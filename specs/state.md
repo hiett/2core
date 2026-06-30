@@ -18,7 +18,7 @@ units (see overview §3). Announce milestones here the moment they land.
 | `«IR-FROZEN»` — `ir.gleam` + `ir-grammar.md` | 01 | **FROZEN ✓** | 02, 08, 10, 11 |
 | `«ABI-FROZEN»` — `instance.gleam` (Binding + convention) | 01 | **FROZEN ✓** | 08, 09, 11 |
 | `«RTNUM-SIG-FROZEN»` — `rt_num.gleam` signatures (90 fns) | 01 | **FROZEN ✓** | 06, 08 |
-| `«CORE-AST»` — `backend/core_erlang.gleam` types | 03 (day 1) | `unclaimed` | 08 |
+| `«CORE-AST»` — `backend/core_erlang.gleam` types | 03 | **published ✓** | 08 |
 | `«WASM-AST»` — `frontend/wasm/ast.gleam` types + `DecodeError` | 05 (day 1) | `unclaimed` | 10 (validate) |
 | `«FFI-SHIM»` — `twocore_codegen_ffi.erl` (compile+load) | 04 | **published ✓** | 03 (verify), 08/10 (e2e tests) |
 
@@ -32,7 +32,7 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 |---|---|---|---|---|
 | **01** Interface freeze | [`01`](phase-1/01-interface-freeze.md) | **done** | — | IR types, `.ir` grammar, runtime ABI, rt_num signatures (90 fns, `todo` bodies → 06), PipelineError stub all frozen; neutrality review signed off; 3 golden `.ir` + strawman test green. The keystones exist. |
 | **02** `.ir` printer & parser | [`02`](phase-1/02-ir-textual-form.md) | `unclaimed` | `«IR-FROZEN»` | `.ir` round-trips; every stage can dump/load IR as the inter-stage contract (D7). |
-| **03** Core Erlang AST & printer | [`03`](phase-1/03-core-erlang-backend.md) | `unclaimed` | — (self-frozen) | A `.core` AST + verified pretty-printer; `08` can build Core Erlang and get compilable text. |
+| **03** Core Erlang AST & printer | [`03`](phase-1/03-core-erlang-backend.md) | **done** | — | `.core` AST (`«CORE-AST»`) + pretty-printer; printed ASTs compile+run on real OTP-29 (add/fac/classify); atom escaping proven byte-identical to OTP `io_lib:write_string`. |
 | **04** `build_beam` driver & FFI | [`04`](phase-1/04-build-beam-driver.md) | **done** | — | `.core` text → loaded `.beam` proven (hand-written `.core` compiled, loaded, ran on BEAM); the `«FFI-SHIM»`; `gleam_erlang` added. |
 | **05** WASM decoder & AST | [`05`](phase-1/05-wasm-decoder.md) | `unclaimed` | — | `.wasm` → WASM AST (`«WASM-AST»`); LEB128 + fail-closed decoding; frontend input ready. |
 | **06** `rt_num` numerics (`bif`) | [`06`](phase-1/06-rt-num-numerics.md) | `unclaimed` | `«RTNUM-SIG-FROZEN»` | The single source of numeric-fidelity truth (tier-P reference impl), property-tested vs the spec. |
