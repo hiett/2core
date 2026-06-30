@@ -264,13 +264,15 @@ pub fn fib_if_and_call_test() {
 
 // ───────────────────────────── out-of-scope: typed error, not a panic ─────────────────────────────
 
-/// `call_indirect` is out of Phase-1 lowering scope and is REJECTED by validation as a
-/// typed error (the security boundary rejects what we cannot fully type) — never a
-/// panic. (`lower` likewise returns `Unsupported`; validation rejects it first.)
+/// `call_indirect` is out of Phase-1 lowering scope and is rejected fail-closed before
+/// it can run — never a panic. As of Phase-2 the validator *types* `call_indirect` (a
+/// well-typed module with a declared table is now accepted), so the rejection moves to
+/// `lower`, which returns `Unsupported("call_indirect")` until unit 09 lowers it.
 pub fn call_indirect_rejected_test() {
   let assert Ok(m) = decode.decode(call_indirect_wasm)
-  case validate.validate(m) {
-    Error(validate.Unsupported(_)) -> True
+  let assert Ok(tm) = validate.validate(m)
+  case lower.lower(tm) {
+    Error(lower.Unsupported("call_indirect")) -> True
     _ -> False
   }
   |> should.equal(True)
