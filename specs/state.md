@@ -40,7 +40,7 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 | **08** `emit_core` (IR → Core) | [`08`](phase-1/08-emit-core.md) | **done** | `«IR-FROZEN»`,`«CORE-AST»`,`«ABI-FROZEN»`,`«RTNUM-SIG-FROZEN»` | **The backend works end-to-end:** hand-written IR → Core Erlang → loaded `.beam` → correct results (add/wrap/shift, `sum_to(100k)` constant-space, fib/fac, div traps, deny-all host, stdlib gcd); binding chokepoint + security-invariant test pass. |
 | **09** Runtime defaults | [`09`](phase-1/09-runtime-defaults.md) | **done** | `«ABI-FROZEN»` | `rt_trap.raise/1`, `rt_host.call_host/3` (deny-all), `rt_meter.charge/1` (tier-O pdict fuel), `rt_stdlib.gcd/2` (own), `rt_bif` (build-time allowlist). 34 fail-closed/security tests. |
 | **10** WASM validate & lower | [`10`](phase-1/10-wasm-validate-and-lower.md) | **done** | `«WASM-AST»`, `«IR-FROZEN»` | `full` validation (spec abstract-stack algorithm + local cap) rejects ill-typed; lower does stack-elim/SSA (mutable locals → `LoopParam`) with named labels. **Real `.wasm` → BEAM proven** (add/sum_to/fib via the full pipeline). |
-| **11** ir_lower, linker, Safe profile, CLI (capstone) | [`11`](phase-1/11-ir-lower-linker-cli.md) | `unclaimed` | all of the above | The `ir_lower` pass, the linker + Safe profile, the per-stage CLI (decision #5), and the **end-to-end differential acceptance** — Phase-1 goal proven. |
+| **11** ir_lower, linker, Safe profile, CLI (capstone) | [`11`](phase-1/11-ir-lower-linker-cli.md) | **done** | all of the above | `ir_lower` (fail-closed allowlist + metering insertion), the Safe profile/linker, the per-stage CLI (decision #5; `gleam run -- run add.wasm add 2 3` → `5`), and the acceptance corpus green **with ir_lower(Safe) in the chain**. Phase-1 goal proven. |
 
 ---
 
@@ -99,6 +99,20 @@ broaden the `own` stdlib + BIF allowlist; then the Porffor bridge + its ABI `rt_
 
 ## Change log
 
+- **Unit 11 landed (capstone) — PHASE 1 COMPLETE.** A real WASM binary now compiles
+  through decode→validate→lower→**ir_lower(Safe)**→emit→build→run on the BEAM, driven by a
+  CLI. `ir_lower` enforces the `rt_bif` allowlist fail-closed (allowlisted `("std","gcd")`
+  runs; an un-allowlisted/undeclared `CallHost` → build-time `ForbiddenHost`; a declared
+  host import passes to run-time deny-all) and inserts `Charge` metering (fuel accumulates
+  per the cost model without changing results; `sum_to(100000)` stays constant-space with
+  metering on). `profiles.safe()` + linker (fail-closed). The CLI (`src/twocore.gleam`)
+  exposes every stage independently (decision #5): `decode`/`validate`/`lower`/`ir`/
+  `ir-lower`/`emit`/`to-core`/`build`/`run` — verified e.g. `gleam run -- run add.wasm add
+  2 3` → `5`. `pipeline.gleam` completed with the real per-stage `PipelineError`. 310 tests;
+  the embedded spec-suite stays 1699/1400/0. Deps `argv` + `simplifile` added (CLI). Minor:
+  `RunResult.Trapped` carries a `String` reason (reuses unit 07's trap channel + represents
+  capability denials); `LowerError` gained a `ForbiddenHost` variant; a `twocore_cli_ffi.erl`
+  catching-apply shim was added (unit 04's FFI is single-owned).
 - **Unit 07 landed (conformance harness, oracle & corpus).** The Phase-1 acceptance
   corpus passes end-to-end through decode→validate→lower→emit→build→invoke (the goal
   proof: add/wrap, signed&unsigned div pair, INT_MIN/-1 & /0 traps, shift-mask, sum_to,
