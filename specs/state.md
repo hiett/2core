@@ -87,18 +87,83 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 
 ---
 
-## Phase 2 preview (not yet specced into units)
+## Phase 2 — complete WASM 1.0 (linear memory, tables, globals, full floats, mutable state)
 
-Once Phase 1's vertical slice is green, the natural next wave (to be broken down later):
-broaden WASM 1.0 coverage (full `br_table`/`call_indirect`, globals, `memory` load/store);
-the `rt_mem` tiers (`rebuild`→`paged`→`atomics`) + `rt_table`; the `baseline` optimizer;
-the WAT parser; the Unsafe profile (passthrough stdlib, open BIFs, `aggressive` optimizer);
-broaden the `own` stdlib + BIF allowlist; then the Porffor bridge + its ABI `rt_host` shim.
+Goal & honest scope: see [`specs/phase-2/00-overview.md`](phase-2/00-overview.md). The
+load-bearing new thing is **mutable instance state** via the tier-O **`cell`**
+(process-dictionary) strategy (E1); the tier-P `threaded` build, non-function imports,
+reference types, bulk memory, multi-memory, SIMD, the WAT parser, the optimizer, and the
+Unsafe profile are all **Phase 3** (deferred, not dropped).
+
+### Phase-2 freeze milestones
+
+| Milestone | Produced by | Status | Unblocks |
+|---|---|---|---|
+| `«IR2-FROZEN»` — `ir.gleam` tables/elem + MemSize/MemGrow + load result-width + float NumOp/ConvOp + 3 TrapReasons + grammar delta | P2-01 | `unclaimed` | 02, 08, 09, 10 |
+| `«CELL-STATE-ABI-FROZEN»` — Binding (mem/table/state) + rt_state/rt_mem/rt_table stub sigs + the emit_core state-access seam + the instantiation contract | P2-01 | `unclaimed` | 03, 04, 05, 10, 11 |
+| `«RTNUM2-SIG-FROZEN»` — new rt_num float/convert signatures (`todo`) | P2-01 | `unclaimed` | 06, 10 |
+| `«WASM-AST2»` — extended `frontend/wasm/ast.gleam` types | P2-07 (day 1) | `unclaimed` | 08 (validate) |
+
+### Phase-2 units
+
+| Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
+|---|---|---|---|---|
+| **P2-01** Interface freeze (keystone) | [`01`](phase-2/01-interface-freeze.md) | `unclaimed` | — | IR2 + cell ABI + instantiation contract + rt_num float sigs frozen, build green. |
+| **P2-02** `.ir` printer/parser ext | [`02`](phase-2/02-ir-textual-form.md) | `unclaimed` | `«IR2-FROZEN»` | `.ir` round-trips the new variants (fast-follow, off critical path). |
+| **P2-03** rt_state + globals + lifecycle | [`03`](phase-2/03-rt-state-lifecycle.md) | `unclaimed` | `«CELL-STATE-ABI-FROZEN»` | The per-instance pdict cell (opaque, fresh/reset, fail-closed) + mutable globals + one-instance-one-process. |
+| **P2-04** rt_mem (paged + oracle) | [`04`](phase-2/04-rt-mem.md) | `unclaimed` | `«CELL-STATE-ABI-FROZEN»` | Bounds-checked (no-wrap, trap-before-write) LE load/store/size/grow + data-init + Safe max-pages cap; rebuild-oracle differential + memory_trap/address/endianness `.wast`. |
+| **P2-05** rt_table + call_indirect | [`05`](phase-2/05-rt-table.md) | `unclaimed` | `«CELL-STATE-ABI-FROZEN»` | 3-fault fail-closed indirect dispatch (build-controlled, no ambient apply) + element-init. |
+| **P2-06** rt_num float ext | [`06`](phase-2/06-rt-num-floats.md) | `unclaimed` | `«RTNUM2-SIG-FROZEN»` | The remaining float bodies (unary, copysign, comparisons, trapping trunc, convert, demote/promote), spec-corner tested. |
+| **P2-07** decode ext (+ `«WASM-AST2»`) | [`07`](phase-2/07-decode.md) | `unclaimed` | — | Decode table/memory/global/element/data/start sections + the full opcode set (load/store matrix, size/grow, 0xA7–0xBF conversions, floats, select, global/table ops). |
+| **P2-08** validate ext | [`08`](phase-2/08-validate.md) | `unclaimed` | `«WASM-AST2»` | Typing for all new ops + memarg alignment + const-expr validation (AST-only security boundary). |
+| **P2-09** lower ext | [`09`](phase-2/09-lower.md) | `unclaimed` | `«WASM-AST2»`, `«IR2-FROZEN»` | WASM AST → IR2 for memory/table/global/float/select/conversions + active data/element/global-init. |
+| **P2-10** emit_core ext + instantiate entry | [`10`](phase-2/10-emit-core.md) | `unclaimed` | `«IR2-FROZEN»`,`«CELL-STATE-ABI-FROZEN»`,`«RTNUM2-SIG-FROZEN»` (∥ 03–06) | Lower the stateful ops via the seam + trapping converts + the generated `instantiate/N`; extended security-invariant test. |
+| **P2-11** capstone (run-ABI + linker + conformance) | [`11`](phase-2/11-capstone.md) | `unclaimed` | all above | `load→instantiate→invoke` run-ABI + harness isolation; Safe profile (mem/table/state + max-pages cap); Phase-2 `.wast` allowlist + acceptance; refresh the conformance image. |
+
+### High-level spec coverage this phase takes (additions to the §-coverage table)
+
+| High-level item | Taken by | Notes |
+|---|---|---|
+| §3 optional linear memory (runtime) | P2-04 (`rt_mem`) | `paged` + `rebuild` oracle; `atomics`/`nif` tiers deferred. |
+| §4 R-mem / R-tab subsystem | P2-04 / P2-05 | Bounds-/type-checked → trap (security boundary). |
+| §4 R-state instance state | P2-03 | tier-O **`cell`** (pdict); tier-P `threaded` deferred. |
+| §9.1 full float/conversion fidelity | P2-06 | Remaining unary/cmp/trapping-trunc/convert/promote/demote. |
+| §10 mutable-state calling convention | P2-01 (E1) | `state_strategy = cell`; the emit_core state-access seam. |
+| §6 Safe-mode memory resource bound | P2-01/P2-04/P2-11 (E3) | Hard max-pages cap + proportional grow charge. |
+| §12 Phase-1 (full WASM 1.0) | P2-* | Completes what high-level §12 calls "Phase 1"; §12 "Phase 2" proposals stay deferred. |
+
+### Deferred to Phase 3 (explicit)
+
+tier-P `threaded` state build; `rt_mem` `atomics`/`nif` tiers; non-function imports + the
+`spectest` module; reference types (externref/funcref, `table.get/set/copy/fill`, `select_t`,
+`elem.wast`); bulk memory (`memory.fill/copy/init`, `data.drop`); multi-memory (`memory.wast`/
+`table.wast`/`memory_grow.wast` are un-convertible/multi-memory at the pin); SIMD; memory64;
+GC; the WAT text parser; the `baseline`/`aggressive` optimizer; the Unsafe profile; CPU-fuel
+enforcement (still observe-only); the Porffor JS→WASM bridge.
 
 ---
 
 ## Change log
 
+- **Phase-2 plan authored + reconciled.** Grounded (5 topics) + adversarially critiqued (4
+  lenses); the keystone decision (mutable state = tier-O **pdict `cell`**) was verified to
+  preserve constant-space loops + preemption. Foundation docs (`phase-2/00-overview.md`,
+  `01-interface-freeze.md`) + 10 unit docs (`02`–`11`) authored. Post-authoring reconciliations
+  folded into the keystone (flagged by the unit agents):
+  - **Cell access without circular imports:** `rt_state` holds the per-layer values **opaquely
+    as `Dynamic`** under one fixed namespaced key and exposes typed `mem_get/mem_put`/
+    `table_get/table_put`; fresh `mem`/`table` are built by `rt_mem:fresh`/`rt_table:new` (not
+    rt_state) and assembled into the cell by the generated `instantiate` entry via `StateDecl`.
+  - Added **`start: Option(String)`** to the IR Module (instantiation needs it) and a
+    **`TableOutOfBounds`** TrapReason ("out of bounds table access") for active-element OOB.
+  - `rt_table` gains **`new`** + **type-tagged entries** (`#(FuncType, closure)`) so
+    `call_indirect`'s structural type check has a tag and rt_state needn't construct the table.
+  - Instantiation order corrected to the spec's **element → data** (then start).
+  - The Safe **max-pages cap** is enforced in `rt_mem:grow` (single-sourced value baked into the
+    Mem at `fresh`), not threaded through generated code.
+  - `get()` on an un-seeded cell is an **internal** invariant error (node-safe crash), not a WASM
+    `TrapReason`. The keystone's "land green" list now includes the `Module`/`MemLoad`
+    constructor reach across the tree (incl. unit-02's `roundtrip_test.gleam`).
 - **Robustness fix-pass — the 3 conformance-surfaced codegen gaps are FIXED** (no IR/ABI
   change needed; entirely in `emit_core.gleam` + `lower.gleam`). Root causes & fixes:
   (1) **multi-result calls** (the `ArityMismatch` — actual trigger was `fac-ssa`'s 3-result
