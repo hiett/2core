@@ -1,55 +1,137 @@
 # 2core
 
-> ⚠️ **Experimental — pre-implementation.** Nothing described here is built yet. This repository is an experiment that is *going to try* to do what's laid out below. Treat everything as **intent and direction**, not as working features or claims about what exists today.
+> ⚠️ **Experimental.** This is a research project, not a production tool. The
+> WebAssembly frontend now compiles end-to-end, but the platform is early and most
+> of the roadmap is not built yet. Treat the rest as direction, and check
+> [`specs/state.md`](specs/state.md) for exactly what is and isn't done.
 
 **2core is an experiment in compiling code to run fast and _preemptively_ on the BEAM.**
 
-The goal it's reaching for: a **multi-frontend compiler platform**, written in [Gleam](https://gleam.run), that lowers several source languages into **one shared, language-neutral intermediate representation (IR)** and emits **Core Erlang** from it — so the output runs as ordinary, fairly-scheduled BEAM code. Loosely: the way Arc runs JavaScript on the BEAM today, but **compiled rather than interpreted**.
+It's a **multi-frontend compiler platform**, written in [Gleam](https://gleam.run), that
+lowers several source languages into **one shared, language-neutral intermediate
+representation (IR)** and emits **Core Erlang** — so the output runs as ordinary,
+fairly-scheduled BEAM code. Loosely: the way Arc runs JavaScript on the BEAM today, but
+**compiled rather than interpreted**. The bet is that compiling *to Erlang* — rather than
+shipping a long-running interpreter — is what preserves BEAM preemption (even a tight loop
+yields fairly and can't monopolise a scheduler) while getting close to native speed.
 
-None of this works yet. The sections below describe the plan, not the present.
+WebAssembly is the **first** frontend, because so much already compiles *to* WASM —
+which transitively brings Rust and (via a JS→WASM compiler) JavaScript along. Native
+JavaScript and Gleam/Erlang frontends are planned to follow. The intent is for all of
+them to share one IR, one optimizer, one backend, one standard library, and one security
+model.
 
-## The goal
+## Status — what works today
 
-The project wants to find out whether you can take code written for *other* runtimes — starting with WebAssembly — and **compile** it down to Core Erlang so it runs natively on the BEAM: fast, and **preemptively scheduled** like any other BEAM process (so even a tight loop yields fairly and can't monopolise a scheduler). The bet is that compiling to Erlang — rather than shipping a long-running interpreter — is what preserves that preemption while getting close to native speed.
+**Phase 1 is complete: a real `.wasm` binary compiles all the way to a loaded, running
+`.beam` module**, through a fully modular pipeline, in the sandboxed "Safe" mode, driven
+by a CLI.
 
-WebAssembly is the entry point because so much already compiles *to* WASM. If the WASM frontend works, then Rust (via Rust→WASM) and JavaScript (via a JS→WASM compiler) come along transitively — and beyond that, the plan is to add native frontends for JavaScript and Gleam/Erlang. The intent is for all of them to share one IR, one optimizer, one backend, one standard library, and one security model.
+```sh
+$ gleam run -- run add.wasm add 2 3     # decode → validate → lower → IR → Core Erlang → .beam → run
+5
+$ gleam run -- run fib.wasm fib 10
+55
+$ gleam run -- ir add.wasm              # dump the shared IR in its textual form
+module @twocore@wasm@add { … }
+```
 
-## How it's going to try to get there
+Every stage is independently invokable (`decode`, `validate`, `lower`, `ir`, `ir-lower`,
+`emit`, `to-core`, `build`, `run`), and the whole project builds with **zero warnings**
+and **313 passing tests**. What's proven end-to-end:
 
-Key ideas the design is betting on — all still to be built:
+- the full WASM 1.0 integer + control-flow slice (locals, `block`/`loop`/`if`, `br`/
+  `br_table`, direct `call`, the `i32`/`i64` op set, sign-extension, non-trapping
+  float→int);
+- **spec-faithful numerics** *through codegen* — two's-complement wrap, signed/unsigned
+  `div`/`rem`, the `INT_MIN / -1` and divide-by-zero **traps**, shift-count masking;
+- **constant-space, preemptible loops** — `sum_to(100000)` runs as a tail-recursive BEAM
+  loop without stack growth (even with metering on);
+- the **capability boundary** — an un-allowlisted host call is rejected fail-closed at
+  build time; a host import is rejected at runtime under deny-all; a vetted stdlib call
+  runs.
 
-- **One shared IR, many frontends.** Every source language is meant to lower into a single, **language-neutral** IR (deliberately *not* WASM-shaped). Behind that IR sits one optimizer, one backend, and one runtime — so adding a language is "write a frontend," not "rebuild the stack."
-- **WASM first.** The WebAssembly frontend is the first thing to build. It aims to transitively unlock **Rust → Erlang** (via Rust→WASM) and **JS → Erlang** (via a JS→WASM compiler) without writing those frontends by hand.
-- **Compile to Core Erlang; run on the BEAM.** The backend intends to emit Core Erlang, then hand it to the standard Erlang compiler to produce a loadable `.beam` module — so generated code is ordinary BEAM code, **preemptively scheduled** for free.
-- **Structured control flow → tail-recursive loops.** WASM (and JS/Gleam) control flow is *already* structured, so the plan is to lower `block`/`loop`/`if`/`switch` into a `letrec` of tail-recursive functions. Proper BEAM tail calls should make loops constant-space and preemptible.
-- **A dual value model.** A BEAM-native **term** model (for dynamic/term languages like JS and Gleam) *and* an opt-in **fixed-width numeric + linear-memory** model (for WASM and Rust), with explicit conversions between them — so term languages don't pay for linear memory, and low-level languages keep exact WASM semantics.
-- **Safe / Unsafe modes.** Two planned global modes: **Unsafe** (emit the fastest possible near-native code, full BEAM access) and **Safe** (sandbox untrusted code — an in-house vetted standard library, a tiny allowlist of BEAM functions, deny-all host access, no node-crashing native code, and metering on). The intent is for Safe and Unsafe instances to coexist on one node.
-- **Everything modular.** Each stage and runtime layer is meant to be a narrow, independently-callable interface with many interchangeable implementations. The design treats that modularity as *both* the security model and the replaceability model.
-- **Built in Gleam; output is pure Core Erlang.** The compiler itself is written in Gleam (build-time, on the BEAM); whether any native code runs underneath is a per-deployment choice, never a global assumption.
+What's deliberately **not** here yet (Phase 2+): linear memory and tables, the WAT text
+parser, the optimizer, the "Unsafe" performance profile, and the JS/Rust/Gleam frontends.
+The full roadmap and per-component status live in [`specs/state.md`](specs/state.md).
+
+## How it works
+
+- **One shared IR, many frontends.** Every source language lowers into a single,
+  **language-neutral** IR (deliberately *not* WASM-shaped) with a canonical textual form
+  (`.ir`). Behind it sit one optimizer, one backend, and one runtime — so adding a
+  language is "write a frontend," not "rebuild the stack."
+- **Structured control → tail-recursive loops.** `block`/`loop`/`if`/`switch` lower to a
+  `letrec` of tail-recursive functions; proper BEAM tail calls make loops constant-space
+  and preemptible.
+- **A dual value model.** A BEAM-native **term** model (for dynamic/term languages) *and*
+  an opt-in **fixed-width numeric + linear-memory** model (for WASM/Rust), with explicit
+  conversions between them — so term languages don't pay for linear memory, and low-level
+  languages keep exact WASM semantics.
+- **Safe / Unsafe modes.** Two global modes: **Safe** sandboxes untrusted code (vetted
+  in-house stdlib, a tiny allowlist of BEAM functions, deny-all host access, metering on,
+  no node-crashing native code); **Unsafe** (Phase 2) emits the fastest possible code.
+  The two are designed to coexist on one node.
+- **Everything modular.** Each stage and runtime layer is a narrow, independently-callable
+  interface with interchangeable implementations — the design treats that modularity as
+  *both* the security model and the replaceability model.
+- **Built in Gleam; output is pure Core Erlang.** The compiler runs at build time on the
+  BEAM; whether any native code runs underneath is a per-deployment choice.
+
+The canonical architecture spec is [`specs/00-high-level.md`](specs/00-high-level.md), and
+the Phase-1 work was planned as independent units under [`specs/phase-1/`](specs/phase-1/).
 
 ## Planned frontend roadmap
 
-In intended order — none implemented yet:
+In intended order (only the first is implemented):
 
-1. **WASM** *(first)* — the initial frontend; also brings **Rust → Erlang** along via Rust→WASM.
-2. **JavaScript via [Porffor](https://github.com/CanadaHonk/porffor)** *(bridge)* — a JS→WASM AOT compiler feeding the WASM frontend, as an early proof-of-concept. Bounded by Porffor's experimental JS coverage, and explored as a benchmark rather than a complete JS solution.
-3. **Arc as a native JavaScript frontend** *(later)* — emitting the IR directly (using the term value model instead of boxing JS through linear memory), rather than going through the WASM bridge.
-4. **Erlang / Gleam frontend** *(later)* — write Gleam, deploy to the platform, and (via Safe mode) be provably unable to take over the VM.
+1. **WASM** — *implemented (Phase 1).* Also the path to **Rust → BEAM** (via Rust→WASM).
+2. **JavaScript via [Porffor](https://github.com/CanadaHonk/porffor)** — a JS→WASM AOT
+   compiler feeding the WASM frontend, as an early proof-of-concept.
+3. **Arc as a native JavaScript frontend** — emitting the IR directly (term value model)
+   rather than boxing JS through linear memory.
+4. **Erlang / Gleam frontend** — write Gleam, deploy to the platform, and (via Safe mode)
+   be provably unable to take over the VM.
 
-## Status
+## WebAssembly conformance
 
-Pre-implementation. The repository currently holds the architecture specification and a hello-world Gleam scaffold — `gleam run` just prints a placeholder. There is no compiler here yet.
+The WASM frontend is differential-tested against the official
+[WebAssembly spec test suite](https://github.com/WebAssembly/testsuite) (pinned), run
+through the real compile-and-execute pipeline. Of the assertions we attempt, **100% pass
+and 0 fail**; the large "out of scope" share is spec coverage for constructs the current
+slice doesn't implement yet (linear memory, tables, `call_indirect`, most float ops).
 
-## Specification
+<p align="center">
+  <img src="docs/wasm-conformance.svg" width="640"
+       alt="WebAssembly spec-suite conformance: 1,740 passing, 1,359 out of scope, 0 failing">
+</p>
 
-The full, canonical architecture spec lives in [`specs/00-high-level.md`](specs/00-high-level.md). It is the source of truth for everything above and goes much deeper into the IR, the layer map, the security model, and the work breakdown.
+> Regenerate with `scripts/gen-conformance-svg.sh` (run `RUN_VENDOR=1 …` to fetch the full
+> pinned fixture set first). The image reflects the full allowlist; a fresh checkout ships
+> only a small committed fixture subset, so `gleam test` runs green without re-vendoring.
 
 ## Development
 
+Requires the standard Gleam toolchain — **Gleam 1.17+**, Erlang/OTP 29. For the full
+conformance run you also need **wabt** (`wat2wasm`/`wast2json`/`spectest-interp`).
+
 ```sh
-gleam run   # run the (placeholder) entry point
-gleam test  # run the tests
-gleam format # format the code (CI requires this)
+gleam test                      # run all tests (unit + the committed conformance subset)
+gleam format --check src test   # CI requires this
+gleam run -- run mod.wasm fn a b   # compile a .wasm and invoke an export on the BEAM
+gleam run -- ir mod.wasm           # dump the shared IR (.ir text)
+
+# Full WASM spec-suite conformance (clones the pinned testsuite, needs wabt + network):
+bash test/twocore/conformance/vendor/vendor.sh && gleam test
 ```
 
-See [`CLAUDE.md`](CLAUDE.md) for contributor conventions (definition of done, testing against the spec, and commit rules).
+See [`CLAUDE.md`](CLAUDE.md) for contributor conventions (definition of done, testing
+against the spec, commit rules).
+
+## Specification
+
+- [`specs/00-high-level.md`](specs/00-high-level.md) — the canonical architecture spec
+  (the IR, the layer map, the security model).
+- [`specs/state.md`](specs/state.md) — the live status ledger: every component, what's
+  done, and what each leaves for the next.
+- [`specs/phase-1/`](specs/phase-1/) — the Phase-1 work breakdown, one unit per file.
