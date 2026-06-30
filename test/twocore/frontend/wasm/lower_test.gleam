@@ -20,10 +20,13 @@ import gleeunit/should
 import twocore/backend/build_beam
 import twocore/backend/core_printer
 import twocore/backend/emit_core
+import twocore/frontend/wasm/ast
 import twocore/frontend/wasm/decode
 import twocore/frontend/wasm/lower
 import twocore/frontend/wasm/validate
 import twocore/ir
+import twocore/ir/parser
+import twocore/ir/printer
 import twocore/runtime/instance
 
 // Test-only FFI (shared with the unit-08 e2e suite): apply `M:F(Args)` and capture a
@@ -262,17 +265,299 @@ pub fn fib_if_and_call_test() {
   list.length(calls) |> should.equal(2)
 }
 
-// ───────────────────────────── out-of-scope: typed error, not a panic ─────────────────────────────
+// ───────────────────────────── Phase-2: linear memory ─────────────────────────────
 
-/// `call_indirect` is out of Phase-1 lowering scope and is rejected fail-closed before
-/// it can run — never a panic. As of Phase-2 the validator *types* `call_indirect` (a
-/// well-typed module with a declared table is now accepted), so the rejection moves to
-/// `lower`, which returns `Unsupported("call_indirect")` until unit 09 lowers it.
-pub fn call_indirect_rejected_test() {
-  let assert Ok(m) = decode.decode(call_indirect_wasm)
-  let assert Ok(tm) = validate.validate(m)
+/// A memory program lowers each load/store opcode to a `MemLoad`/`MemStore` carrying the
+/// SPEC-correct `MemAccess(bytes, signed)` and (for loads) `result` type — cite
+/// binary/instructions. Crucially `i32.load8_s` and `i64.load8_s` share `MemAccess(1, True)`
+/// but differ in `result` (`TI32` vs `TI64`) — exactly why `MemLoad` carries `result` (E2).
+/// `f32.load` is byte-identical to `i32.load` (`MemAccess(4, False)`) but `result: TF32`
+/// (raw bits, D5). `i32.store` is `MemAccess(4, False)` (sign irrelevant on a store).
+pub fn mem_load_store_structure_test() {
+  let irm = build(mem_wasm)
+  let f = func(irm, "f0")
+  let exprs = all_exprs(f.body)
+  let loads =
+    list.filter_map(exprs, fn(e) {
+      case e {
+        ir.MemLoad(op, _, _, result) -> Ok(#(op, result))
+        _ -> Error(Nil)
+      }
+    })
+  let stores =
+    list.filter_map(exprs, fn(e) {
+      case e {
+        ir.MemStore(op, _, _, _) -> Ok(op)
+        _ -> Error(Nil)
+      }
+    })
+  // i32.load8_s ⇒ MemAccess(1, True) + TI32
+  list.contains(loads, #(ir.MemAccess(1, True), ir.TI32)) |> should.equal(True)
+  // i64.load8_s ⇒ MemAccess(1, True) + TI64 (same access bytes+sign, different result)
+  list.contains(loads, #(ir.MemAccess(1, True), ir.TI64)) |> should.equal(True)
+  // f32.load ⇒ MemAccess(4, False) + TF32
+  list.contains(loads, #(ir.MemAccess(4, False), ir.TF32)) |> should.equal(True)
+  // i32.load ⇒ MemAccess(4, False) + TI32
+  list.contains(loads, #(ir.MemAccess(4, False), ir.TI32)) |> should.equal(True)
+  // i32.store ⇒ MemAccess(4, False) (signed always False on a store)
+  list.contains(stores, ir.MemAccess(4, False)) |> should.equal(True)
+}
+
+/// `memory.grow` lowers to a `MemGrow(delta)` (the delta carried as a value) and
+/// `memory.size` to `MemSize` — cite binary/instructions (0x40 / 0x3F). The module also
+/// declares its memory, so `Module.memory` is `Some`.
+pub fn mem_size_grow_test() {
+  let irm = build(grow_wasm)
+  let f = func(irm, "f0")
+  let exprs = all_exprs(f.body)
+  list.any(exprs, fn(e) {
+    case e {
+      ir.MemGrow(_) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+  list.any(exprs, fn(e) { e == ir.MemSize }) |> should.equal(True)
+  case irm.memory {
+    option.Some(_) -> True
+    option.None -> False
+  }
+  |> should.equal(True)
+}
+
+// ───────────────────────────── Phase-2: globals ─────────────────────────────
+
+/// A global program lowers `global.set`/`global.get` to `GlobalSet`/`GlobalGet` referencing
+/// the STABLE name `g<idx>` (here `g0`), and `Module.globals` is populated with bit-exact,
+/// type-correct `GlobalDecl`s in index order (a mutable i32 init `100`, an immutable i64
+/// init `7`). The `GlobalGet/Set` names match the declared global names.
+pub fn globals_test() {
+  let irm = build(global_wasm)
+  let f = func(irm, "f0")
+  let exprs = all_exprs(f.body)
+  list.any(exprs, fn(e) {
+    case e {
+      ir.GlobalSet("g0", ir.ConstI32(5)) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+  list.any(exprs, fn(e) { e == ir.GlobalGet("g0") }) |> should.equal(True)
+  // Module.globals populated, in declaration (= index) order, with the const-literal inits.
+  irm.globals
+  |> should.equal([
+    ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(100)])),
+    ir.GlobalDecl("g1", ir.TI64, False, ir.Values([ir.ConstI64(7)])),
+  ])
+}
+
+// ───────────────────────────── Phase-2: tables + call_indirect ─────────────────────────────
+
+/// `call_indirect (type $t) (i32.const 0)` lowers to a single `CallIndirect("t0", index, ty,
+/// args)` whose `ty` is the STRUCTURAL `module.types[y]` (`FuncType([], [TI32])` here) — the
+/// runtime does the per-call type check (E3). The table is named `"t0"` (the MVP reserved
+/// table 0). `Module.tables` and `Module.elements` are populated; the element's target name is
+/// `"f<funcidx>"` (`"f0"`), which resolves to a real `Function`.
+pub fn call_indirect_structure_test() {
+  let irm = build(ci_full_wasm)
+  let f = func(irm, "f1")
+  let exprs = all_exprs(f.body)
+  list.any(exprs, fn(e) {
+    case e {
+      ir.CallIndirect("t0", ir.ConstI32(0), ir.FuncType([], [ir.TI32]), []) ->
+        True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+  // Table declared and named "t0".
+  irm.tables |> should.equal([ir.TableDecl("t0", 1, option.None)])
+  // Active element segment into "t0" at offset 0, targeting function name "f0".
+  irm.elements
+  |> should.equal([
+    ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["f0"]),
+  ])
+  // The element target name resolves to a real defined function.
+  list.any(irm.functions, fn(fn_) { fn_.name == "f0" }) |> should.equal(True)
+}
+
+// ───────────────────────────── Phase-2: select → If ─────────────────────────────
+
+/// `select` (0x1B) lowers to the existing `If` (NO new IR node). Per exec/instructions the
+/// result is `val1` when `cond ≠ 0`, else `val2`; so the lowered `If`'s then-branch is
+/// `Values([val1])` (the first/deeper operand) and the else-branch is `Values([val2])`. The
+/// operands are i32 here, so the `If` result arity is 1 and its type is `[TI32]`.
+pub fn select_test() {
+  let irm = build(select_wasm)
+  let f = func(irm, "f0")
+  let exprs = all_exprs(f.body)
+  list.any(exprs, fn(e) {
+    case e {
+      ir.If(
+        ir.Var("p2"),
+        [ir.TI32],
+        ir.Values([ir.Var("p0")]),
+        ir.Values([ir.Var("p1")]),
+      ) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+}
+
+/// A `select` over i64 operands recovers `TI64` as the result type — proving the SSA
+/// value-type tracking (a select's result type is operand-determined, not opcode-determined,
+/// §5). The lowered `If` carries `[TI64]`.
+pub fn select_i64_test() {
+  let irm = build(select64_wasm)
+  let f = func(irm, "f0")
+  let exprs = all_exprs(f.body)
+  list.any(exprs, fn(e) {
+    case e {
+      ir.If(_, [ir.TI64], _, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+}
+
+// ───────────────────────────── Phase-2: the conversion block ─────────────────────────────
+
+/// The `0xA7–0xBF` conversion block lowers each opcode to its IR `ConvOp` (cite
+/// binary/instructions): wrap/extend/reinterpret reuse the EXISTING ConvOps, and the TRAPPING
+/// trunc maps to `TruncS/U` (DISTINCT from the saturating `TruncSat*`). lower does not mark
+/// the trapping trunc — emit_core wires the trap.
+pub fn conversions_test() {
+  let irm = build(conv_wasm)
+  let f = func(irm, "f0")
+  let convs =
+    list.filter_map(all_exprs(f.body), fn(e) {
+      case e {
+        ir.Convert(op, _) -> Ok(op)
+        _ -> Error(Nil)
+      }
+    })
+  // wrap / extend → existing ConvOps
+  list.contains(convs, ir.I32WrapI64) |> should.equal(True)
+  list.contains(convs, ir.I64ExtendI32S) |> should.equal(True)
+  list.contains(convs, ir.I64ExtendI32U) |> should.equal(True)
+  // the 4 reinterprets → existing ReinterpretFToI / ReinterpretIToF
+  list.contains(convs, ir.ReinterpretFToI(ir.FW32)) |> should.equal(True)
+  list.contains(convs, ir.ReinterpretIToF(ir.W32)) |> should.equal(True)
+  list.contains(convs, ir.ReinterpretFToI(ir.FW64)) |> should.equal(True)
+  // trapping trunc → TruncS/U (NOT TruncSat*)
+  list.contains(convs, ir.TruncU(ir.FW64, ir.W32)) |> should.equal(True)
+  list.contains(convs, ir.TruncS(ir.FW32, ir.W32)) |> should.equal(True)
+  // None of these are the saturating family.
+  list.any(convs, fn(op) {
+    case op {
+      ir.TruncSatS(_, _) | ir.TruncSatU(_, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(False)
+}
+
+// ───────────────────────────── Phase-2: float arithmetic ─────────────────────────────
+
+/// `f64.add` lowers to the neutral, width-tagged `Num(FAdd(FW64), …)` (D6) — the float
+/// arith ops share the integer NumOp shape, just at a float width.
+pub fn float_add_structure_test() {
+  let irm = build(fadd_wasm)
+  let f = func(irm, "f0")
+  f.result |> should.equal([ir.TF64])
+  list.any(all_exprs(f.body), fn(e) {
+    case e {
+      ir.Num(ir.FAdd(ir.FW64), _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+}
+
+/// END-TO-END: `f64.add` runs spec-correctly through lower → emit_core → `rt_num` → BEAM.
+/// Floats are raw IEEE-754 bit patterns end-to-end (D5): `1.5 + 2.5 == 4.0` is asserted on
+/// the bit patterns (`0x3FF8…` + `0x4004…` == `0x4010…`). This proves the float-arith
+/// lowering composes with the existing backend, not just that the IR shape is right.
+pub fn float_add_e2e_test() {
+  let mod = load(build(fadd_wasm))
+  // 1.5 = 4609434218613702656, 2.5 = 4612811918334230528, 4.0 = 4616189618054758400
+  catch_apply(mod, atom.create("fadd"), [
+    4_609_434_218_613_702_656,
+    4_612_811_918_334_230_528,
+  ])
+  |> should.equal(Ok(4_616_189_618_054_758_400))
+}
+
+// ───────────────────────────── Phase-2: module decls (memory/data/start) ─────────────────────────────
+
+/// A module with a memory, an active data segment, and a `start` function populates
+/// `Module.memory` (`Some`), `Module.data_segments` (the offset const-expr + raw bytes), and
+/// `Module.start` (`Some("f<funcidx>")`). The data bytes are bit-exact (`"abc"`).
+pub fn data_start_test() {
+  let irm = build(data_start_wasm)
+  irm.memory |> should.equal(option.Some(ir.MemoryDecl(1, option.None)))
+  irm.data_segments
+  |> should.equal([
+    ir.DataSegment(ir.Values([ir.ConstI32(0)]), bit_array.from_string("abc")),
+  ])
+  irm.start |> should.equal(option.Some("f0"))
+}
+
+// ───────────────────────────── Phase-2: .ir round-trip (unit 02) ─────────────────────────────
+
+/// The lowered IR with the new Phase-2 variants round-trips through the `.ir` printer+parser
+/// (D7, unit 02): `parse(print(m)) == m` (bit-exact, since the IR stores floats/ints as raw
+/// bit patterns). Exercised over a memory module, a global module, a table+element module, and
+/// a conversion module — covering `MemLoad`/`MemStore`/`MemSize`/`MemGrow`/`GlobalGet`/
+/// `GlobalSet`/`CallIndirect`/`TableDecl`/`ElementSegment`/`GlobalDecl`/`DataSegment` and the
+/// new ConvOps.
+pub fn ir_roundtrip_test() {
+  [mem_wasm, grow_wasm, global_wasm, ci_full_wasm, conv_wasm, data_start_wasm]
+  |> list.each(fn(bytes) {
+    let m = build(bytes)
+    let assert Ok(reparsed) = parser.parse_module(printer.print_module(m))
+    reparsed |> should.equal(m)
+  })
+}
+
+// ───────────────────────────── Phase-2: fail-closed const-expr ─────────────────────────────
+
+/// A non-constant init expression (an extended-const `i32.add` chain in a global) is rejected
+/// with a typed `Error(NonConstInitExpr(_))`, never a panic (D4 fail-closed). Validation
+/// already blocks this, so the case is reached by handing `lower` a `TypedModule` directly —
+/// proving the constructive const-expr lowering is itself fail-closed (Phase-2 MVP accepts
+/// only a single `t.const`; cite valid/instructions constant expressions).
+pub fn nonconst_init_fail_closed_test() {
+  let m =
+    ast.Module(
+      imported_func_count: 0,
+      types: [],
+      tables: [],
+      memories: [],
+      globals: [
+        ast.Global(ty: ast.I32, mutable: False, init: [
+          ast.I32Const(1),
+          ast.I32Const(2),
+          ast.I32Add,
+        ]),
+      ],
+      funcs: [],
+      start: option.None,
+      elements: [],
+      data: [],
+      exports: [],
+    )
+  let tm =
+    validate.TypedModule(
+      module: m,
+      imported_func_count: 0,
+      func_types: [],
+      func_locals: [],
+      global_types: [ast.I32],
+    )
   case lower.lower(tm) {
-    Error(lower.Unsupported("call_indirect")) -> True
+    Error(lower.NonConstInitExpr(_)) -> True
     _ -> False
   }
   |> should.equal(True)
@@ -398,10 +683,76 @@ const br_to_if_wasm: BitArray = <<
   0x0c, 0x00, 0x41, 0xe7, 0x07, 0x05, 0x41, 0x05, 0x0b, 0x41, 0x01, 0x6a, 0x0b,
 >>
 
-// A module using `call_indirect` (out of Phase-1 scope) — produced with wat2wasm.
-const call_indirect_wasm: BitArray = <<
-  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00,
-  0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x04, 0x04, 0x01, 0x70, 0x00, 0x01, 0x07,
-  0x05, 0x01, 0x01, 0x67, 0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x00,
-  0x11, 0x00, 0x00, 0x0b,
+// ── Phase-2 fixtures (all produced with wat2wasm; the WAT is in the doc comment) ──
+
+// `(memory 1 2) (func (export "m") (param i32) (result i32)
+//    (i32.store (local.get 0) (i32.const 42))
+//    (drop (i32.load8_s (local.get 0))) (drop (i64.load8_s (local.get 0)))
+//    (drop (f32.load (local.get 0))) (i32.load (local.get 0)))`
+const mem_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 6, 1, 96, 1, 127, 1, 127, 3, 2, 1, 0, 5, 4, 1,
+  1, 1, 2, 7, 5, 1, 1, 109, 0, 0, 10, 34, 1, 32, 0, 32, 0, 65, 42, 54, 2, 0, 32,
+  0, 44, 0, 0, 26, 32, 0, 48, 0, 0, 26, 32, 0, 42, 2, 0, 26, 32, 0, 40, 2, 0, 11,
+>>
+
+// `(memory 1) (func (export "g") (result i32)
+//    (drop (memory.grow (i32.const 1))) (memory.size))`
+const grow_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 127, 3, 2, 1, 0, 5, 3, 1, 0, 1,
+  7, 5, 1, 1, 103, 0, 0, 10, 11, 1, 9, 0, 65, 1, 64, 0, 26, 63, 0, 11,
+>>
+
+// `(global $g (mut i32) (i32.const 100)) (global $h i64 (i64.const 7))
+//  (func (export "gg") (result i32) (global.set $g (i32.const 5)) (global.get $g))`
+const global_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 127, 3, 2, 1, 0, 6, 12, 2, 127,
+  1, 65, 228, 0, 11, 126, 0, 66, 7, 11, 7, 6, 1, 2, 103, 103, 0, 0, 10, 10, 1, 8,
+  0, 65, 5, 36, 0, 35, 0, 11,
+>>
+
+// `(type $t (func (result i32))) (table 1 funcref) (elem (i32.const 0) $f)
+//  (func $f (type $t) (result i32) (i32.const 42))
+//  (func (export "ci") (result i32) (call_indirect (type $t) (i32.const 0)))`
+const ci_full_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 127, 3, 3, 2, 0, 0, 4, 4, 1,
+  112, 0, 1, 7, 6, 1, 2, 99, 105, 0, 1, 9, 7, 1, 0, 65, 0, 11, 1, 0, 10, 14, 2,
+  4, 0, 65, 42, 11, 7, 0, 65, 0, 17, 0, 0, 11,
+>>
+
+// `(func (export "s") (param i32 i32 i32) (result i32)
+//    (select (local.get 0) (local.get 1) (local.get 2)))`
+const select_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 8, 1, 96, 3, 127, 127, 127, 1, 127, 3, 2, 1, 0,
+  7, 5, 1, 1, 115, 0, 0, 10, 11, 1, 9, 0, 32, 0, 32, 1, 32, 2, 27, 11,
+>>
+
+// `(func (export "s64") (param i64 i64 i32) (result i64)
+//    (select (local.get 0) (local.get 1) (local.get 2)))`
+const select64_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 8, 1, 96, 3, 126, 126, 127, 1, 126, 3, 2, 1, 0,
+  7, 7, 1, 3, 115, 54, 52, 0, 0, 10, 11, 1, 9, 0, 32, 0, 32, 1, 32, 2, 27, 11,
+>>
+
+// `(func (export "c") (param i64 i32 f32 f64) (result i32)
+//    (drop (i32.wrap_i64 (local.get 0))) (drop (i64.extend_i32_s (local.get 1)))
+//    (drop (i64.extend_i32_u (local.get 1))) (drop (i32.reinterpret_f32 (local.get 2)))
+//    (drop (f32.reinterpret_i32 (local.get 1))) (drop (i64.reinterpret_f64 (local.get 3)))
+//    (drop (i32.trunc_f64_u (local.get 3))) (i32.trunc_f32_s (local.get 2)))`
+const conv_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 9, 1, 96, 4, 126, 127, 125, 124, 1, 127, 3, 2,
+  1, 0, 7, 5, 1, 1, 99, 0, 0, 10, 35, 1, 33, 0, 32, 0, 167, 26, 32, 1, 172, 26,
+  32, 1, 173, 26, 32, 2, 188, 26, 32, 1, 190, 26, 32, 3, 189, 26, 32, 3, 171, 26,
+  32, 2, 168, 11,
+>>
+
+// `(memory 1) (data (i32.const 0) "abc") (start $init) (func $init)`
+const data_start_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 3, 2, 1, 0, 5, 3, 1, 0, 1, 8,
+  1, 0, 10, 4, 1, 2, 0, 11, 11, 9, 1, 0, 65, 0, 11, 3, 97, 98, 99,
+>>
+
+// `(func (export "fadd") (param f64 f64) (result f64) (f64.add (local.get 0) (local.get 1)))`
+const fadd_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 7, 1, 96, 2, 124, 124, 1, 124, 3, 2, 1, 0, 7,
+  8, 1, 4, 102, 97, 100, 100, 0, 0, 10, 9, 1, 7, 0, 32, 0, 32, 1, 160, 11,
 >>
