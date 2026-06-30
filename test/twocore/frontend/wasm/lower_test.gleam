@@ -341,6 +341,22 @@ pub fn fib_e2e_test() {
   catch_apply(mod, atom.create("fib"), [1]) |> should.equal(Ok(1))
 }
 
+/// REGRESSION (spec: a structured branch may target an `if`). A `br 0` inside an `if`
+/// arm exits the `if` itself — `f` is `(i32.add (if (result i32) (local.get 0)
+///   (then (br 0 (i32.const 100)) …dead…) (else (i32.const 5))) (i32.const 1))`.
+///
+/// Per the WASM spec a label index counts the enclosing structured blocks, and an `if`
+/// IS one of them; `br 0` from a then/else arm forwards out of the `if` carrying its
+/// result. So `f(1) == 101` (then taken: the `br` yields 100, then `+1`) and `f(0) == 6`
+/// (else: 5, then `+1`). The IR `If` carries no label, so the frontend hosts the `if`'s
+/// label in a wrapping `ir.Block`; before that fix this module failed to emit with
+/// `UnboundLabel`.
+pub fn br_to_if_e2e_test() {
+  let mod = load(build(br_to_if_wasm))
+  catch_apply(mod, atom.create("f"), [1]) |> should.equal(Ok(101))
+  catch_apply(mod, atom.create("f"), [0]) |> should.equal(Ok(6))
+}
+
 // ───────────────────────────── fixtures ─────────────────────────────
 
 const add_wasm: BitArray = <<
@@ -365,6 +381,19 @@ const fib_wasm: BitArray = <<
   0x62, 0x00, 0x00, 0x0a, 0x1e, 0x01, 0x1c, 0x00, 0x20, 0x00, 0x41, 0x02, 0x48,
   0x04, 0x7f, 0x20, 0x00, 0x05, 0x20, 0x00, 0x41, 0x01, 0x6b, 0x10, 0x00, 0x20,
   0x00, 0x41, 0x02, 0x6b, 0x10, 0x00, 0x6a, 0x0b, 0x0b,
+>>
+
+// `(func (export "f") (param i32) (result i32)
+//    (i32.add
+//      (if (result i32) (local.get 0)
+//        (then (br 0 (i32.const 100)) (i32.const 999))
+//        (else (i32.const 5)))
+//      (i32.const 1)))` — produced with wat2wasm. The `br 0` targets the `if`.
+const br_to_if_wasm: BitArray = <<
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x06, 0x01, 0x60, 0x01,
+  0x7f, 0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66, 0x00,
+  0x00, 0x0a, 0x17, 0x01, 0x15, 0x00, 0x20, 0x00, 0x04, 0x7f, 0x41, 0xe4, 0x00,
+  0x0c, 0x00, 0x41, 0xe7, 0x07, 0x05, 0x41, 0x05, 0x0b, 0x41, 0x01, 0x6a, 0x0b,
 >>
 
 // A module using `call_indirect` (out of Phase-1 scope) — produced with wat2wasm.

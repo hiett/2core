@@ -290,3 +290,81 @@ pub fn stdlib_gcd_e2e_test() {
   assert catch_apply(mod, atom.create("mygcd"), [48, 36]) == Ok(12)
   assert catch_apply(mod, atom.create("mygcd"), [1071, 462]) == Ok(21)
 }
+
+// ──────────────── multi-value & zero-result function boundaries (REGRESSION) ────────────────
+
+/// `swap2(a, b)` returns TWO values `<b, a>` (a multi-value result).
+fn swap2_fn() -> ir.Function {
+  ir.Function(
+    name: "swap2",
+    params: [ir.Local("p0", ir.TI64), ir.Local("p1", ir.TI64)],
+    result: [ir.TI64, ir.TI64],
+    locals: [],
+    body: ir.Values([ir.Var("p1"), ir.Var("p0")]),
+  )
+}
+
+/// `caller(x)` calls the multi-value `swap2(x, 7)`, binds its two results `<lo, hi>`, and
+/// returns `lo - hi`.
+fn use_swap2_fn() -> ir.Function {
+  ir.Function(
+    name: "caller",
+    params: [ir.Local("p0", ir.TI64)],
+    result: [ir.TI64],
+    locals: [],
+    body: ir.Let(
+      ["lo", "hi"],
+      ir.CallDirect("swap2", [ir.Var("p0"), ir.ConstI64(7)]),
+      ir.Let(
+        ["d"],
+        ir.Num(ir.ISub(ir.W64), [ir.Var("lo"), ir.Var("hi")]),
+        ir.Return([ir.Var("d")]),
+      ),
+    ),
+  )
+}
+
+/// REGRESSION: a function with MORE than one result (multi-value) compiles and its results
+/// round-trip through a call in order. A BEAM function returns exactly one value, so a
+/// multi-value result is packaged as a tuple at the boundary and destructured at the call
+/// site (the `fac-ssa` shape that previously emitted `ArityMismatch` then failed to build
+/// with "return count mismatch").
+///
+/// `swap2(x, 7) == <7, x>`, so `caller(x) == 7 - x`: `caller(2) == 5`; `caller(10) == 7-10
+/// == -3`, the i64 two's-complement bit pattern `2^64 - 3`. The asymmetric subtraction
+/// would expose a swapped destructure (it would compute `x - 7` instead).
+pub fn multi_value_call_e2e_test() {
+  let mod = load(module("multival", [swap2_fn(), use_swap2_fn()]))
+  assert catch_apply(mod, atom.create("caller"), [2]) == Ok(5)
+  assert catch_apply(mod, atom.create("caller"), [10])
+    == Ok(18_446_744_073_709_551_613)
+}
+
+/// `voiddiv(a, b)` computes signed `a / b` and DROPS it — a zero-result (`void`) function.
+fn voiddiv_fn() -> ir.Function {
+  ir.Function(
+    name: "voiddiv",
+    params: [ir.Local("p0", ir.TI32), ir.Local("p1", ir.TI32)],
+    result: [],
+    locals: [],
+    body: ir.Let(
+      ["x"],
+      ir.Num(ir.IDivS(ir.W32), [ir.Var("p0"), ir.Var("p1")]),
+      ir.Values([]),
+    ),
+  )
+}
+
+/// REGRESSION: a zero-result function compiles and still traps. A BEAM function must yield
+/// exactly one value, so the empty result list is packaged as a single unit value (the
+/// `traps.wast` `no_dce` shape that previously failed to build with "return count
+/// mismatch"). The dropped division is NOT eliminated, so its trap still fires:
+/// `voiddiv(6, 2)` runs and returns (result discarded); `voiddiv(6, 0)` traps with
+/// `int_div_by_zero`.
+pub fn zero_result_fn_e2e_test() {
+  let mod = load(module("voidfn", [voiddiv_fn()]))
+  let assert Ok(_) = catch_apply(mod, atom.create("voiddiv"), [6, 2])
+  let assert Error(trap) = catch_apply(mod, atom.create("voiddiv"), [6, 0])
+  assert string.contains(trap, "wasm_trap")
+  assert string.contains(trap, "int_div_by_zero")
+}

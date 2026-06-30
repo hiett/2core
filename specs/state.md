@@ -99,6 +99,18 @@ broaden the `own` stdlib + BIF allowlist; then the Porffor bridge + its ABI `rt_
 
 ## Change log
 
+- **Robustness fix-pass — the 3 conformance-surfaced codegen gaps are FIXED** (no IR/ABI
+  change needed; entirely in `emit_core.gleam` + `lower.gleam`). Root causes & fixes:
+  (1) **multi-result calls** (the `ArityMismatch` — actual trigger was `fac-ssa`'s 3-result
+  helper, not loop-params) → emit_core now binds a multi-result call as a value list and
+  unpacks per the callee's result arity; (2) **a BEAM function returns exactly one value**
+  → a function-boundary packager (0 results → `'ok'`, 1 → bare, N → N-tuple) + the
+  trapping-op `case` arms unified to one value each; (3) **`UnboundLabel` on a branch-target
+  `if`** → lower wraps an `If` that is a `br` target in a label-bearing `Block` (only when
+  needed). 3 end-to-end regression tests added. **Conformance: 1699→1740 pass (+41),
+  1400→1359 skip (−41), fail still 0** (fac 0→6, labels 3→28, traps 0→10). Remaining skips
+  on those files are genuinely out of Phase-1 scope (`assert_exhaustion`, trapping
+  float→int `trunc_*`, memory `load`). 313 tests, zero warnings.
 - **Unit 11 landed (capstone) — PHASE 1 COMPLETE.** A real WASM binary now compiles
   through decode→validate→lower→**ir_lower(Safe)**→emit→build→run on the BEAM, driven by a
   CLI. `ir_lower` enforces the `rt_bif` allowlist fail-closed (allowlisted `("std","gcd")`

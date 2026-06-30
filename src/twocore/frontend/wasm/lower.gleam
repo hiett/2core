@@ -637,6 +637,7 @@ fn lower_if(
       use else_res <- result.try(go(after_else, ctx, child_else))
       use #(else_expr, rest, c3) <- result.try(expect_end(else_res))
       finish_if(
+        label,
         cond,
         result_types,
         then_expr,
@@ -657,6 +658,7 @@ fn lower_if(
       let else_vals = list.append(list.reverse(inner_stack), carried_curr)
       let else_expr = ir.Values(else_vals)
       finish_if(
+        label,
         cond,
         result_types,
         then_expr,
@@ -675,7 +677,16 @@ fn lower_if(
 
 /// Bind an `if`'s results and continue lowering after it (shared by the with/without
 /// `else` paths).
+///
+/// A WASM `if` is itself a labelled block: `br 0` (from anywhere inside, possibly nested)
+/// exits the `if` forward. The IR `If` node carries **no** label, so when any branch
+/// targets this `if`'s frame the lowering must give the label a home: it wraps the `If` in
+/// an `ir.Block(label, result_types, If(..))` — the same `result_types`, so the wrapper is
+/// arity-transparent — and the `Break(label, …)` then resolves to that block's forward
+/// exit. When the `if` is *not* a branch target (the common case — `fib`/`fac`), the bare
+/// `If` is emitted with no wrapper.
 fn finish_if(
+  label: String,
   cond: ir.Value,
   result_types: List(ir.ValType),
   then_expr: ir.Expr,
@@ -688,16 +699,37 @@ fn finish_if(
   ctx: LCtx,
   st: LState,
 ) -> Result(GoResult, LowerError) {
-  finish_construct(
-    ir.If(cond, result_types, then_expr, else_expr),
-    out_n,
-    carried,
-    below,
-    rest,
-    counter,
-    ctx,
-    st,
-  )
+  let if_expr = ir.If(cond, result_types, then_expr, else_expr)
+  let construct = case
+    expr_breaks_to(then_expr, label) || expr_breaks_to(else_expr, label)
+  {
+    True -> ir.Block(label, result_types, if_expr)
+    False -> if_expr
+  }
+  finish_construct(construct, out_n, carried, below, rest, counter, ctx, st)
+}
+
+/// True if `expr` contains a `Break(label, _)` — a `br` resolved to this `label`. Labels
+/// are unique within a function (fresh-generated), so there is no shadowing and a plain
+/// recursive scan over the structured sub-expressions is exact. Used by `finish_if` to
+/// decide whether a WASM `if` needs an `ir.Block` wrapper to host its label.
+fn expr_breaks_to(expr: ir.Expr, label: String) -> Bool {
+  case expr {
+    ir.Break(l, _) -> l == label
+    ir.Let(_, rhs, body) ->
+      expr_breaks_to(rhs, label) || expr_breaks_to(body, label)
+    ir.If(_, _, t, e) -> expr_breaks_to(t, label) || expr_breaks_to(e, label)
+    ir.Switch(_, _, arms, default) ->
+      list.any(arms, fn(a) {
+        let ir.SwitchArm(_, b) = a
+        expr_breaks_to(b, label)
+      })
+      || expr_breaks_to(default, label)
+    ir.Block(_, _, body) -> expr_breaks_to(body, label)
+    ir.Loop(_, _, _, body) -> expr_breaks_to(body, label)
+    ir.Charge(_, body) -> expr_breaks_to(body, label)
+    _ -> False
+  }
 }
 
 /// Bind a construct's `out_arity` stack results and its carried locals to fresh names,

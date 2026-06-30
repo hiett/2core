@@ -386,23 +386,35 @@ fn div_fn() -> ir.Function {
   )
 }
 
-/// A trapping `Num` (`IDivS`) → `case call '<num>':'i32_div_s'(A,B) of <{'ok',X}> -> …
-/// <{'error',E}> -> call '<trap>':'raise'(E) end` — the Result-`case`-and-`raise` shape.
+/// A trapping `Num` (`IDivS`) → `let <R> = case call '<num>':'i32_div_s'(A,B) of
+/// <{'ok',X}> -> X <{'error',E}> -> call '<trap>':'raise'(E) end in …` — the
+/// Result-`case`-and-`raise` shape, reduced to ONE bound value and threaded on.
+///
+/// Both `case` arms yield exactly one value (the unwrapped `X`, or the never-returning
+/// `raise`), so the shape is arity-correct in *any* surrounding context — including a
+/// 0-result function, where inlining the continuation into only the `ok` arm would make
+/// the two arms disagree on value-list arity (a Core "return count mismatch").
 pub fn trapping_num_is_case_and_raise_test() {
   let b = binding()
-  let assert CCase(
-    CCall(CAtom(num), CAtom("i32_div_s"), [CVar("p0"), CVar("p1")]),
-    [
-      CClause([PTuple([PAtom("ok"), PVar(_)])], CAtom("true"), _ok),
-      CClause(
-        [PTuple([PAtom("error"), PVar(e)])],
-        CAtom("true"),
-        CCall(CAtom(trap), CAtom("raise"), [CVar(e2)]),
-      ),
-    ],
+  let assert CLet(
+    [_r],
+    CCase(
+      CCall(CAtom(num), CAtom("i32_div_s"), [CVar("p0"), CVar("p1")]),
+      [
+        CClause([PTuple([PAtom("ok"), PVar(x)])], CAtom("true"), CVar(x2)),
+        CClause(
+          [PTuple([PAtom("error"), PVar(e)])],
+          CAtom("true"),
+          CCall(CAtom(trap), CAtom("raise"), [CVar(e2)]),
+        ),
+      ],
+    ),
+    _threaded,
   ) = body_of(module_with(div_fn()), "d")
   assert num == b.num_module
   assert trap == b.trap_module
+  // the `{'ok', X}` arm yields exactly the matched value X (the unwrapped result).
+  assert x == x2
   // the raised payload is exactly the matched `{'error', E}` value.
   assert e == e2
 }

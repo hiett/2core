@@ -62,8 +62,8 @@ import gleam/set.{type Set}
 import gleam/string
 import twocore/backend/core_erlang.{
   type CClause, type CExpr, type CModule, type FName, type FunDef, CApply, CAtom,
-  CCall, CCase, CClause, CCons, CFun, CInt, CLet, CLetrec, CNil, CValues, CVar,
-  FName, FunDef, PAtom, PInt, PTuple, PVar,
+  CCall, CCase, CClause, CCons, CFun, CInt, CLet, CLetrec, CNil, CTuple, CValues,
+  CVar, FName, FunDef, PAtom, PInt, PTuple, PVar,
 }
 import twocore/ir.{
   type ConvOp, type Expr, type Function, type IntWidth, type Module, type NumOp,
@@ -106,11 +106,20 @@ pub type EmitError {
 
 // ─────────────────────────────── internal state ───────────────────────────────
 
-/// Read-only emission context shared across one module: the runtime `Binding` (the
-/// chokepoint table) and the module's `function name → arity` map (for resolving
-/// `CallDirect`/exports).
+/// Read-only emission context shared across one module:
+/// - `binding`: the runtime `Binding` (the chokepoint table).
+/// - `fn_arity`: each defined function's PARAMETER count (the `apply 'f'/n` arity, for
+///   resolving `CallDirect`/exports).
+/// - `fn_results`: each defined function's RESULT count, needed to unpack a call: a
+///   function returning 0/1/many values is realised as a single BEAM value (a dummy / the
+///   bare value / a tuple — see `function_return`), so the caller must unpack it back into
+///   the right number of values.
 type Ctx {
-  Ctx(binding: Binding, fn_arity: Dict(String, Int))
+  Ctx(
+    binding: Binding,
+    fn_arity: Dict(String, Int),
+    fn_results: Dict(String, Int),
+  )
 }
 
 /// A compile-time continuation — what to do with the value list an `Expr` yields.
@@ -214,7 +223,10 @@ pub fn emit_module(
   let fn_arity =
     list.map(module.functions, fn(f) { #(f.name, list.length(f.params)) })
     |> dict.from_list
-  let ctx = Ctx(binding: binding, fn_arity: fn_arity)
+  let fn_results =
+    list.map(module.functions, fn(f) { #(f.name, list.length(f.result)) })
+    |> dict.from_list
+  let ctx = Ctx(binding: binding, fn_arity: fn_arity, fn_results: fn_results)
   use defs <- result.try(
     list.try_map(module.functions, fn(f) { emit_function(f, ctx) }),
   )
@@ -297,7 +309,7 @@ fn emit(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case expr {
     Values(vs) -> apply_cont(cont, list.map(vs, emit_value), state, ctx)
-    Return(vs) -> Ok(#(value_list(list.map(vs, emit_value)), state))
+    Return(vs) -> Ok(#(function_return(list.map(vs, emit_value)), state))
     Num(op, args) -> emit_num(op, args, cont, state, ctx)
     Convert(op, arg) -> emit_convert(op, arg, cont, state, ctx)
     CallDirect(fn_name, args) ->
@@ -338,7 +350,7 @@ fn apply_cont(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case cont {
-    KReturn -> Ok(#(value_list(vals), state))
+    KReturn -> Ok(#(function_return(vals), state))
     KJump(target) -> Ok(#(CApply(target, vals), state))
     KBind(names, body, next) ->
       case list.length(names) == list.length(vals) {
@@ -348,6 +360,72 @@ fn apply_cont(
           Ok(#(CLet(names, value_list(vals), body_c), state2))
         }
       }
+  }
+}
+
+/// Dispose a single Core expression `produced` that itself yields a value LIST (a
+/// `CallDirect`/`CallHost` to a function returning 0, 1, or many values) according to
+/// `cont`.
+///
+/// A `CallDirect`/`CallHost` is realised as a single BEAM `apply`/`call` whose result is
+/// ONE value — but the callee logically returns `r` values, packaged by `function_return`
+/// (a dummy for `r==0`, the bare value for `r==1`, an `r`-tuple for `r>=2`). This routine
+/// UNPACKS that single value back into `r` Core values and disposes them through `cont`.
+///
+/// - `KReturn`: the caller's own result is the same `r`-valued thing, already packaged
+///   identically — yield `produced` straight through (no unpack/repack).
+/// - otherwise: unpack and feed `apply_cont`:
+///   - `r==0`: bind+discard the dummy (`let <_> = produced in …`), continue with no values;
+///   - `r==1`: continue with the bare value (this matches the legacy single-result shape
+///     exactly, so existing `.core` goldens are preserved);
+///   - `r>=2`: destructure the result tuple `<{V1,…,Vr}>` and continue with `V1,…,Vr`.
+///
+/// `r` is the callee's result count (from `ctx.fn_results` for `CallDirect`; `1` for a
+/// `CallHost`, whose Phase-1 fates each yield one value or raise). Validation guarantees
+/// `r` matches the surrounding binding, so no arity error is raised here.
+fn apply_cont_call(
+  cont: Cont,
+  produced: CExpr,
+  r: Int,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case cont {
+    KReturn -> Ok(#(produced, state))
+    _ ->
+      case r {
+        0 -> {
+          let #(g, state2) = fresh_var(state)
+          use #(rest, state3) <- result.try(apply_cont(cont, [], state2, ctx))
+          Ok(#(CLet([g], produced, rest), state3))
+        }
+        1 -> apply_cont(cont, [produced], state, ctx)
+        _ -> {
+          let #(names, state2) = fresh_n_vars(state, r)
+          use #(rest, state3) <- result.try(apply_cont(
+            cont,
+            list.map(names, CVar),
+            state2,
+            ctx,
+          ))
+          let clause =
+            CClause([PTuple(list.map(names, PVar))], CAtom("true"), rest)
+          Ok(#(CCase(produced, [clause]), state3))
+        }
+      }
+  }
+}
+
+/// `n` fresh Core-variable raw names (in order), each distinct from every reserved name,
+/// plus the advanced state. Used to destructure a multi-value call result tuple.
+fn fresh_n_vars(state: EmitState, n: Int) -> #(List(String), EmitState) {
+  case n <= 0 {
+    True -> #([], state)
+    False -> {
+      let #(name, state2) = fresh_var(state)
+      let #(rest, state3) = fresh_n_vars(state2, n - 1)
+      #([name, ..rest], state3)
+    }
   }
 }
 
@@ -414,25 +492,38 @@ fn emit_num(
   case is_trapping(op) {
     False -> apply_cont(cont, [call], state, ctx)
     True -> {
+      // A trapping op yields EXACTLY ONE value (or raises). Reduce it to a single bound
+      // variable `rvar` via a `case` whose BOTH clauses yield one value — the unwrapped
+      // `{ok,X}` result, or the never-returning `raise` on `{error,E}` — then thread that
+      // single value through `cont` normally. Binding once and threading once keeps the
+      // two `case` arms arity-consistent (both yield 1) regardless of the surrounding
+      // value-list arity: a 0-result function (cont yields `<>`) or a multi-value join
+      // point would break a structure that inlined `cont` into only the `ok` arm, because
+      // then the `error` arm's lone `raise` value would disagree with the `ok` arm's arity
+      // (the Core compiler rejects that as a "return count mismatch").
       let #(xvar, state2) = fresh_var(state)
       let #(evar, state3) = fresh_var(state2)
-      use #(ok_body, state4) <- result.try(apply_cont(
-        cont,
-        [CVar(xvar)],
-        state3,
-        ctx,
-      ))
-      let err_body = raise_trap(ctx, CVar(evar))
-      let case_expr =
+      let #(rvar, state4) = fresh_var(state3)
+      let result_case =
         CCase(call, [
-          CClause([PTuple([PAtom("ok"), PVar(xvar)])], CAtom("true"), ok_body),
+          CClause(
+            [PTuple([PAtom("ok"), PVar(xvar)])],
+            CAtom("true"),
+            CVar(xvar),
+          ),
           CClause(
             [PTuple([PAtom("error"), PVar(evar)])],
             CAtom("true"),
-            err_body,
+            raise_trap(ctx, CVar(evar)),
           ),
         ])
-      Ok(#(case_expr, state4))
+      use #(rest, state5) <- result.try(apply_cont(
+        cont,
+        [CVar(rvar)],
+        state4,
+        ctx,
+      ))
+      Ok(#(CLet([rvar], result_case, rest), state5))
     }
   }
 }
@@ -480,13 +571,16 @@ fn emit_call_direct(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case dict.get(ctx.fn_arity, fn_name) {
     Error(_) -> Error(UnknownFunction(fn_name))
-    Ok(arity) ->
-      apply_cont(
+    Ok(arity) -> {
+      let r = result.unwrap(dict.get(ctx.fn_results, fn_name), 1)
+      apply_cont_call(
         cont,
-        [CApply(FName(fn_name, arity), list.map(args, emit_value))],
+        CApply(FName(fn_name, arity), list.map(args, emit_value)),
+        r,
         state,
         ctx,
       )
+    }
   }
 }
 
@@ -514,20 +608,23 @@ fn emit_call_host(
   let cargs = list.map(args, emit_value)
   case resolve_stdlib(capability, name) {
     Some(fn_name) ->
-      apply_cont(
+      // A vetted `own`-stdlib call yields a single value (Phase-1: `gcd/2`).
+      apply_cont_call(
         cont,
-        [CCall(CAtom(ctx.binding.stdlib_module), CAtom(fn_name), cargs)],
+        CCall(CAtom(ctx.binding.stdlib_module), CAtom(fn_name), cargs),
+        1,
         state,
         ctx,
       )
     None -> {
+      // The deny-all host yields a single value or raises (`{capability_denied,…}`).
       let call =
         CCall(CAtom(ctx.binding.host_module), CAtom("call_host"), [
           CAtom(capability),
           CAtom(name),
           core_list(cargs),
         ])
-      apply_cont(cont, [call], state, ctx)
+      apply_cont_call(cont, call, 1, state, ctx)
     }
   }
 }
@@ -738,10 +835,34 @@ fn emit_value(v: Value) -> CExpr {
 }
 
 /// A Core value list: a single value is itself; zero or many become `<…>` (`CValues`).
+/// Used for *internal* value-list positions (the RHS of a `let <names…> = … in …` and the
+/// arguments of a join-point `apply`), where Core Erlang permits an arbitrary-arity value
+/// list. NOT used at a function/join-point return boundary — see `function_return`.
 fn value_list(exprs: List(CExpr)) -> CExpr {
   case exprs {
     [single] -> single
     _ -> CValues(exprs)
+  }
+}
+
+/// Package a function/join-point's result value list into the SINGLE value a BEAM function
+/// must return (Core Erlang rejects a top-level body that yields a value list of arity ≠ 1
+/// as a "return count mismatch"):
+///
+/// - 0 results (a `void`/zero-result WASM function) → the canonical unit atom `'ok'`. The
+///   conformance driver ignores a zero-result return, so the concrete value is immaterial;
+///   what matters is that exactly one value is produced so the function compiles (and any
+///   trap inside it still raises).
+/// - 1 result → the bare value (the common case; unchanged).
+/// - N≥2 results (multi-value) → an N-tuple `{V1,…,Vn}`. The matching `apply_cont_call`
+///   destructures this tuple at the call site, so the multi-value convention round-trips.
+///   Direct multi-value *invocation* remains out of Phase-1 scope (the driver skips it);
+///   this only makes multi-value functions and their callers compile and compute correctly.
+fn function_return(exprs: List(CExpr)) -> CExpr {
+  case exprs {
+    [] -> CAtom("ok")
+    [single] -> single
+    _ -> CTuple(exprs)
   }
 }
 
