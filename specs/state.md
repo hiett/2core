@@ -35,7 +35,7 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 | **03** Core Erlang AST & printer | [`03`](phase-1/03-core-erlang-backend.md) | **done** | — | `.core` AST (`«CORE-AST»`) + pretty-printer; printed ASTs compile+run on real OTP-29 (add/fac/classify); atom escaping proven byte-identical to OTP `io_lib:write_string`. |
 | **04** `build_beam` driver & FFI | [`04`](phase-1/04-build-beam-driver.md) | **done** | — | `.core` text → loaded `.beam` proven (hand-written `.core` compiled, loaded, ran on BEAM); the `«FFI-SHIM»`; `gleam_erlang` added. |
 | **05** WASM decoder & AST | [`05`](phase-1/05-wasm-decoder.md) | `unclaimed` | — | `.wasm` → WASM AST (`«WASM-AST»`); LEB128 + fail-closed decoding; frontend input ready. |
-| **06** `rt_num` numerics (`bif`) | [`06`](phase-1/06-rt-num-numerics.md) | `unclaimed` | `«RTNUM-SIG-FROZEN»` | The single source of numeric-fidelity truth (tier-P reference impl), property-tested vs the spec. |
+| **06** `rt_num` numerics (`bif`) | [`06`](phase-1/06-rt-num-numerics.md) | **done** | `«RTNUM-SIG-FROZEN»` | All 90 bodies implemented; the numeric-fidelity reference (tier-P), 40 spec-corner/property tests. Build now **zero-warning**. |
 | **07** Conformance harness & corpus | [`07`](phase-1/07-conformance-harness.md) | `unclaimed` | — (engine side); IR/backend (compare side) | The spec-suite oracle + the Phase-1 acceptance corpus; "is our output spec-correct?" answerable. |
 | **08** `emit_core` (IR → Core) | [`08`](phase-1/08-emit-core.md) | `unclaimed` | `«IR-FROZEN»`,`«CORE-AST»`,`«ABI-FROZEN»`,`«RTNUM-SIG-FROZEN»` | The backend: structured control → `letrec`+tail-calls; the binding chokepoint; codegen security-invariant test. |
 | **09** Runtime defaults | [`09`](phase-1/09-runtime-defaults.md) | `unclaimed` | `«ABI-FROZEN»` | `rt_trap`/`rt_host`(deny-all)/`rt_meter`(fuel)/`rt_stdlib`(own min)/`rt_bif`(allowlist) — the Safe seams. |
@@ -99,6 +99,14 @@ broaden the `own` stdlib + BIF allowlist; then the Porffor bridge + its ABI `rt_
 
 ## Change log
 
+- **Unit 06 landed (rt_num bodies).** All 90 frozen signatures implemented in pure Gleam
+  over BEAM bignums + bit syntax; the numeric-fidelity reference (high-level §9.1).
+  40 spec-corner/property tests (div_s INT_MIN/-1 overflow trap, rem_s INT_MIN/-1 == 0,
+  /0 traps, shift-count mod N, sign-fill, extend/wrap, reinterpret, canonical-NaN,
+  signed-zero min/max, trunc_sat clamps). **Build is now zero-warning** (the 90 `todo`
+  warnings are gone). Verified correction to the doc: f32 bit-build *saturates* to ±Inf
+  on OTP 29 (does not raise `badarith`); only f64 overflow needs the guard, handled
+  exactly via the IEEE round-to-nearest threshold.
 - **Unit 04 landed (build_beam + FFI shim).** A hand-written `.core` module compiled,
   loaded via `code:load_binary`, and ran on the BEAM with correct results (incl.
   hot-replace), and malformed `.core` returns a typed `BuildError` (no panic).
