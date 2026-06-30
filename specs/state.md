@@ -20,7 +20,7 @@ units (see overview §3). Announce milestones here the moment they land.
 | `«RTNUM-SIG-FROZEN»` — `rt_num.gleam` signatures (90 fns) | 01 | **FROZEN ✓** | 06, 08 |
 | `«CORE-AST»` — `backend/core_erlang.gleam` types | 03 (day 1) | `unclaimed` | 08 |
 | `«WASM-AST»` — `frontend/wasm/ast.gleam` types + `DecodeError` | 05 (day 1) | `unclaimed` | 10 (validate) |
-| `«FFI-SHIM»` — `twocore_codegen_ffi.erl` (compile+load) | 04 (day 1) | `unclaimed` | 03 (verify), 08/10 (e2e tests) |
+| `«FFI-SHIM»` — `twocore_codegen_ffi.erl` (compile+load) | 04 | **published ✓** | 03 (verify), 08/10 (e2e tests) |
 
 ---
 
@@ -33,7 +33,7 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 | **01** Interface freeze | [`01`](phase-1/01-interface-freeze.md) | **done** | — | IR types, `.ir` grammar, runtime ABI, rt_num signatures (90 fns, `todo` bodies → 06), PipelineError stub all frozen; neutrality review signed off; 3 golden `.ir` + strawman test green. The keystones exist. |
 | **02** `.ir` printer & parser | [`02`](phase-1/02-ir-textual-form.md) | `unclaimed` | `«IR-FROZEN»` | `.ir` round-trips; every stage can dump/load IR as the inter-stage contract (D7). |
 | **03** Core Erlang AST & printer | [`03`](phase-1/03-core-erlang-backend.md) | `unclaimed` | — (self-frozen) | A `.core` AST + verified pretty-printer; `08` can build Core Erlang and get compilable text. |
-| **04** `build_beam` driver & FFI | [`04`](phase-1/04-build-beam-driver.md) | `unclaimed` | — | `.core` text → loaded `.beam`; the `«FFI-SHIM»`; the BEAM-loading seam (D10) proven with hand-written `.core`. |
+| **04** `build_beam` driver & FFI | [`04`](phase-1/04-build-beam-driver.md) | **done** | — | `.core` text → loaded `.beam` proven (hand-written `.core` compiled, loaded, ran on BEAM); the `«FFI-SHIM»`; `gleam_erlang` added. |
 | **05** WASM decoder & AST | [`05`](phase-1/05-wasm-decoder.md) | `unclaimed` | — | `.wasm` → WASM AST (`«WASM-AST»`); LEB128 + fail-closed decoding; frontend input ready. |
 | **06** `rt_num` numerics (`bif`) | [`06`](phase-1/06-rt-num-numerics.md) | `unclaimed` | `«RTNUM-SIG-FROZEN»` | The single source of numeric-fidelity truth (tier-P reference impl), property-tested vs the spec. |
 | **07** Conformance harness & corpus | [`07`](phase-1/07-conformance-harness.md) | `unclaimed` | — (engine side); IR/backend (compare side) | The spec-suite oracle + the Phase-1 acceptance corpus; "is our output spec-correct?" answerable. |
@@ -99,6 +99,14 @@ broaden the `own` stdlib + BIF allowlist; then the Porffor bridge + its ABI `rt_
 
 ## Change log
 
+- **Unit 04 landed (build_beam + FFI shim).** A hand-written `.core` module compiled,
+  loaded via `code:load_binary`, and ran on the BEAM with correct results (incl.
+  hot-replace), and malformed `.core` returns a typed `BuildError` (no panic).
+  `gleam_erlang v1.3.0` added. Two real bugs were corrected in the unit-doc's "verified"
+  shim (they only surface when called *from Gleam*, not from an Erlang shell): the
+  scan/parse error branches returned a bare binary instead of a `[Binary]` list, and
+  `load_module`'s filename must be an Erlang charlist (`unicode:characters_to_list`), not
+  a Gleam-`String` binary. Both fixed + documented inline in `twocore_codegen_ffi.erl`.
 - **Unit 01 landed (interface freeze).** IR types, runtime `Binding` ABI + calling
   convention, the complete 90-function `rt_num` signature set (`todo` bodies, owned next
   by unit 06), and `PipelineError` are frozen. `gleam build` clean except the 90
