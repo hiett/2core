@@ -38,7 +38,7 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 | **06** `rt_num` numerics (`bif`) | [`06`](phase-1/06-rt-num-numerics.md) | **done** | `«RTNUM-SIG-FROZEN»` | All 90 bodies implemented; the numeric-fidelity reference (tier-P), 40 spec-corner/property tests. Build now **zero-warning**. |
 | **07** Conformance harness & corpus | [`07`](phase-1/07-conformance-harness.md) | `unclaimed` | — (engine side); IR/backend (compare side) | The spec-suite oracle + the Phase-1 acceptance corpus; "is our output spec-correct?" answerable. |
 | **08** `emit_core` (IR → Core) | [`08`](phase-1/08-emit-core.md) | `unclaimed` | `«IR-FROZEN»`,`«CORE-AST»`,`«ABI-FROZEN»`,`«RTNUM-SIG-FROZEN»` | The backend: structured control → `letrec`+tail-calls; the binding chokepoint; codegen security-invariant test. |
-| **09** Runtime defaults | [`09`](phase-1/09-runtime-defaults.md) | `unclaimed` | `«ABI-FROZEN»` | `rt_trap`/`rt_host`(deny-all)/`rt_meter`(fuel)/`rt_stdlib`(own min)/`rt_bif`(allowlist) — the Safe seams. |
+| **09** Runtime defaults | [`09`](phase-1/09-runtime-defaults.md) | **done** | `«ABI-FROZEN»` | `rt_trap.raise/1`, `rt_host.call_host/3` (deny-all), `rt_meter.charge/1` (tier-O pdict fuel), `rt_stdlib.gcd/2` (own), `rt_bif` (build-time allowlist). 34 fail-closed/security tests. |
 | **10** WASM validate & lower | [`10`](phase-1/10-wasm-validate-and-lower.md) | `unclaimed` | `«WASM-AST»` (validate); `«IR-FROZEN»` (lower) | `full` validation (security boundary) + WASM AST → shared IR. |
 | **11** ir_lower, linker, Safe profile, CLI (capstone) | [`11`](phase-1/11-ir-lower-linker-cli.md) | `unclaimed` | all of the above | The `ir_lower` pass, the linker + Safe profile, the per-stage CLI (decision #5), and the **end-to-end differential acceptance** — Phase-1 goal proven. |
 
@@ -99,6 +99,22 @@ broaden the `own` stdlib + BIF allowlist; then the Porffor bridge + its ABI `rt_
 
 ## Change log
 
+- **Unit 09 landed (Safe-mode runtime defaults).** `rt_trap`/`rt_host`/`rt_meter`/
+  `rt_stdlib`/`rt_bif` + 34 security/fail-closed tests; zero warnings. **Pinned
+  cross-unit conventions** (units 08 & 11 must follow):
+  - Runtime ABI the generated code calls: `rt_trap:raise/1` (reason = the snake_case
+    atom of the `TrapReason` ctor; raises error-class `{wasm_trap, Kind}`),
+    `rt_host:call_host/3` (deny-all, raises `{capability_denied, Cap, Name}`),
+    `rt_meter:charge/1`.
+  - **`rt_meter` is tier-O** (process-dictionary fuel counter, observable via
+    `fuel_consumed/0`) — confirmed in-bounds for Safe (P or O, never N).
+  - **`call_host` → own-stdlib triple (PINNED):** IR `CallHost(capability:"std",
+    name:"gcd")` resolves (by `ir_lower`, unit 11) to `rt_stdlib:gcd/2`; the `rt_bif`
+    allowlist contains exactly `("twocore@runtime@rt_stdlib","gcd",2)`. Unit 08 emits
+    the direct call; unit 11 does the rewrite.
+  - `rt_trap.spec_trap_message/1` maps each `TrapReason` → the WASM spec trap-message
+    substring (for the unit-07 harness): int_div_by_zero→"integer divide by zero",
+    int_overflow→"integer overflow", unreachable→"unreachable".
 - **Unit 06 landed (rt_num bodies).** All 90 frozen signatures implemented in pure Gleam
   over BEAM bignums + bit syntax; the numeric-fidelity reference (high-level §9.1).
   40 spec-corner/property tests (div_s INT_MIN/-1 overflow trap, rem_s INT_MIN/-1 == 0,
