@@ -9,10 +9,25 @@
 //// function arities are unchanged — the state handle never becomes a loop-carried value
 //// (it stays hidden in the cell), preserving the Phase-1 constant-space tail loop.
 ////
+//// **The key.** The cell lives under ONE fixed key, the 0-field Gleam constructor
+//// `TwocoreRtState`, which compiles to the unique, namespace-hygienic atom
+//// `twocore_rt_state` (exactly the `rt_meter` `TwocoreRtMeterFuel → twocore_rt_meter_fuel`
+//// pattern). One key holds the WHOLE `{mem, globals, table}` record, so it cannot collide
+//// with `rt_meter`'s fuel key (or any other pdict use) and a (re)seed is an atomic
+//// one-`put` replacement of all prior state.
+////
+//// **Tier-O, by reference, constant space.** Reads use `erlang:get/1`, which returns the
+//// stored term BY REFERENCE (no copy); writes use `erlang:put/2`, which replaces a single
+//// root (the superseded record becomes garbage, GC'd with the process). This is the proven
+//// `rt_meter` posture (a 100k-iteration pdict store loop was constant-space on OTP 29). It
+//// is tier-O (OTP-native, memory-safe, no NIF), which Safe permits. ETS is the WRONG cell
+//// here: it deep-copies the whole term on every read/write and has no auto-GC.
+////
 //// **Fail-closed (E3).** Operating on an UN-SEEDED cell is an internal invariant
 //// violation (it is unreachable under the one-instance-one-process harness contract), NOT
-//// a WASM `TrapReason`: the bodies raise a distinct internal error (a node-safe process
-//// crash) rather than reading garbage. Tier-O (process-local), never NIF.
+//// a WASM `TrapReason`: the bodies raise a distinct internal error (a node-safe `panic`)
+//// rather than reading garbage. Reading garbage out of an empty pdict — fabricating a
+//// zeroed cell to "recover" — is exactly the bug this guard exists to prevent.
 ////
 //// **Opacity.** `rt_state` does NOT import `rt_mem`/`rt_table`, so there is no circular
 //// import: the memory and table values are held as `gleam/dynamic.Dynamic`. `rt_mem` owns
@@ -20,12 +35,49 @@
 //// own field via `mem_get`/`mem_put` / `table_get`/`table_put`. Mutable globals are
 //// raw-bit-pattern `Int`s keyed by name.
 ////
-//// NB (freeze): the public signatures below are frozen by name/arity/types. Their `todo`
-//// bodies leave every parameter unused, so each is written `_name` (the Gleam idiom for an
-//// unimplemented stub); unit 03 drops the underscore when it implements the body.
+//// **Globals are raw bits (D5).** i32/i64/f32/f64 globals are all stored identically as a
+//// raw bit-pattern `Int`. f32/f64 are NEVER round-tripped through a BEAM double (a double
+//// cannot hold NaN payloads / signalling bits), so `rt_state` does no float math and needs
+//// no per-global type tag.
+////
+//// **Effect note (E6).** `global.get`/`global.set` (and the mem/table accessors) are
+//// side-effecting: a future optimizer must treat them as barriers — never CSE, reorder, or
+//// dead-code-eliminate across them.
+////
+//// **Pitfall — one-instance-one-process is load-bearing.** pdict is strictly per-process.
+//// If a host or another process calls an instance export directly, `rt_state` reads the
+//// CALLER's (empty) pdict → silent corruption. The contract is that every cross-process
+//// entry goes via the instance's owned process; the harness (unit 11) enforces it.
 
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
+
+/// `erlang:put/2` — store `value` under `key` in the current process dictionary; returns
+/// the previous value (or the atom `undefined` if unset), which callers here discard.
+/// Direct BIF reference; process-local, cannot crash the node.
+@external(erlang, "erlang", "put")
+fn erlang_put(key: k, value: v) -> Dynamic
+
+/// `erlang:erase/1` — remove `key` from the current process dictionary, returning its
+/// previous value (or `undefined`), which callers here discard. Direct BIF reference;
+/// process-local, cannot crash the node.
+@external(erlang, "erlang", "erase")
+fn erlang_erase(key: k) -> Dynamic
+
+/// Read this process's cell with a sound presence check (the `twocore_`-namespaced shim,
+/// mirroring `twocore_codegen_ffi`/`twocore_cli_ffi`). Returns `Ok(state)` when the key
+/// holds a cell, or `Error(Nil)` when it is absent (the BIF's `undefined`). The present
+/// term is returned BY REFERENCE wrapped in `{ok, _}` (no deep copy) — `rt_state` is the
+/// sole writer of this key, so coercing the present term back to `InstanceState` is sound.
+@external(erlang, "twocore_rt_state_ffi", "read_cell")
+fn read_cell(key: k) -> Result(InstanceState, Nil)
+
+/// The process-dictionary key holding this process's whole instance cell. As a 0-field
+/// Gleam constructor it compiles to the unique, namespace-hygienic atom `twocore_rt_state`,
+/// so it cannot clash with `rt_meter`'s fuel key or any other library's pdict keys.
+type StateKey {
+  TwocoreRtState
+}
 
 /// The opaque per-instance state record held in the process cell.
 ///
@@ -45,7 +97,8 @@ pub type InstanceState {
 /// - `mem`: a fresh memory value built by `rt_mem.fresh` (rt_state stores it as-is,
 ///   preserving opacity — it never constructs memory).
 /// - `globals`: the initial globals as `#(name, raw_bits)` pairs (from each global's
-///   constant init expression).
+///   constant init expression), in declaration order. Duplicate names keep the LAST pair
+///   (`dict.from_list` semantics); validation guarantees unique global names upstream.
 /// - `table`: a fresh table value built by `rt_table.new` (stored as-is).
 pub type StateDecl {
   StateDecl(mem: Dynamic, globals: List(#(String, Int)), table: Dynamic)
@@ -55,66 +108,113 @@ pub type StateDecl {
 /// (one-instance-one-process). Called once by the generated `instantiate` entry before any
 /// element/data segment is written or the start function runs.
 ///
-/// - `decl`: the fresh mem/globals/table to install.
-/// - Returns `Nil`. The body installs the cell (a process-local side effect).
-pub fn seed(_decl: StateDecl) -> Nil {
-  todo
+/// - `decl`: the fresh mem/globals/table to install. `decl.globals` is materialised into a
+///   `Dict` keyed by name.
+/// - Returns `Nil`. The body installs the cell with a single `erlang:put/2`, so the reset
+///   is atomic: the old record (if any) is discarded wholesale and becomes garbage. Total;
+///   never raises.
+pub fn seed(decl: StateDecl) -> Nil {
+  put_cell(InstanceState(
+    mem: decl.mem,
+    globals: dict.from_list(decl.globals),
+    table: decl.table,
+  ))
 }
 
 /// Drop this process's cell (used between instances when a process is reused). After
 /// `clear`, any state accessor is an un-seeded-cell invariant violation until the next
 /// `seed`.
 ///
-/// - Returns `Nil`. Side-effecting (process-local).
+/// - Returns `Nil`. Side-effecting (process-local `erlang:erase/1`). Total; never raises
+///   (erasing an absent key is a no-op).
 pub fn clear() -> Nil {
-  todo
+  let _ = erlang_erase(TwocoreRtState)
+  Nil
 }
 
 /// Read the opaque memory value out of this process's cell (for `rt_mem`).
 ///
-/// - Returns the `Dynamic` memory value. Fail-closed: raises an internal error on an
-///   un-seeded cell (never returns garbage).
+/// - Returns the `Dynamic` memory value, unchanged (rt_state never inspects it). Fail-closed:
+///   `panic`s (a node-safe internal error) on an un-seeded cell — never returns garbage.
 pub fn mem_get() -> Dynamic {
-  todo
+  require_cell().mem
 }
 
 /// Write a new opaque memory value back into this process's cell (for `rt_mem`).
 ///
 /// - `mem`: the updated memory value (rt_mem produces it; rt_state stores it opaquely).
-/// - Returns `Nil`. Fail-closed on an un-seeded cell.
-pub fn mem_put(_mem: Dynamic) -> Nil {
-  todo
+/// - Returns `Nil`. Fail-closed: `panic`s on an un-seeded cell (the read-modify-write needs
+///   a present cell). The other fields (globals/table) are preserved by reference.
+pub fn mem_put(mem: Dynamic) -> Nil {
+  put_cell(InstanceState(..require_cell(), mem: mem))
 }
 
 /// Read the opaque table value out of this process's cell (for `rt_table`).
 ///
-/// - Returns the `Dynamic` table value. Fail-closed on an un-seeded cell.
+/// - Returns the `Dynamic` table value, unchanged. Fail-closed: `panic`s on an un-seeded
+///   cell — never returns garbage.
 pub fn table_get() -> Dynamic {
-  todo
+  require_cell().table
 }
 
 /// Write a new opaque table value back into this process's cell (for `rt_table`).
 ///
 /// - `table`: the updated table value (rt_table produces it; rt_state stores it opaquely).
-/// - Returns `Nil`. Fail-closed on an un-seeded cell.
-pub fn table_put(_table: Dynamic) -> Nil {
-  todo
+/// - Returns `Nil`. Fail-closed: `panic`s on an un-seeded cell. The other fields are
+///   preserved by reference.
+pub fn table_put(table: Dynamic) -> Nil {
+  put_cell(InstanceState(..require_cell(), table: table))
 }
 
 /// Read mutable global `name`'s current raw bit pattern from this process's cell.
 ///
 /// - `name`: the global's name.
-/// - Returns the global's value as a raw bit pattern (`Int`). Fail-closed on an un-seeded
-///   cell or an undeclared global (internal invariant violation, not a WASM trap).
-pub fn global_get(_name: String) -> Int {
-  todo
+/// - Returns the global's value as a raw bit pattern (`Int`) — bit-exact, never coerced to
+///   a BEAM double. Fail-closed: `panic`s (internal invariant violation, NOT a WASM trap)
+///   on an un-seeded cell OR an undeclared `name`; both are unreachable under validation +
+///   the harness contract, so they are defensive guards, never a normal path.
+pub fn global_get(name: String) -> Int {
+  case dict.get(require_cell().globals, name) {
+    Ok(value) -> value
+    Error(Nil) ->
+      panic as "rt_state.global_get: undeclared global (internal invariant violation)"
+  }
 }
 
 /// Write `value` (a raw bit pattern) into mutable global `name` in this process's cell.
 ///
 /// - `name`: the global's name.
-/// - `value`: the new raw bit pattern.
-/// - Returns `Nil`. Side-effecting; fail-closed on an un-seeded cell.
-pub fn global_set(_name: String, _value: Int) -> Nil {
-  todo
+/// - `value`: the new raw bit pattern (stored verbatim; rt_state does no float math).
+/// - Returns `Nil`. Side-effecting (read-cell → `dict.insert` → put-cell). Fail-closed:
+///   `panic`s on an un-seeded cell. `value` overwrites only `name`; other globals are
+///   preserved by reference. Immutability of `const` globals is enforced at validation
+///   (unit 08), not here — this is a mechanical write.
+pub fn global_set(name: String, value: Int) -> Nil {
+  let state = require_cell()
+  put_cell(
+    InstanceState(..state, globals: dict.insert(state.globals, name, value)),
+  )
+}
+
+// ── internal helpers ──────────────────────────────────────────────────────────
+
+/// Install `state` as this process's cell under the fixed key. The superseded record (if
+/// any) becomes garbage. Total; never raises. (Private: the seam between rt_state's public
+/// ops and the raw pdict BIF.)
+fn put_cell(state: InstanceState) -> Nil {
+  let _ = erlang_put(TwocoreRtState, state)
+  Nil
+}
+
+/// Read this process's cell, FAILING CLOSED on an un-seeded cell. `panic`s a distinct
+/// internal error (node-safe) rather than fabricating a zeroed cell — reading garbage out
+/// of an empty pdict is the bug the guard prevents. A present cell coerces in O(1) (the
+/// term is shared by reference; no deep copy). Private: the single read chokepoint every
+/// fail-closed accessor goes through.
+fn require_cell() -> InstanceState {
+  case read_cell(TwocoreRtState) {
+    Ok(state) -> state
+    Error(Nil) ->
+      panic as "rt_state: operation on an un-seeded instance cell (one-instance-one-process contract violated)"
+  }
 }
