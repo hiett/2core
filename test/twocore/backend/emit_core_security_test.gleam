@@ -141,6 +141,9 @@ fn mixed_module() -> ir.Module {
     functions: [kitchen_sink],
     exports: [ir.ExportFn("f", "f")],
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
   )
 }
 
@@ -174,6 +177,9 @@ pub fn call_indirect_does_not_lower_test() {
       functions: [f],
       exports: [ir.ExportFn("f", "f")],
       data_segments: [],
+      tables: [],
+      elements: [],
+      start: option.None,
     )
   assert emit_core.emit_module(module, instance.safe_default())
     == Error(emit_core.UnsupportedNode("call_indirect"))

@@ -161,7 +161,9 @@ fn lower_expr(
     | ir.Num(_, _)
     | ir.Convert(_, _)
     | ir.TermOp(_, _)
-    | ir.MemLoad(_, _, _)
+    | ir.MemSize
+    | ir.MemGrow(_)
+    | ir.MemLoad(_, _, _, _)
     | ir.MemStore(_, _, _, _)
     | ir.GlobalGet(_)
     | ir.GlobalSet(_, _)

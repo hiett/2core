@@ -50,10 +50,11 @@ import twocore/ir.{
   IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU,
   ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS,
   IShrU, ISub, IXor, If, ImportFn, IndirectCallTypeMismatch, IntDivByZero,
-  IntOverflow, Let, Local, Loop, LoopParam, MakeCons, MakeTuple, MemAccess,
-  MemLoad, MemStore, MemoryDecl, MemoryOutOfBounds, Module, Num, ReinterpretFToI,
-  ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm,
-  TermOp, Trap, TruncSatS, TruncSatU, TupleGet, UnboxFloat, UnboxInt,
+  IntOverflow, InvalidConversionToInteger, Let, Local, Loop, LoopParam, MakeCons,
+  MakeTuple, MemAccess, MemLoad, MemStore, MemoryDecl, MemoryOutOfBounds, Module,
+  Num, ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64,
+  TI32, TI64, TTerm, TableOutOfBounds, TermOp, Trap, TruncSatS, TruncSatU,
+  TupleGet, UnboxFloat, UnboxInt, UndefinedElement, UninitializedElement,
   Unreachable, Values, Var, W32, W64,
 }
 
@@ -557,6 +558,9 @@ fn build_module(name: String, acc: ModuleAcc) -> Module {
     functions: list.reverse(acc.functions),
     exports: list.reverse(acc.exports),
     data_segments: list.reverse(acc.data),
+    tables: [],
+    elements: [],
+    start: None,
   )
 }
 
@@ -978,16 +982,19 @@ fn parse_term(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
   }
 }
 
-/// Parses `mem.load <memaccess> <addr> offset=<int>`.
+/// Parses `mem.load <result-valtype> <memaccess> <addr> offset=<int>`. The leading result
+/// valtype disambiguates the loaded value's width/sign (e.g. `i32.load8_s` vs
+/// `i64.load8_s`) — see `«IR2-FROZEN»` and `specs/phase-2/ir2-grammar-delta.md`.
 fn parse_mem_load(
   toks: List(PToken),
 ) -> Result(#(Expr, List(PToken)), ParseError) {
-  use #(macc, rest) <- result.try(parse_memaccess(toks))
+  use #(result, rest) <- result.try(parse_valtype(toks))
+  use #(macc, rest) <- result.try(parse_memaccess(rest))
   use #(addr, rest) <- result.try(parse_value(rest))
   use rest <- result.try(expect_word(rest, "offset"))
   use rest <- result.try(expect(rest, TEquals, "="))
   use #(off, rest) <- result.try(expect_number(rest))
-  Ok(#(MemLoad(macc, addr, off), rest))
+  Ok(#(MemLoad(macc, addr, off, result), rest))
 }
 
 /// Parses `mem.store <memaccess> <addr> <value> offset=<int>`.
@@ -1310,6 +1317,10 @@ fn string_to_trapreason(w: String) -> Result(TrapReason, Nil) {
     "unreachable" -> Ok(Unreachable)
     "indirect_call_type_mismatch" -> Ok(IndirectCallTypeMismatch)
     "memory_out_of_bounds" -> Ok(MemoryOutOfBounds)
+    "invalid_conversion_to_integer" -> Ok(InvalidConversionToInteger)
+    "undefined_element" -> Ok(UndefinedElement)
+    "uninitialized_element" -> Ok(UninitializedElement)
+    "table_out_of_bounds" -> Ok(TableOutOfBounds)
     _ -> Error(Nil)
   }
 }

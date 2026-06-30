@@ -1116,3 +1116,258 @@ pub fn f64_min(a: Int, b: Int) -> Int {
 pub fn f64_max(a: Int, b: Int) -> Int {
   fmax(f64_fmt, a, b)
 }
+
+// ───────────────────────── «RTNUM2-SIG-FROZEN» — Phase-2 float/convert heads ─────────────────────────
+// SIGNATURES frozen by unit 01 (`todo` bodies); BODIES implemented by unit 06; the
+// `NumOp/ConvOp → fn-name` map in `emit_core` (unit 10) MUST match these names. Operands
+// and results are raw IEEE-754 bit-pattern `Int`s (D5). Each is documented for its WASM
+// spec semantics; the body is `todo` until unit 06.
+
+// ── f32 unary (raw bits → raw bits) ──────────────────────────────────────────
+
+/// `f32.abs` — clear the sign bit (NaN preserved as canonical). Returns the bit pattern.
+pub fn f32_abs(_a: Int) -> Int {
+  todo
+}
+
+/// `f32.neg` — flip the sign bit (including for NaN/±0). Returns the bit pattern.
+pub fn f32_neg(_a: Int) -> Int {
+  todo
+}
+
+/// `f32.ceil` — round toward +∞ (NaN→canonical NaN; ±Inf/±0 preserved). Bit pattern.
+pub fn f32_ceil(_a: Int) -> Int {
+  todo
+}
+
+/// `f32.floor` — round toward −∞. Bit pattern.
+pub fn f32_floor(_a: Int) -> Int {
+  todo
+}
+
+/// `f32.trunc` — round toward zero. Bit pattern.
+pub fn f32_trunc(_a: Int) -> Int {
+  todo
+}
+
+/// `f32.nearest` — round to nearest, ties to even. Bit pattern.
+pub fn f32_nearest(_a: Int) -> Int {
+  todo
+}
+
+/// `f32.sqrt` — IEEE square root (sqrt of a negative → canonical NaN). Bit pattern.
+pub fn f32_sqrt(_a: Int) -> Int {
+  todo
+}
+
+/// `f32.copysign(a, b)` — magnitude of `a` with the sign of `b`. Bit pattern.
+pub fn f32_copysign(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+// ── f64 unary (raw bits → raw bits) ──────────────────────────────────────────
+
+/// `f64.abs` — clear the sign bit. Bit pattern.
+pub fn f64_abs(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.neg` — flip the sign bit. Bit pattern.
+pub fn f64_neg(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.ceil` — round toward +∞. Bit pattern.
+pub fn f64_ceil(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.floor` — round toward −∞. Bit pattern.
+pub fn f64_floor(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.trunc` — round toward zero. Bit pattern.
+pub fn f64_trunc(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.nearest` — round to nearest, ties to even. Bit pattern.
+pub fn f64_nearest(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.sqrt` — IEEE square root (sqrt of a negative → canonical NaN). Bit pattern.
+pub fn f64_sqrt(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.copysign(a, b)` — magnitude of `a` with the sign of `b`. Bit pattern.
+pub fn f64_copysign(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+// ── float comparisons → i32 truth value (0/1) ────────────────────────────────
+
+/// `f32.eq` — ordered equality (`+0 == -0`; any NaN → `0`). Returns `1`/`0`.
+pub fn f32_eq(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+/// `f32.ne` — ordered/unordered inequality (any NaN → `1`). Returns `1`/`0`.
+pub fn f32_ne(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+/// `f32.lt` — ordered less-than (NaN → `0`). Returns `1`/`0`.
+pub fn f32_lt(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+/// `f32.gt` — ordered greater-than (NaN → `0`). Returns `1`/`0`.
+pub fn f32_gt(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+/// `f32.le` — ordered less-than-or-equal (NaN → `0`). Returns `1`/`0`.
+pub fn f32_le(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+/// `f32.ge` — ordered greater-than-or-equal (NaN → `0`). Returns `1`/`0`.
+pub fn f32_ge(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+/// `f64.eq` — ordered equality. Returns `1`/`0`.
+pub fn f64_eq(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+/// `f64.ne` — ordered/unordered inequality. Returns `1`/`0`.
+pub fn f64_ne(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+/// `f64.lt` — ordered less-than. Returns `1`/`0`.
+pub fn f64_lt(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+/// `f64.gt` — ordered greater-than. Returns `1`/`0`.
+pub fn f64_gt(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+/// `f64.le` — ordered less-than-or-equal. Returns `1`/`0`.
+pub fn f64_le(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+/// `f64.ge` — ordered greater-than-or-equal. Returns `1`/`0`.
+pub fn f64_ge(_a: Int, _b: Int) -> Int {
+  todo
+}
+
+// ── TRAPPING float→int truncation → Result(Int, TrapReason) ──────────────────
+// `Error(InvalidConversionToInteger)` on NaN/±Inf; `Error(IntOverflow)` when the
+// truncated magnitude is out of the target's range; else `Ok(bits)` (truncate toward 0).
+// Distinct from the total saturating `*_trunc_sat_*` above.
+
+/// `i32.trunc_f32_s` — trapping signed f32 → i32.
+pub fn i32_trunc_f32_s(_a: Int) -> Result(Int, TrapReason) {
+  todo
+}
+
+/// `i32.trunc_f32_u` — trapping unsigned f32 → i32.
+pub fn i32_trunc_f32_u(_a: Int) -> Result(Int, TrapReason) {
+  todo
+}
+
+/// `i32.trunc_f64_s` — trapping signed f64 → i32.
+pub fn i32_trunc_f64_s(_a: Int) -> Result(Int, TrapReason) {
+  todo
+}
+
+/// `i32.trunc_f64_u` — trapping unsigned f64 → i32.
+pub fn i32_trunc_f64_u(_a: Int) -> Result(Int, TrapReason) {
+  todo
+}
+
+/// `i64.trunc_f32_s` — trapping signed f32 → i64.
+pub fn i64_trunc_f32_s(_a: Int) -> Result(Int, TrapReason) {
+  todo
+}
+
+/// `i64.trunc_f32_u` — trapping unsigned f32 → i64.
+pub fn i64_trunc_f32_u(_a: Int) -> Result(Int, TrapReason) {
+  todo
+}
+
+/// `i64.trunc_f64_s` — trapping signed f64 → i64.
+pub fn i64_trunc_f64_s(_a: Int) -> Result(Int, TrapReason) {
+  todo
+}
+
+/// `i64.trunc_f64_u` — trapping unsigned f64 → i64.
+pub fn i64_trunc_f64_u(_a: Int) -> Result(Int, TrapReason) {
+  todo
+}
+
+// ── int→float conversion → Int (round to nearest, ties to even). Never traps. ─
+// Operand is the raw integer bit pattern (interpreted signed for `*_s`, unsigned for
+// `*_u`); the result is the raw float bit pattern.
+
+/// `f32.convert_i32_s` — signed i32 → f32.
+pub fn f32_convert_i32_s(_a: Int) -> Int {
+  todo
+}
+
+/// `f32.convert_i32_u` — unsigned i32 → f32.
+pub fn f32_convert_i32_u(_a: Int) -> Int {
+  todo
+}
+
+/// `f32.convert_i64_s` — signed i64 → f32.
+pub fn f32_convert_i64_s(_a: Int) -> Int {
+  todo
+}
+
+/// `f32.convert_i64_u` — unsigned i64 → f32.
+pub fn f32_convert_i64_u(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.convert_i32_s` — signed i32 → f64.
+pub fn f64_convert_i32_s(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.convert_i32_u` — unsigned i32 → f64.
+pub fn f64_convert_i32_u(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.convert_i64_s` — signed i64 → f64.
+pub fn f64_convert_i64_s(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.convert_i64_u` — unsigned i64 → f64.
+pub fn f64_convert_i64_u(_a: Int) -> Int {
+  todo
+}
+
+// ── float width changes → Int (raw bits) ─────────────────────────────────────
+
+/// `f32.demote_f64` — narrow an f64 to f32 (round to nearest, ties to even; overflow →
+/// ±Inf; NaN → canonical f32 NaN). Returns the f32 bit pattern.
+pub fn f32_demote_f64(_a: Int) -> Int {
+  todo
+}
+
+/// `f64.promote_f32` — widen an f32 to f64 (exact; NaN → canonical f64 NaN). Returns the
+/// f64 bit pattern.
+pub fn f64_promote_f32(_a: Int) -> Int {
+  todo
+}

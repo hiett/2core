@@ -155,18 +155,19 @@ pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
         _ -> Error(Nil)
       }
     })
-  Ok(
-    ir.Module(
-      name: "twocore@wasm@" <> module_base(module),
-      uses_numerics: True,
-      memory: None,
-      globals: [],
-      imports: [],
-      functions: functions,
-      exports: exports,
-      data_segments: [],
-    ),
-  )
+  Ok(ir.Module(
+    name: "twocore@wasm@" <> module_base(module),
+    uses_numerics: True,
+    memory: None,
+    globals: [],
+    imports: [],
+    functions: functions,
+    exports: exports,
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: None,
+  ))
 }
 
 /// A sanitised base for the IR module name, derived from the first function export

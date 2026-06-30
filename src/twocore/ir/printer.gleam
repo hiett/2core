@@ -37,17 +37,21 @@ import twocore/ir.{
   type IntWidth, type Local, type LoopParam, type MemAccess, type Module,
   type NumOp, type SwitchArm, type TermOp, type TrapReason, type ValType,
   type Value, Block, BoxFloat, BoxInt, Break, CallDirect, CallHost, CallIndirect,
-  Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue, Convert, FAdd, FDiv,
-  FMax, FMin, FMul, FSub, FW32, FW64, FuncType, Function, GlobalGet, GlobalSet,
-  I32Extend16S, I32Extend8S, I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S,
+  Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue, Convert, ConvertS,
+  ConvertU, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil, FCopysign, FDiv, FEq,
+  FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe, FNearest, FNeg, FSqrt, FSub,
+  FTrunc, FW32, FW64, FuncType, Function, GlobalGet, GlobalSet, I32Extend16S,
+  I32Extend8S, I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S,
   I64ExtendI32S, I64ExtendI32U, IAdd, IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz,
   IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS,
   IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If,
-  IndirectCallTypeMismatch, IntDivByZero, IntOverflow, Let, Loop, LoopParam,
-  MakeCons, MakeTuple, MemAccess, MemLoad, MemStore, MemoryDecl,
-  MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF, Return, Switch,
-  SwitchArm, TF32, TF64, TI32, TI64, TTerm, TermOp, Trap, TruncSatS, TruncSatU,
-  TupleGet, UnboxFloat, UnboxInt, Unreachable, Values, Var, W32, W64,
+  IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
+  InvalidConversionToInteger, Let, Loop, LoopParam, MakeCons, MakeTuple,
+  MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryDecl, MemoryOutOfBounds,
+  Num, ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64,
+  TI32, TI64, TTerm, TableOutOfBounds, TermOp, Trap, TruncS, TruncSatS,
+  TruncSatU, TruncU, TupleGet, UnboxFloat, UnboxInt, UndefinedElement,
+  UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
 
 // ───────────────────────────── public entry point ─────────────────────────────
@@ -255,8 +259,13 @@ fn print_expr(indent: Int, e: Expr) -> String {
       "convert " <> convop_to_string(op) <> " " <> print_value(arg)
     TermOp(op, args) ->
       "term " <> termop_to_string(op) <> " " <> value_list(args)
-    MemLoad(op, addr, offset) ->
+    // Phase-2: unit 02 fills the real spellings for these new memory.size/grow nodes.
+    MemSize -> todo
+    MemGrow(_delta) -> todo
+    MemLoad(op, addr, offset, result) ->
       "mem.load "
+      <> print_valtype(result)
+      <> " "
       <> print_memaccess(op)
       <> " "
       <> print_value(addr)
@@ -462,6 +471,22 @@ fn numop_to_string(op: NumOp) -> String {
     FDiv(w) -> "f.div." <> fwidth_str(w)
     FMin(w) -> "f.min." <> fwidth_str(w)
     FMax(w) -> "f.max." <> fwidth_str(w)
+    // Phase-2 float NumOps (`«IR2-FROZEN»`; spellings in ir2-grammar-delta.md). Unit 02
+    // fills the `f.<op>.<W>` renderings; transitional `todo` keeps the freeze compiling.
+    FAbs(_)
+    | FNeg(_)
+    | FCeil(_)
+    | FFloor(_)
+    | FTrunc(_)
+    | FNearest(_)
+    | FSqrt(_)
+    | FCopysign(_)
+    | FEq(_)
+    | FNe(_)
+    | FLt(_)
+    | FGt(_)
+    | FLe(_)
+    | FGe(_) -> todo
   }
 }
 
@@ -490,6 +515,15 @@ fn convop_to_string(op: ConvOp) -> String {
     UnboxInt(w) -> "unbox." <> iwidth_ty(w)
     BoxFloat(w) -> "box." <> fwidth_ty(w)
     UnboxFloat(w) -> "unbox." <> fwidth_ty(w)
+    // Phase-2 ConvOps (`«IR2-FROZEN»`; spellings `trunc_s.<fw>.<iw>`,
+    // `convert_s.<iw>.<fw>`, `demote.f64`, `promote.f32` — see ir2-grammar-delta.md).
+    // Unit 02 fills these; transitional `todo` keeps the freeze compiling.
+    TruncS(_, _)
+    | TruncU(_, _)
+    | ConvertS(_, _)
+    | ConvertU(_, _)
+    | F32DemoteF64
+    | F64PromoteF32 -> todo
   }
 }
 
@@ -513,6 +547,10 @@ fn trapreason_to_string(r: TrapReason) -> String {
     Unreachable -> "unreachable"
     IndirectCallTypeMismatch -> "indirect_call_type_mismatch"
     MemoryOutOfBounds -> "memory_out_of_bounds"
+    InvalidConversionToInteger -> "invalid_conversion_to_integer"
+    UndefinedElement -> "undefined_element"
+    UninitializedElement -> "uninitialized_element"
+    TableOutOfBounds -> "table_out_of_bounds"
   }
 }
 

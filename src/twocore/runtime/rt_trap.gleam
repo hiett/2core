@@ -25,7 +25,8 @@
 
 import twocore/ir.{
   type TrapReason, IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
-  MemoryOutOfBounds, Unreachable,
+  InvalidConversionToInteger, MemoryOutOfBounds, TableOutOfBounds,
+  UndefinedElement, UninitializedElement, Unreachable,
 }
 
 /// `erlang:error/1` — raises an **error-class** exception with the given reason term and
@@ -74,5 +75,9 @@ pub fn spec_trap_message(reason: TrapReason) -> String {
     Unreachable -> "unreachable"
     IndirectCallTypeMismatch -> "indirect call type mismatch"
     MemoryOutOfBounds -> "out of bounds memory access"
+    InvalidConversionToInteger -> "invalid conversion to integer"
+    UndefinedElement -> "undefined element"
+    UninitializedElement -> "uninitialized element"
+    TableOutOfBounds -> "out of bounds table access"
   }
 }

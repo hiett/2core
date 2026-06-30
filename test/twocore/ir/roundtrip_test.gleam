@@ -71,6 +71,9 @@ fn add_module() -> ir.Module {
     ],
     exports: [ir.ExportFn("add", "add")],
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: None,
   )
 }
 
@@ -118,6 +121,9 @@ fn sum_to_module() -> ir.Module {
     ],
     exports: [ir.ExportFn("sum_to", "sum_to")],
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: None,
   )
 }
 
@@ -169,6 +175,9 @@ fn fib_module() -> ir.Module {
     ],
     exports: [ir.ExportFn("fib", "fib")],
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: None,
   )
 }
 
@@ -203,6 +212,9 @@ fn expr_module(name: String, body: ir.Expr) -> ir.Module {
     ],
     exports: [],
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: None,
   )
 }
 
@@ -322,9 +334,11 @@ fn expr_corpus() -> List(ir.Expr) {
     ir.TermOp(ir.MakeTuple, [ir.Var("a"), ir.Var("b")]),
     ir.TermOp(ir.TupleGet(3), [ir.Var("t")]),
     ir.TermOp(ir.MakeCons, [ir.Var("h"), ir.Var("t")]),
-    // memory
-    ir.MemLoad(ir.MemAccess(4, False), ir.Var("a"), 0),
-    ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 8),
+    // memory: a plain i32.load and a sign-extending i64.load8_s (distinct result widths
+    // prove the new `result` field round-trips and discriminates i32.load8_s vs
+    // i64.load8_s — same bytes+sign, different result type).
+    ir.MemLoad(ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32),
+    ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 8, ir.TI64),
     ir.MemStore(ir.MemAccess(8, False), ir.Var("a"), ir.Var("v"), 16),
     // globals
     ir.GlobalGet("g"),
@@ -436,6 +450,9 @@ fn kitchen_sink_module() -> ir.Module {
       >>),
       ir.DataSegment(ir.Values([ir.ConstI32(16)]), <<>>),
     ],
+    tables: [],
+    elements: [],
+    start: None,
   )
 }
 
@@ -484,6 +501,9 @@ pub fn empty_module_roundtrip_test() {
       functions: [],
       exports: [],
       data_segments: [],
+      tables: [],
+      elements: [],
+      start: None,
     )
   check_roundtrip(m)
 }

@@ -99,16 +99,16 @@ Unsafe profile are all **Phase 3** (deferred, not dropped).
 
 | Milestone | Produced by | Status | Unblocks |
 |---|---|---|---|
-| `«IR2-FROZEN»` — `ir.gleam` tables/elem + MemSize/MemGrow + load result-width + float NumOp/ConvOp + 3 TrapReasons + grammar delta | P2-01 | `unclaimed` | 02, 08, 09, 10 |
-| `«CELL-STATE-ABI-FROZEN»` — Binding (mem/table/state) + rt_state/rt_mem/rt_table stub sigs + the emit_core state-access seam + the instantiation contract | P2-01 | `unclaimed` | 03, 04, 05, 10, 11 |
-| `«RTNUM2-SIG-FROZEN»` — new rt_num float/convert signatures (`todo`) | P2-01 | `unclaimed` | 06, 10 |
+| `«IR2-FROZEN»` — `ir.gleam` tables/elem + MemSize/MemGrow + load result-width + float NumOp/ConvOp + 3 TrapReasons + grammar delta | P2-01 | **FROZEN ✓** | 02, 08, 09, 10 |
+| `«CELL-STATE-ABI-FROZEN»` — Binding (mem/table/state) + rt_state/rt_mem/rt_table stub sigs + the emit_core state-access seam + the instantiation contract | P2-01 | **FROZEN ✓** | 03, 04, 05, 10, 11 |
+| `«RTNUM2-SIG-FROZEN»` — new rt_num float/convert signatures (`todo`) | P2-01 | **FROZEN ✓** | 06, 10 |
 | `«WASM-AST2»` — extended `frontend/wasm/ast.gleam` types | P2-07 (day 1) | `unclaimed` | 08 (validate) |
 
 ### Phase-2 units
 
 | Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
 |---|---|---|---|---|
-| **P2-01** Interface freeze (keystone) | [`01`](phase-2/01-interface-freeze.md) | `unclaimed` | — | IR2 + cell ABI + instantiation contract + rt_num float sigs frozen, build green. |
+| **P2-01** Interface freeze (keystone) | [`01`](phase-2/01-interface-freeze.md) | **done** | — | IR2 + cell ABI + instantiation contract + rt_num float sigs frozen, build green. |
 | **P2-02** `.ir` printer/parser ext | [`02`](phase-2/02-ir-textual-form.md) | `unclaimed` | `«IR2-FROZEN»` | `.ir` round-trips the new variants (fast-follow, off critical path). |
 | **P2-03** rt_state + globals + lifecycle | [`03`](phase-2/03-rt-state-lifecycle.md) | `unclaimed` | `«CELL-STATE-ABI-FROZEN»` | The per-instance pdict cell (opaque, fresh/reset, fail-closed) + mutable globals + one-instance-one-process. |
 | **P2-04** rt_mem (paged + oracle) | [`04`](phase-2/04-rt-mem.md) | `unclaimed` | `«CELL-STATE-ABI-FROZEN»` | Bounds-checked (no-wrap, trap-before-write) LE load/store/size/grow + data-init + Safe max-pages cap; rebuild-oracle differential + memory_trap/address/endianness `.wast`. |

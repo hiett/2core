@@ -51,6 +51,9 @@ fn module(name: String, functions: List(ir.Function)) -> ir.Module {
     functions: functions,
     exports: list.map(functions, fn(f) { ir.ExportFn(f.name, f.name) }),
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
   )
 }
 

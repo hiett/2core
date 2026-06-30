@@ -46,6 +46,9 @@ fn module_with(f: ir.Function) -> ir.Module {
     functions: [f],
     exports: [ir.ExportFn(f.name, f.name)],
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
   )
 }
 
@@ -549,7 +552,7 @@ pub fn out_of_scope_nodes_error_test() {
     == Error(emit_core.UnsupportedNode("call_indirect"))
   assert emit_one(ir.GlobalGet("g"))
     == Error(emit_core.UnsupportedNode("global_get"))
-  assert emit_one(ir.MemLoad(ir.MemAccess(4, False), ir.Var("a"), 0))
+  assert emit_one(ir.MemLoad(ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32))
     == Error(emit_core.UnsupportedNode("mem_load"))
   assert emit_one(ir.Convert(ir.BoxInt(ir.W32), ir.Var("a")))
     == Error(emit_core.UnsupportedNode("box_int"))
@@ -592,6 +595,9 @@ pub fn export_alias_wrapper_test() {
       functions: [f],
       exports: [ir.ExportFn("main", "f3")],
       data_segments: [],
+      tables: [],
+      elements: [],
+      start: option.None,
     )
   let assert Ok(cm) = emit_core.emit_module(m, binding())
   // The external name/arity is exported …

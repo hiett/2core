@@ -42,6 +42,9 @@ fn add_module() -> ir.Module {
     functions: [add_function()],
     exports: [ir.ExportFn("add", "add")],
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
   )
 }
 
@@ -110,6 +113,9 @@ fn sum_to_module() -> ir.Module {
     functions: [sum_to_function()],
     exports: [ir.ExportFn("sum_to", "sum_to")],
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
   )
 }
 
@@ -179,6 +185,9 @@ fn fib_module() -> ir.Module {
     functions: [fib_function()],
     exports: [ir.ExportFn("fib", "fib")],
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
   )
 }
 

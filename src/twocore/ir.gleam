@@ -73,8 +73,14 @@ import gleam/option.{type Option}
 ///   boundary).
 /// - `functions`: the module's own defined functions.
 /// - `exports`: the externally callable entry points (export-name → function name).
-/// - `data_segments`: Phase-2 linear-memory initialisers (present for lock-now
-///   completeness; unused when `memory: None`).
+/// - `data_segments`: Phase-2 linear-memory initialisers (active segments written into
+///   memory at instantiation).
+/// - `tables`: the module's funcref tables (Phase-2; MVP funcref-only). A `CallIndirect`
+///   references one of these by name.
+/// - `elements`: active element segments — funcrefs written into a `tables` entry at
+///   instantiation (an out-of-bounds active segment traps at instantiation).
+/// - `start`: the name of the module's start function (run once at instantiation), or
+///   `None`. A trapping start fails instantiation.
 pub type Module {
   Module(
     name: String,
@@ -85,7 +91,33 @@ pub type Module {
     functions: List(Function),
     exports: List(ExportDecl),
     data_segments: List(DataSegment),
+    tables: List(TableDecl),
+    elements: List(ElementSegment),
+    start: Option(String),
   )
+}
+
+/// A funcref table declaration (Phase-2). The MVP's only reference type is `funcref`, so a
+/// table is described purely by its sizing.
+///
+/// - `name`: the table's unique name (referenced by `CallIndirect` and `ElementSegment`).
+/// - `min`: the initial size in entries (≥ 0). Every slot starts uninitialised (null).
+/// - `max`: optional upper bound in entries; `None` means unbounded growth (table growth
+///   itself is a post-MVP op — Phase-2 only populates a table via element segments).
+pub type TableDecl {
+  TableDecl(name: String, min: Int, max: Option(Int))
+}
+
+/// An ACTIVE element segment (Phase-2): at instantiation, write `funcs` (each a defined
+/// IR function name) into the named `table` starting at the constant `offset`.
+///
+/// - `table`: the target table's name (must match a `TableDecl.name`).
+/// - `offset`: a constant expression giving the first entry index written. An offset (or
+///   offset+len) past the table bound traps at instantiation (`TableOutOfBounds`).
+/// - `funcs`: the IR function names placed into consecutive entries from `offset`. Each
+///   becomes a build-controlled type-tagged closure (never a data-driven `apply`).
+pub type ElementSegment {
+  ElementSegment(table: String, offset: Expr, funcs: List(String))
 }
 
 /// Declares the module's single linear memory (Phase-2 subsystem; modelled now per
@@ -126,7 +158,9 @@ pub type ExportDecl {
   ExportFn(export_name: String, fn_name: String)
 }
 
-/// A linear-memory data initialiser (Phase-2; present for lock-now completeness).
+/// An ACTIVE linear-memory data initialiser (Phase-2): write `bytes` into linear memory at
+/// `offset` during instantiation. An out-of-bounds segment traps at instantiation (reusing
+/// `MemoryOutOfBounds`).
 ///
 /// - `offset`: a constant expression giving the byte offset at which `bytes` are
 ///   written.
@@ -264,8 +298,11 @@ pub type Value {
 ///   term↔numeric boxing (the only bridge between the value layers, D5).
 /// - `TermOp(op, args)`: term construction/destructuring (Phase-2 term layer;
 ///   lock-now placeholder).
-/// - `MemLoad`/`MemStore`: typed linear-memory access with a static `offset`
-///   (Phase-2; lock-now).
+/// - `MemSize`/`MemGrow(delta)`: query / grow linear memory (`memory.size` returns the
+///   page count; `memory.grow` returns the previous page count or `-1`).
+/// - `MemLoad`/`MemStore`: typed linear-memory access with a static `offset` (Phase-2).
+///   `MemLoad` carries a `result` value type (a load's result bit pattern depends on its
+///   target width/sign, which `MemAccess` alone cannot express).
 /// - `GlobalGet(name)`/`GlobalSet(name, value)`: read/write a module global.
 /// - `CallDirect`/`CallIndirect`/`CallHost`: the three first-class call kinds
 ///   (high-level §3). `CallHost` is THE capability boundary.
@@ -276,6 +313,14 @@ pub type Value {
 /// - `Trap(reason)`: abort with a typed trap.
 /// - `Charge(cost, body)`: the metering hook — charge `cost` fuel, then evaluate
 ///   `body` (inserted by `ir_lower`, unit 11; D9).
+///
+/// **Effects (E6).** `MemLoad`, `MemStore`, `MemGrow`, `GlobalGet`, `GlobalSet`, and
+/// `CallIndirect` are **side-effecting**: they read and/or write mutable instance state
+/// (the per-instance memory/globals/table cell). A future optimizer must treat them as
+/// memory barriers — **no** CSE of a load across a store, **no** reordering across a grow,
+/// **no** dead-store elimination without an aliasing proof. The remaining `Expr` variants
+/// (`Num`/`Convert`/`Values`/structured control/…) are pure. `CallHost` and `Charge` are
+/// effectful by their nature (host boundary / fuel) and likewise non-reorderable.
 pub type Expr {
   // pure / value-producing ----------------------------------------------------
   /// Forward existing values unchanged (e.g. a block's tail result).
@@ -287,10 +332,25 @@ pub type Expr {
   Convert(op: ConvOp, arg: Value)
   /// Term construction / destructuring (Phase-2 term layer; lock-now placeholder).
   TermOp(op: TermOp, args: List(Value))
-  // linear-memory layer (Phase-2; lock-now) ----------------------------------
-  /// Typed load from linear memory at `addr + offset`.
-  MemLoad(op: MemAccess, addr: Value, offset: Int)
-  /// Typed store of `value` to linear memory at `addr + offset`.
+  // linear-memory layer (Phase-2) --------------------------------------------
+  /// `memory.size` → the current linear-memory size in 64 KiB pages (an i32).
+  /// Side-effecting (observes mutable state; do not CSE across a `MemGrow`).
+  MemSize
+  /// `memory.grow(delta_pages)` → the PREVIOUS size in pages, or `-1` (i32) on failure
+  /// (the requested growth exceeds the declared `max_pages` or the Safe max-pages cap).
+  /// Side-effecting (E6): allocates/zero-fills pages and mutates the memory state.
+  MemGrow(delta: Value)
+  /// Typed load from linear memory at `addr + offset`, yielding a `result`-typed value.
+  ///
+  /// `op` (a `MemAccess`) carries the access width in bytes and, for sub-word loads, the
+  /// sign-extension flag. `result` is the value type the load PRODUCES — it is required
+  /// because `op` alone cannot distinguish `i32.load8_s` from `i64.load8_s` (identical
+  /// bytes + sign, different result bit pattern). Side-effecting (E6).
+  MemLoad(op: MemAccess, addr: Value, offset: Int, result: ValType)
+  /// Typed store of `value` to linear memory at `addr + offset`. `op.bytes` is the store
+  /// width; `op.signed` is IRRELEVANT for stores (a store writes the low `bytes` bytes of
+  /// `value` regardless of sign) and is ignored. Side-effecting (E6); the evaluation order
+  /// is addr, then value, then the store.
   MemStore(op: MemAccess, addr: Value, value: Value, offset: Int)
   /// Read the named module global's current value.
   GlobalGet(name: String)
@@ -399,13 +459,43 @@ pub type NumOp {
   ILeU(IntWidth)
   IGeS(IntWidth)
   IGeU(IntWidth)
-  // floats (lock-now; Phase-1 covers a subset end-to-end — see unit 06)
+  // floats — binary arithmetic (Phase-1 covered these end-to-end; see unit 06)
   FAdd(FloatWidth)
   FSub(FloatWidth)
   FMul(FloatWidth)
   FDiv(FloatWidth)
   FMin(FloatWidth)
   FMax(FloatWidth)
+  // floats — unary (Phase-2). Operate on / produce raw IEEE-754 bit patterns.
+  /// `f.abs` — clear the sign bit (magnitude).
+  FAbs(FloatWidth)
+  /// `f.neg` — flip the sign bit.
+  FNeg(FloatWidth)
+  /// `f.ceil` — round toward +∞.
+  FCeil(FloatWidth)
+  /// `f.floor` — round toward −∞.
+  FFloor(FloatWidth)
+  /// `f.trunc` — round toward zero.
+  FTrunc(FloatWidth)
+  /// `f.nearest` — round to nearest, ties to even.
+  FNearest(FloatWidth)
+  /// `f.sqrt` — IEEE square root.
+  FSqrt(FloatWidth)
+  /// `f.copysign(a, b)` — magnitude of `a` with the sign of `b`.
+  FCopysign(FloatWidth)
+  // floats — comparisons (Phase-2). Produce an i32 truth value (`0`/`1`).
+  /// `f.eq` — ordered equality (NaN compares false).
+  FEq(FloatWidth)
+  /// `f.ne` — ordered/unordered inequality (NaN compares true).
+  FNe(FloatWidth)
+  /// `f.lt` — ordered less-than.
+  FLt(FloatWidth)
+  /// `f.gt` — ordered greater-than.
+  FGt(FloatWidth)
+  /// `f.le` — ordered less-than-or-equal.
+  FLe(FloatWidth)
+  /// `f.ge` — ordered greater-than-or-equal.
+  FGe(FloatWidth)
 }
 
 /// Conversion operations: width/sign changes within the numeric layer, float↔int
@@ -421,6 +511,13 @@ pub type NumOp {
 ///   between a float and an integer of the same width (no value change).
 /// - `BoxInt`/`UnboxInt`/`BoxFloat`/`UnboxFloat`: the ONLY bridge between the term
 ///   layer and the numeric layer (D5) — explicit, never implicit.
+/// - `TruncS(from, to)`/`TruncU(from, to)`: TRAPPING float→int truncation (Phase-2),
+///   distinct from the saturating `TruncSat*` — traps on NaN/±Inf
+///   (`InvalidConversionToInteger`) or out-of-range (`IntOverflow`).
+/// - `ConvertS(from, to)`/`ConvertU(from, to)`: int→float conversion (round to nearest,
+///   ties to even). Never traps.
+/// - `F32DemoteF64`/`F64PromoteF32`: float width changes (narrow f64→f32 with rounding;
+///   widen f32→f64 exactly).
 pub type ConvOp {
   I32WrapI64
   I64ExtendI32S
@@ -439,6 +536,24 @@ pub type ConvOp {
   UnboxInt(IntWidth)
   BoxFloat(FloatWidth)
   UnboxFloat(FloatWidth)
+  // TRAPPING float→int truncation (Phase-2) — distinct from the saturating `TruncSat*`.
+  // Traps `InvalidConversionToInteger` on NaN/±Inf and `IntOverflow` when the truncated
+  // value is out of the target's range; otherwise truncates toward zero. Because they
+  // trap, `emit_core` wires these through `rt_num`'s `Result(Int, TrapReason)` signatures
+  // (the `case`-and-`raise` shape), unlike the total `TruncSat*`.
+  /// Trapping signed truncation `from` float → `to` int.
+  TruncS(from: FloatWidth, to: IntWidth)
+  /// Trapping unsigned truncation `from` float → `to` int.
+  TruncU(from: FloatWidth, to: IntWidth)
+  // int→float conversion (Phase-2) — round to nearest, ties to even. Never traps.
+  /// Signed `from` int → `to` float.
+  ConvertS(from: IntWidth, to: FloatWidth)
+  /// Unsigned `from` int → `to` float.
+  ConvertU(from: IntWidth, to: FloatWidth)
+  /// `f32.demote_f64` — narrow an f64 to f32 (round to nearest, ties to even).
+  F32DemoteF64
+  /// `f64.promote_f32` — widen an f32 to f64 (exact).
+  F64PromoteF32
 }
 
 /// Term-layer operations (Phase-2; lock-now placeholder so the term frontends do not
@@ -469,12 +584,21 @@ pub type MemAccess {
 /// - `IntOverflow`: signed `div_s` of `INT_MIN / -1` (the one overflow trap).
 /// - `Unreachable`: an explicit unreachable point was executed.
 /// - `IndirectCallTypeMismatch`: a `CallIndirect` target's type did not match.
-/// - `MemoryOutOfBounds`: a linear-memory access fell outside bounds.
+/// - `MemoryOutOfBounds`: a linear-memory access fell outside bounds. Also raised when an
+///   active DATA segment is out of bounds at instantiation.
+/// - `InvalidConversionToInteger`: a trapping float→int truncation of NaN or ±Inf
+///   (distinct from `IntOverflow`, which is the out-of-range case).
+/// - `UndefinedElement`: a `CallIndirect` whose table index is out of bounds (runtime).
+/// - `UninitializedElement`: a `CallIndirect` to a null / unfilled table slot.
+/// - `TableOutOfBounds`: an active ELEMENT segment is out of bounds at instantiation.
 pub type TrapReason {
   IntDivByZero
   IntOverflow
   Unreachable
   IndirectCallTypeMismatch
   MemoryOutOfBounds
-  // … extend in Phase 2
+  InvalidConversionToInteger
+  UndefinedElement
+  UninitializedElement
+  TableOutOfBounds
 }

@@ -267,6 +267,9 @@ fn numeric_module(name: String, fns: List(ir.Function)) -> ir.Module {
     functions: fns,
     exports: list.map(fns, fn(f) { ir.ExportFn(f.name, f.name) }),
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
   )
 }
 

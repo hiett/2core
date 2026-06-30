@@ -69,15 +69,19 @@ import twocore/ir.{
   type ConvOp, type Expr, type Function, type IntWidth, type Module, type NumOp,
   type SwitchArm, type TrapReason, type Value, Block, BoxFloat, BoxInt, Break,
   CallDirect, CallHost, CallIndirect, Charge, ConstF32, ConstF64, ConstI32,
-  ConstI64, Continue, Convert, FAdd, FDiv, FMax, FMin, FMul, FSub, FW32, FW64,
-  GlobalGet, GlobalSet, I32Extend16S, I32Extend8S, I32WrapI64, I64Extend16S,
-  I64Extend32S, I64Extend8S, I64ExtendI32S, I64ExtendI32U, IAdd, IAnd, IClz,
-  ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU,
-  IMul, INe, IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub,
-  IXor, If, IndirectCallTypeMismatch, IntDivByZero, IntOverflow, Let, Loop,
-  MemLoad, MemStore, MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF,
-  Return, Switch, SwitchArm, TermOp, Trap, TruncSatS, TruncSatU, UnboxFloat,
-  UnboxInt, Unreachable, Values, Var, W32, W64,
+  ConstI64, Continue, Convert, ConvertS, ConvertU, F32DemoteF64, F64PromoteF32,
+  FAbs, FAdd, FCeil, FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe, FLt, FMax,
+  FMin, FMul, FNe, FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64, GlobalGet,
+  GlobalSet, I32Extend16S, I32Extend8S, I32WrapI64, I64Extend16S, I64Extend32S,
+  I64Extend8S, I64ExtendI32S, I64ExtendI32U, IAdd, IAnd, IClz, ICtz, IDivS,
+  IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe,
+  IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If,
+  IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
+  InvalidConversionToInteger, Let, Loop, MemGrow, MemLoad, MemSize, MemStore,
+  MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF, Return, Switch,
+  SwitchArm, TableOutOfBounds, TermOp, Trap, TruncS, TruncSatS, TruncSatU,
+  TruncU, UnboxFloat, UnboxInt, UndefinedElement, UninitializedElement,
+  Unreachable, Values, Var, W32, W64,
 }
 import twocore/runtime/instance.{type Binding}
 
@@ -329,8 +333,13 @@ fn emit(
     Trap(reason) ->
       Ok(#(raise_trap(ctx, CAtom(trap_reason_atom(reason))), state))
     Charge(cost, body) -> emit_charge(cost, body, cont, state, ctx)
-    // Out of Phase-1 scope — typed error, never a panic.
+    // Out of Phase-1 scope — typed error, never a panic. The Phase-2 stateful ops
+    // (memory/global/table/size/grow) are wired by unit 10 through the emit_core
+    // state-access seam (`«CELL-STATE-ABI-FROZEN»`); transitional `UnsupportedNode`
+    // arms keep the freeze compiling.
     CallIndirect(..) -> Error(UnsupportedNode("call_indirect"))
+    MemSize -> Error(UnsupportedNode("mem_size"))
+    MemGrow(..) -> Error(UnsupportedNode("mem_grow"))
     MemLoad(..) -> Error(UnsupportedNode("mem_load"))
     MemStore(..) -> Error(UnsupportedNode("mem_store"))
     GlobalGet(..) -> Error(UnsupportedNode("global_get"))
@@ -914,6 +923,23 @@ pub fn num_op_name(op: NumOp) -> String {
     FDiv(f) -> fw(f) <> "_div"
     FMin(f) -> fw(f) <> "_min"
     FMax(f) -> fw(f) <> "_max"
+    // Phase-2 float NumOps (`«RTNUM2-SIG-FROZEN»`). Unit 10 maps these to the frozen
+    // `rt_num` names (`f32_abs`, `f64_lt`, …); transitional `todo` keeps the freeze
+    // compiling without committing the chokepoint table early.
+    FAbs(_)
+    | FNeg(_)
+    | FCeil(_)
+    | FFloor(_)
+    | FTrunc(_)
+    | FNearest(_)
+    | FSqrt(_)
+    | FCopysign(_)
+    | FEq(_)
+    | FNe(_)
+    | FLt(_)
+    | FGt(_)
+    | FLe(_)
+    | FGe(_) -> todo
   }
 }
 
@@ -949,6 +975,16 @@ fn conv_op_name(op: ConvOp) -> Result(String, String) {
     UnboxInt(_) -> Error("unbox_int")
     BoxFloat(_) -> Error("box_float")
     UnboxFloat(_) -> Error("unbox_float")
+    // Phase-2 ConvOps (`«RTNUM2-SIG-FROZEN»`). The trapping `TruncS/U` need the
+    // `case`-and-`raise` lowering (NOT a bare call) and the convert/demote/promote map to
+    // `rt_num` names — both owned by unit 10. Transitional `Error` keeps the freeze
+    // compiling (no codegen committed yet).
+    TruncS(_, _) -> Error("trunc_s")
+    TruncU(_, _) -> Error("trunc_u")
+    ConvertS(_, _) -> Error("convert_s")
+    ConvertU(_, _) -> Error("convert_u")
+    F32DemoteF64 -> Error("f32_demote_f64")
+    F64PromoteF32 -> Error("f64_promote_f32")
   }
 }
 
@@ -994,6 +1030,10 @@ fn trap_ctor_name(reason: TrapReason) -> String {
     Unreachable -> "Unreachable"
     IndirectCallTypeMismatch -> "IndirectCallTypeMismatch"
     MemoryOutOfBounds -> "MemoryOutOfBounds"
+    InvalidConversionToInteger -> "InvalidConversionToInteger"
+    UndefinedElement -> "UndefinedElement"
+    UninitializedElement -> "UninitializedElement"
+    TableOutOfBounds -> "TableOutOfBounds"
   }
 }
 
@@ -1035,7 +1075,9 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     Num(_, args) -> collect_values(args, acc)
     Convert(_, arg) -> collect_value(arg, acc)
     TermOp(_, args) -> collect_values(args, acc)
-    MemLoad(_, addr, _) -> collect_value(addr, acc)
+    MemSize -> acc
+    MemGrow(delta) -> collect_value(delta, acc)
+    MemLoad(_, addr, _, _) -> collect_value(addr, acc)
     MemStore(_, addr, value, _) ->
       collect_value(value, collect_value(addr, acc))
     GlobalGet(_) -> acc

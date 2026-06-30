@@ -87,9 +87,16 @@ pub type Mode {
 /// - `host_module`: implements the host/capability boundary (`rt_host`).
 /// - `meter_module`: implements metering / fuel (`rt_meter`).
 /// - `stdlib_module`: implements the `own` standard library (`rt_stdlib`).
+/// - `mem_module`: implements linear memory — load/store/size/grow/init_data (`rt_mem`).
+/// - `table_module`: implements funcref tables + `call_indirect` dispatch (`rt_table`).
+/// - `state_module`: implements the per-instance cell holder + mutable globals
+///   (`rt_state`). `GlobalGet`/`GlobalSet` route here; the cell ABI is
+///   `«CELL-STATE-ABI-FROZEN»` (the tier-O process-dictionary convention).
 ///
-/// Phase-2 adds memory/table/instance-state module fields here; because binding lives
-/// in this one record, that is a clean extension, not a retrofit.
+/// Phase-2 adds the memory/table/instance-state module fields below; because binding lives
+/// in this one record, that is a clean extension, not a retrofit. The cell↔threaded
+/// *state* tier is a codegen-shape sub-axis (`emit_core`'s state-access seam), NOT a
+/// module swap through this record (overview E1).
 pub type Binding {
   Binding(
     mode: Mode,
@@ -98,6 +105,9 @@ pub type Binding {
     host_module: String,
     meter_module: String,
     stdlib_module: String,
+    mem_module: String,
+    table_module: String,
+    state_module: String,
   )
 }
 
@@ -118,5 +128,8 @@ pub fn safe_default() -> Binding {
     host_module: "twocore@runtime@rt_host",
     meter_module: "twocore@runtime@rt_meter",
     stdlib_module: "twocore@runtime@rt_stdlib",
+    mem_module: "twocore@runtime@rt_mem",
+    table_module: "twocore@runtime@rt_table",
+    state_module: "twocore@runtime@rt_state",
   )
 }

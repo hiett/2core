@@ -32,6 +32,9 @@ fn module_with(
     functions: fns,
     exports: list.map(fns, fn(f) { ir.ExportFn(f.name, f.name) }),
     data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
   )
 }
 
