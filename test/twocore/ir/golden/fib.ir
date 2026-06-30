@@ -1,0 +1,22 @@
+; fib(n) -> i64 — `if`, a direct self-`call`, and recursion. Hand-authored golden
+; fixture for unit 01, written by reading specs/phase-1/ir-grammar.md (D7). In strict
+; ANF: every comparison, subtraction, recursive call, and addition is bound by `let`
+; so each control/return position forwards an atomic value.
+module @fib {
+  numerics true
+  memory none
+  export "fib" = @fib
+  func @fib ( %p0:i64 ) -> (i64) {
+    let (%c) = num i.lt_u.64 (%p0, i64.const 2) ;
+    if %c : (i64) {
+      return (%p0)
+    } else {
+      let (%n1) = num i.sub.64 (%p0, i64.const 1) ;
+      let (%f1) = call @fib (%n1) ;
+      let (%n2) = num i.sub.64 (%p0, i64.const 2) ;
+      let (%f2) = call @fib (%n2) ;
+      let (%r) = num i.add.64 (%f1, %f2) ;
+      return (%r)
+    }
+  }
+}

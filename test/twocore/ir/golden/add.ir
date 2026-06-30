@@ -1,0 +1,13 @@
+; add(i32, i32) -> i32 — a direct numeric op with named params, an export, and the
+; whole end-to-end plumbing. Hand-authored golden fixture for unit 01, written by
+; reading specs/phase-1/ir-grammar.md (never printer-generated — D7). In strict ANF:
+; the numeric op is bound by `let` so `return` forwards an atomic value.
+module @add {
+  numerics true
+  memory none
+  export "add" = @add
+  func @add ( %p0:i32, %p1:i32 ) -> (i32) {
+    let (%r) = num i.add.32 (%p0, %p1) ;
+    return (%r)
+  }
+}

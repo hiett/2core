@@ -27,10 +27,9 @@ string  := "…" with the usual escapes (export/import/capability names)
 comment := ';' … end-of-line
 ```
 
-> **Sigil convention (suggested):** `%name` for locals/let-bindings/loop vars, `$name`
-> for labels, `@name` for functions/globals, `"…"` for host/export names. Pick one and
-> keep it consistent; it makes the textual form unambiguous and easy to parse. Unit 01
-> finalizes the exact sigils.
+> **Sigil convention (frozen by unit 01):** `%name` for locals/let-bindings/loop vars,
+> `$name` for labels, `@name` for functions/globals, `"…"` for host/export names. These
+> are the frozen sigils; they make the textual form unambiguous and easy to parse.
 
 ## Module
 
@@ -69,6 +68,12 @@ value := %<name>                  ; a binding reference
 ```
 
 ## Expressions (ANF with structured control)
+
+> **Strict ANF (frozen by unit 01).** Every *operand* position holds an atomic
+> `<value>` — including an `if`/`switch` selector and the operands of
+> `return`/`break`/`continue`. Computations are therefore named by `let` before being
+> used; the canonical printer never nests a computation in an operand position. This is
+> what makes the round-trip canonical and the 1:1 lowering to Core Erlang clean.
 
 ```
 expr :=
@@ -132,7 +137,8 @@ module @add {
   memory none
   export "add" = @add
   func @add ( %p0:i32, %p1:i32 ) -> (i32) {
-    return ( num i.add.32 (%p0, %p1) )
+    let (%r) = num i.add.32 (%p0, %p1) ;     ; ANF: bind the op, then return the value
+    return (%r)
   }
 }
 ```
@@ -146,7 +152,8 @@ module @loop {
   export "sum_to" = @sum_to
   func @sum_to ( %p0:i64 ) -> (i64) {
     loop $go ( %i : i64 = i64.const 1, %acc : i64 = i64.const 0 ) : (i64) {
-      if num i.le_u.64 (%i, %p0) : (i64) {
+      let (%cond) = num i.le_u.64 (%i, %p0) ;  ; ANF: the if-selector is an atomic value
+      if %cond : (i64) {
         let (%acc1) = num i.add.64 (%acc, %i) ;
         let (%i1)   = num i.add.64 (%i, i64.const 1) ;
         continue $go (%i1, %acc1)

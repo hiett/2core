@@ -1,0 +1,22 @@
+; sum_to(n) -> i64 — a loop that lowers to a constant-space tail-recursive BEAM loop.
+; Hand-authored golden fixture for unit 01, written by reading
+; specs/phase-1/ir-grammar.md (D7). In strict ANF: the loop condition is bound by
+; `let` so `if` tests an atomic value; both arms transfer control (continue/break) and
+; never fall through, so the loop's i64 result is produced by `break $go (%acc)`.
+module @loop {
+  numerics true
+  memory none
+  export "sum_to" = @sum_to
+  func @sum_to ( %p0:i64 ) -> (i64) {
+    loop $go ( %i : i64 = i64.const 1, %acc : i64 = i64.const 0 ) : (i64) {
+      let (%cond) = num i.le_u.64 (%i, %p0) ;
+      if %cond : (i64) {
+        let (%acc1) = num i.add.64 (%acc, %i) ;
+        let (%i1) = num i.add.64 (%i, i64.const 1) ;
+        continue $go (%i1, %acc1)
+      } else {
+        break $go (%acc)
+      }
+    }
+  }
+}

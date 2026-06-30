@@ -15,9 +15,9 @@ units (see overview §3). Announce milestones here the moment they land.
 
 | Milestone | Produced by | Status | Unblocks |
 |---|---|---|---|
-| `«IR-FROZEN»` — `ir.gleam` + `ir-grammar.md` | 01 | `unclaimed` | 02, 08, 10, 11 |
-| `«ABI-FROZEN»` — `instance.gleam` (Binding + convention) | 01 | `unclaimed` | 08, 09, 11 |
-| `«RTNUM-SIG-FROZEN»` — `rt_num.gleam` signatures | 01 | `unclaimed` | 06, 08 |
+| `«IR-FROZEN»` — `ir.gleam` + `ir-grammar.md` | 01 | **FROZEN ✓** | 02, 08, 10, 11 |
+| `«ABI-FROZEN»` — `instance.gleam` (Binding + convention) | 01 | **FROZEN ✓** | 08, 09, 11 |
+| `«RTNUM-SIG-FROZEN»` — `rt_num.gleam` signatures (90 fns) | 01 | **FROZEN ✓** | 06, 08 |
 | `«CORE-AST»` — `backend/core_erlang.gleam` types | 03 (day 1) | `unclaimed` | 08 |
 | `«WASM-AST»` — `frontend/wasm/ast.gleam` types + `DecodeError` | 05 (day 1) | `unclaimed` | 10 (validate) |
 | `«FFI-SHIM»` — `twocore_codegen_ffi.erl` (compile+load) | 04 (day 1) | `unclaimed` | 03 (verify), 08/10 (e2e tests) |
@@ -30,7 +30,7 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 
 | Unit | Doc | Owner / status | Depends on (freeze) | What it leaves when `done` |
 |---|---|---|---|---|
-| **01** Interface freeze | [`01`](phase-1/01-interface-freeze.md) | `unclaimed` | — | IR types, `.ir` grammar, runtime ABI, rt_num signatures, PipelineError stub all frozen; the keystones exist. |
+| **01** Interface freeze | [`01`](phase-1/01-interface-freeze.md) | **done** | — | IR types, `.ir` grammar, runtime ABI, rt_num signatures (90 fns, `todo` bodies → 06), PipelineError stub all frozen; neutrality review signed off; 3 golden `.ir` + strawman test green. The keystones exist. |
 | **02** `.ir` printer & parser | [`02`](phase-1/02-ir-textual-form.md) | `unclaimed` | `«IR-FROZEN»` | `.ir` round-trips; every stage can dump/load IR as the inter-stage contract (D7). |
 | **03** Core Erlang AST & printer | [`03`](phase-1/03-core-erlang-backend.md) | `unclaimed` | — (self-frozen) | A `.core` AST + verified pretty-printer; `08` can build Core Erlang and get compilable text. |
 | **04** `build_beam` driver & FFI | [`04`](phase-1/04-build-beam-driver.md) | `unclaimed` | — | `.core` text → loaded `.beam`; the `«FFI-SHIM»`; the BEAM-loading seam (D10) proven with hand-written `.core`. |
@@ -99,6 +99,14 @@ broaden the `own` stdlib + BIF allowlist; then the Porffor bridge + its ABI `rt_
 
 ## Change log
 
+- **Unit 01 landed (interface freeze).** IR types, runtime `Binding` ABI + calling
+  convention, the complete 90-function `rt_num` signature set (`todo` bodies, owned next
+  by unit 06), and `PipelineError` are frozen. `gleam build` clean except the 90
+  sanctioned `todo` warnings; `gleam test` green (7); neutrality review (D6) passed.
+  Two notes for downstream: (a) the seeded `ir-grammar.md`/golden examples were corrected
+  to **strict ANF** (the original nested `num` exprs in `return`/`if` operand positions,
+  which the `Value`-typed fields forbid); (b) `rt_num` stub args are underscore-prefixed
+  (`_a`,`_b`) to keep the build warning-free — unit 06 restores `a`/`b` with the bodies.
 - **Planning, post-review reconciliation (initial drafting):** after the unit docs were
   drafted, these refinements were folded back into the frozen foundations so the
   contracts are internally consistent:
