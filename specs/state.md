@@ -19,7 +19,7 @@ units (see overview §3). Announce milestones here the moment they land.
 | `«ABI-FROZEN»` — `instance.gleam` (Binding + convention) | 01 | **FROZEN ✓** | 08, 09, 11 |
 | `«RTNUM-SIG-FROZEN»` — `rt_num.gleam` signatures (90 fns) | 01 | **FROZEN ✓** | 06, 08 |
 | `«CORE-AST»` — `backend/core_erlang.gleam` types | 03 | **published ✓** | 08 |
-| `«WASM-AST»` — `frontend/wasm/ast.gleam` types + `DecodeError` | 05 (day 1) | `unclaimed` | 10 (validate) |
+| `«WASM-AST»` — `frontend/wasm/ast.gleam` types + `DecodeError` | 05 | **published ✓** | 10 (validate) |
 | `«FFI-SHIM»` — `twocore_codegen_ffi.erl` (compile+load) | 04 | **published ✓** | 03 (verify), 08/10 (e2e tests) |
 
 ---
@@ -34,7 +34,7 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 | **02** `.ir` printer & parser | [`02`](phase-1/02-ir-textual-form.md) | `unclaimed` | `«IR-FROZEN»` | `.ir` round-trips; every stage can dump/load IR as the inter-stage contract (D7). |
 | **03** Core Erlang AST & printer | [`03`](phase-1/03-core-erlang-backend.md) | **done** | — | `.core` AST (`«CORE-AST»`) + pretty-printer; printed ASTs compile+run on real OTP-29 (add/fac/classify); atom escaping proven byte-identical to OTP `io_lib:write_string`. |
 | **04** `build_beam` driver & FFI | [`04`](phase-1/04-build-beam-driver.md) | **done** | — | `.core` text → loaded `.beam` proven (hand-written `.core` compiled, loaded, ran on BEAM); the `«FFI-SHIM»`; `gleam_erlang` added. |
-| **05** WASM decoder & AST | [`05`](phase-1/05-wasm-decoder.md) | `unclaimed` | — | `.wasm` → WASM AST (`«WASM-AST»`); LEB128 + fail-closed decoding; frontend input ready. |
+| **05** WASM decoder & AST | [`05`](phase-1/05-wasm-decoder.md) | **done** | — | `.wasm` → WASM AST (`«WASM-AST»`); LEB128 (spec vectors) + fail-closed/fuzz-proven decoding (no `let assert`/`panic`); 54 tests. |
 | **06** `rt_num` numerics (`bif`) | [`06`](phase-1/06-rt-num-numerics.md) | **done** | `«RTNUM-SIG-FROZEN»` | All 90 bodies implemented; the numeric-fidelity reference (tier-P), 40 spec-corner/property tests. Build now **zero-warning**. |
 | **07** Conformance harness & corpus | [`07`](phase-1/07-conformance-harness.md) | `unclaimed` | — (engine side); IR/backend (compare side) | The spec-suite oracle + the Phase-1 acceptance corpus; "is our output spec-correct?" answerable. |
 | **08** `emit_core` (IR → Core) | [`08`](phase-1/08-emit-core.md) | **done** | `«IR-FROZEN»`,`«CORE-AST»`,`«ABI-FROZEN»`,`«RTNUM-SIG-FROZEN»` | **The backend works end-to-end:** hand-written IR → Core Erlang → loaded `.beam` → correct results (add/wrap/shift, `sum_to(100k)` constant-space, fib/fac, div traps, deny-all host, stdlib gcd); binding chokepoint + security-invariant test pass. |
@@ -99,6 +99,18 @@ broaden the `own` stdlib + BIF allowlist; then the Porffor bridge + its ABI `rt_
 
 ## Change log
 
+- **Unit 05 landed (WASM decoder & AST).** `decode/1`, generic `decode_u_n`/`decode_s_n`
+  LEB128 (all spec vectors incl. overflow/too-long), the worked `add` fixture decodes to
+  the exact AST, `wat2wasm` fixtures (loop/if/call/locals/multi-value), and a fail-closed
+  fuzz suite (256×41 single-byte mutations + truncations never crash). 54 tests; the
+  decoder code has no `let assert`/`panic`/`todo`. **`«WASM-AST»` published** with
+  `Module(imported_func_count, types, funcs, exports)`, `Func(type_idx, locals, body)`,
+  the Phase-1 `Instr` set, `ValType`, `BlockType`, and `DecodeError`. **Notes for unit 10:**
+  `Func.locals` are RLE-expanded **declared-only** (params are indices 0..k-1, declared
+  locals follow) — lower must zero-init each declared local as an IR `Let` (emit_core
+  ignores `ir.Function.locals`); use `Module.imported_func_count` as the funcidx offset
+  (don't assume funcidx==defined index); and put a **per-function local-count cap** in the
+  validator (the spec sets that limit in validation — guards against RLE over-allocation).
 - **Unit 08 landed (emit_core) — BACKEND PROVEN END-TO-END.** Hand-written IR compiles to
   Core Erlang and runs on the real BEAM: `add(7,35)=42`, i32 wrap & shift-masking,
   `sum_to(100000)=5000050000` in **constant space** (letrec tail-`apply` back-edge),
