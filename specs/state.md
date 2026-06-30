@@ -39,7 +39,7 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 | **07** Conformance harness & corpus | [`07`](phase-1/07-conformance-harness.md) | `unclaimed` | — (engine side); IR/backend (compare side) | The spec-suite oracle + the Phase-1 acceptance corpus; "is our output spec-correct?" answerable. |
 | **08** `emit_core` (IR → Core) | [`08`](phase-1/08-emit-core.md) | **done** | `«IR-FROZEN»`,`«CORE-AST»`,`«ABI-FROZEN»`,`«RTNUM-SIG-FROZEN»` | **The backend works end-to-end:** hand-written IR → Core Erlang → loaded `.beam` → correct results (add/wrap/shift, `sum_to(100k)` constant-space, fib/fac, div traps, deny-all host, stdlib gcd); binding chokepoint + security-invariant test pass. |
 | **09** Runtime defaults | [`09`](phase-1/09-runtime-defaults.md) | **done** | `«ABI-FROZEN»` | `rt_trap.raise/1`, `rt_host.call_host/3` (deny-all), `rt_meter.charge/1` (tier-O pdict fuel), `rt_stdlib.gcd/2` (own), `rt_bif` (build-time allowlist). 34 fail-closed/security tests. |
-| **10** WASM validate & lower | [`10`](phase-1/10-wasm-validate-and-lower.md) | `unclaimed` | `«WASM-AST»` (validate); `«IR-FROZEN»` (lower) | `full` validation (security boundary) + WASM AST → shared IR. |
+| **10** WASM validate & lower | [`10`](phase-1/10-wasm-validate-and-lower.md) | **done** | `«WASM-AST»`, `«IR-FROZEN»` | `full` validation (spec abstract-stack algorithm + local cap) rejects ill-typed; lower does stack-elim/SSA (mutable locals → `LoopParam`) with named labels. **Real `.wasm` → BEAM proven** (add/sum_to/fib via the full pipeline). |
 | **11** ir_lower, linker, Safe profile, CLI (capstone) | [`11`](phase-1/11-ir-lower-linker-cli.md) | `unclaimed` | all of the above | The `ir_lower` pass, the linker + Safe profile, the per-stage CLI (decision #5), and the **end-to-end differential acceptance** — Phase-1 goal proven. |
 
 ---
@@ -99,6 +99,24 @@ broaden the `own` stdlib + BIF allowlist; then the Porffor bridge + its ABI `rt_
 
 ## Change log
 
+- **Unit 10 landed (WASM validate & lower) — FULL `.wasm` → BEAM PIPELINE WORKS.** Real
+  `wat2wasm` fixtures decode → validate → lower → emit_core → build_beam → run on the
+  BEAM with spec-correct results: `add(2,3)=5` (+ wrap), `sum_to(100)=5050`, `fib(10)=55`.
+  212 tests, zero warnings, fail-closed (no panic on hostile input).
+  - **10a validate** is a faithful transcription of the spec abstract-stack algorithm
+    (vals+ctrls stacks, polymorphic-after-`unreachable`, loop label = input types, full
+    br/br_table/call/index checks, else-less-`if` rule, per-function local cap 50000);
+    rejects every ill-typed fixture with a spec-cited `ValidateError`; imports only
+    `ast.gleam` (gates independently of the IR).
+  - **10b lower**: stack-elim to compile-time `ir.Value` list (no runtime stack); WASM
+    branch DEPTHS resolved to NAMED IR labels (D6); mutable locals threaded as
+    `LoopParam` (loops) / block result values via a sound syntactic over-approximation
+    (locals assigned anywhere in a construct); declared locals zero-init'd via `Let`.
+  - **Notes for unit 11:** lower names a defined function at funcidx `f` as `"f<funcidx>"`
+    (offset by `imported_func_count`); `ExportFn(export_name, "f<idx>")` (emit_core emits a
+    forwarding wrapper when names differ); IR module name `"twocore@wasm@<sanitized>"`.
+    `call_indirect` is rejected at validation (and guarded in lower). Rename in lower if
+    the CLI/linker wants different names.
 - **Unit 05 landed (WASM decoder & AST).** `decode/1`, generic `decode_u_n`/`decode_s_n`
   LEB128 (all spec vectors incl. overflow/too-long), the worked `add` fixture decodes to
   the exact AST, `wat2wasm` fixtures (loop/if/call/locals/multi-value), and a fail-closed
