@@ -38,24 +38,28 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import twocore/ir.{
-  type ConvOp, type DataSegment, type ExportDecl, type Expr, type FloatWidth,
-  type FuncType, type Function, type GlobalDecl, type ImportDecl, type IntWidth,
-  type Local, type LoopParam, type MemAccess, type MemoryDecl, type Module,
-  type NumOp, type SwitchArm, type TermOp, type TrapReason, type ValType,
-  type Value, Block, BoxFloat, BoxInt, Break, CallDirect, CallHost, CallIndirect,
-  Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue, Convert, DataSegment,
-  ExportFn, FAdd, FDiv, FMax, FMin, FMul, FSub, FW32, FW64, FuncType, Function,
+  type ConvOp, type DataSegment, type ElementSegment, type ExportDecl, type Expr,
+  type FloatWidth, type FuncType, type Function, type GlobalDecl,
+  type ImportDecl, type IntWidth, type Local, type LoopParam, type MemAccess,
+  type MemoryDecl, type Module, type NumOp, type SwitchArm, type TableDecl,
+  type TermOp, type TrapReason, type ValType, type Value, Block, BoxFloat,
+  BoxInt, Break, CallDirect, CallHost, CallIndirect, Charge, ConstF32, ConstF64,
+  ConstI32, ConstI64, Continue, Convert, ConvertS, ConvertU, DataSegment,
+  ElementSegment, ExportFn, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil,
+  FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe,
+  FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64, FuncType, Function,
   GlobalDecl, GlobalGet, GlobalSet, I32Extend16S, I32Extend8S, I32WrapI64,
   I64Extend16S, I64Extend32S, I64Extend8S, I64ExtendI32S, I64ExtendI32U, IAdd,
   IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU,
   ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS,
   IShrU, ISub, IXor, If, ImportFn, IndirectCallTypeMismatch, IntDivByZero,
   IntOverflow, InvalidConversionToInteger, Let, Local, Loop, LoopParam, MakeCons,
-  MakeTuple, MemAccess, MemLoad, MemStore, MemoryDecl, MemoryOutOfBounds, Module,
-  Num, ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64,
-  TI32, TI64, TTerm, TableOutOfBounds, TermOp, Trap, TruncSatS, TruncSatU,
-  TupleGet, UnboxFloat, UnboxInt, UndefinedElement, UninitializedElement,
-  Unreachable, Values, Var, W32, W64,
+  MakeTuple, MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryDecl,
+  MemoryOutOfBounds, Module, Num, ReinterpretFToI, ReinterpretIToF, Return,
+  Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableDecl, TableOutOfBounds,
+  TermOp, Trap, TruncS, TruncSatS, TruncSatU, TruncU, TupleGet, UnboxFloat,
+  UnboxInt, UndefinedElement, UninitializedElement, Unreachable, Values, Var,
+  W32, W64,
 }
 
 // ───────────────────────────── error type (D4 — this stage's own) ────────────────
@@ -104,7 +108,7 @@ pub fn parse_module(source: String) -> Result(Module, ParseError) {
   use rest <- result.try(expect(rest, TLBrace, "{"))
   use #(acc, rest) <- result.try(parse_module_items(
     rest,
-    ModuleAcc(False, None, [], [], [], [], []),
+    ModuleAcc(False, None, [], [], [], [], [], [], [], None),
   ))
   use rest <- result.try(expect(rest, TRBrace, "}"))
   case rest {
@@ -544,6 +548,9 @@ type ModuleAcc {
     exports: List(ExportDecl),
     data: List(DataSegment),
     functions: List(Function),
+    tables: List(TableDecl),
+    elements: List(ElementSegment),
+    start: Option(String),
   )
 }
 
@@ -558,13 +565,19 @@ fn build_module(name: String, acc: ModuleAcc) -> Module {
     functions: list.reverse(acc.functions),
     exports: list.reverse(acc.exports),
     data_segments: list.reverse(acc.data),
-    tables: [],
-    elements: [],
-    start: None,
+    tables: list.reverse(acc.tables),
+    elements: list.reverse(acc.elements),
+    start: acc.start,
   )
 }
 
 /// Parses module-level declarations until the closing `}` (left for the caller).
+///
+/// Dispatches on the leading keyword: `numerics`/`memory`/`global`/`import`/`export`/`data`/
+/// `func` (Phase-1) plus the Phase-2 `table`/`elem`/`start` (`«IR2-FROZEN»`). List-valued
+/// items accumulate REVERSED (flipped in `build_module`); `start` overwrites (last wins).
+/// Items may appear in any order. An unknown keyword is a typed `UnexpectedToken` — never a
+/// panic.
 fn parse_module_items(
   toks: List(PToken),
   acc: ModuleAcc,
@@ -596,6 +609,21 @@ fn parse_module_items(
         "data" -> {
           use #(d, r) <- result.try(parse_data(rest))
           parse_module_items(r, ModuleAcc(..acc, data: [d, ..acc.data]))
+        }
+        "table" -> {
+          use #(t, r) <- result.try(parse_table(rest))
+          parse_module_items(r, ModuleAcc(..acc, tables: [t, ..acc.tables]))
+        }
+        "elem" -> {
+          use #(el, r) <- result.try(parse_elem(rest))
+          parse_module_items(
+            r,
+            ModuleAcc(..acc, elements: [el, ..acc.elements]),
+          )
+        }
+        "start" -> {
+          use #(fname, r) <- result.try(parse_at_name(rest))
+          parse_module_items(r, ModuleAcc(..acc, start: Some(fname)))
         }
         "func" -> {
           use #(f, r) <- result.try(parse_func(rest))
@@ -697,6 +725,79 @@ fn parse_data(
   use rest <- result.try(expect(rest, TEquals, "="))
   use #(bytes, rest) <- result.try(parse_hexbytes(rest))
   Ok(#(DataSegment(offset, bytes), rest))
+}
+
+/// Parses a funcref table declaration `table @name min <int> [max <int>]` (`«IR2-FROZEN»`;
+/// see `specs/phase-2/ir2-grammar-delta.md`).
+///
+/// The leading `table` keyword has already been consumed. Returns `Ok(#(TableDecl, rest))`
+/// where `max` is `Some(M)` when the optional `max <int>` clause is present and `None`
+/// otherwise. Errors (typed `ParseError`, never a panic) when the `@name`, the `min`
+/// keyword, or either entry count is missing/malformed — all faults flow from the total
+/// helpers (`parse_at_name`, `expect_word`, `expect_number`).
+fn parse_table(
+  toks: List(PToken),
+) -> Result(#(TableDecl, List(PToken)), ParseError) {
+  use #(name, rest) <- result.try(parse_at_name(toks))
+  use rest <- result.try(expect_word(rest, "min"))
+  use #(min, rest) <- result.try(expect_number(rest))
+  case rest {
+    [PToken(TWord("max"), _, _), ..rest2] -> {
+      use #(max, rest3) <- result.try(expect_number(rest2))
+      Ok(#(TableDecl(name, min, Some(max)), rest3))
+    }
+    _ -> Ok(#(TableDecl(name, min, None), rest))
+  }
+}
+
+/// Parses an active element segment `elem @table ( <offset-expr> ) [ @fn, … ]`
+/// (`«IR2-FROZEN»`; see `specs/phase-2/ir2-grammar-delta.md`).
+///
+/// The leading `elem` keyword has already been consumed. The offset is a full expression
+/// (the parser checks SYNTAX only — it does not require a constant; semantic validation is a
+/// later stage). The payload is a bracketed, comma-separated list of `@`-prefixed function
+/// names (`[]` for an empty segment). Returns `Ok(#(ElementSegment, rest))`, or a typed
+/// `ParseError` (never a panic) on a missing `@table`, the `(`/`)` around the offset, or the
+/// `[`/`]`/`,` of the function list.
+fn parse_elem(
+  toks: List(PToken),
+) -> Result(#(ElementSegment, List(PToken)), ParseError) {
+  use #(table, rest) <- result.try(parse_at_name(toks))
+  use rest <- result.try(expect(rest, TLParen, "("))
+  use #(offset, rest) <- result.try(parse_expr(rest))
+  use rest <- result.try(expect(rest, TRParen, ")"))
+  use #(funcs, rest) <- result.try(parse_at_name_bracket_list(rest))
+  Ok(#(ElementSegment(table, offset, funcs), rest))
+}
+
+/// Parses a bracketed, comma-separated list of `@name` references: `[ @a, @b ]` or `[]`.
+///
+/// The bracket analogue of `parse_paren_list` specialised to `@`-names (the element-segment
+/// function list). Returns `Ok(#(names, rest))` with the bare names (sigil stripped), or a
+/// typed `ParseError` on a missing `[`, a wrong-sigil entry, or a missing `,`/`]`. Total.
+fn parse_at_name_bracket_list(
+  toks: List(PToken),
+) -> Result(#(List(String), List(PToken)), ParseError) {
+  use rest <- result.try(expect(toks, TLBracket, "["))
+  case rest {
+    [PToken(TRBracket, _, _), ..r] -> Ok(#([], r))
+    _ -> parse_at_name_bracket_rest(rest, [])
+  }
+}
+
+/// Tail of `parse_at_name_bracket_list`: reads one `@name`, then either a `,` (continue) or
+/// the closing `]`. Accumulates reversed and flips at the close.
+fn parse_at_name_bracket_rest(
+  toks: List(PToken),
+  acc: List(String),
+) -> Result(#(List(String), List(PToken)), ParseError) {
+  use #(name, rest) <- result.try(parse_at_name(toks))
+  case rest {
+    [PToken(TComma, _, _), ..r] -> parse_at_name_bracket_rest(r, [name, ..acc])
+    [PToken(TRBracket, _, _), ..r] -> Ok(#(list.reverse([name, ..acc]), r))
+    [PToken(t, l, c), ..] -> Error(UnexpectedToken(l, c, ", or ]", describe(t)))
+    [] -> Error(UnexpectedEnd(", or ]"))
+  }
 }
 
 /// Parses an `0x`-prefixed byte string into a `BitArray` (two hex digits per byte).
@@ -878,6 +979,11 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
         "num" -> parse_num(rest)
         "convert" -> parse_convert(rest)
         "term" -> parse_term(rest)
+        "mem.size" -> Ok(#(MemSize, rest))
+        "mem.grow" -> {
+          use #(delta, rest) <- result.try(parse_value(rest))
+          Ok(#(MemGrow(delta), rest))
+        }
         "mem.load" -> parse_mem_load(rest)
         "mem.store" -> parse_mem_store(rest)
         "global.get" -> {
@@ -1211,6 +1317,11 @@ fn int_mnemonic(m: String, w: IntWidth) -> Result(NumOp, Nil) {
   }
 }
 
+/// Resolves a float mnemonic (the middle segment of `f.<mnemonic>.<W>`) to its `NumOp`
+/// constructor at width `w`. Mirrors `printer.numop_to_string`'s float arms. The Phase-2
+/// additions (`abs`/`neg`/`ceil`/`floor`/`trunc`/`nearest`/`sqrt`/`copysign` and the six
+/// comparisons `eq`/`ne`/`lt`/`gt`/`le`/`ge`) are sign-agnostic (no `_s`/`_u`). `Error(Nil)`
+/// for an unknown mnemonic (surfaced as `UnknownOp` by `parse_num`).
 fn float_mnemonic(m: String, w: FloatWidth) -> Result(NumOp, Nil) {
   case m {
     "add" -> Ok(FAdd(w))
@@ -1219,11 +1330,33 @@ fn float_mnemonic(m: String, w: FloatWidth) -> Result(NumOp, Nil) {
     "div" -> Ok(FDiv(w))
     "min" -> Ok(FMin(w))
     "max" -> Ok(FMax(w))
+    "abs" -> Ok(FAbs(w))
+    "neg" -> Ok(FNeg(w))
+    "ceil" -> Ok(FCeil(w))
+    "floor" -> Ok(FFloor(w))
+    "trunc" -> Ok(FTrunc(w))
+    "nearest" -> Ok(FNearest(w))
+    "sqrt" -> Ok(FSqrt(w))
+    "copysign" -> Ok(FCopysign(w))
+    "eq" -> Ok(FEq(w))
+    "ne" -> Ok(FNe(w))
+    "lt" -> Ok(FLt(w))
+    "gt" -> Ok(FGt(w))
+    "le" -> Ok(FLe(w))
+    "ge" -> Ok(FGe(w))
     _ -> Error(Nil)
   }
 }
 
 /// Parses a conversion op spelling (mirror of `printer.convop_to_string`).
+///
+/// Fixed strings (the width/sign changes and the Phase-2 `demote.f64`/`promote.f32`) match
+/// first; the parametric forms (`trunc_sat_*`, `reinterpret_*`, `box`/`unbox`, and the
+/// Phase-2 trapping `trunc_s`/`trunc_u` + `convert_s`/`convert_u`) are resolved by splitting
+/// on `.`. The trapping `trunc_s`/`trunc_u` heads are DISTINCT from the saturating
+/// `trunc_sat_s`/`trunc_sat_u` (no prefix collision). Operand order matches the printer:
+/// trunc is `<from-float>.<to-int>`, convert is `<from-int>.<to-float>`. `Error(Nil)` for an
+/// unknown spelling (surfaced as `UnknownOp` by `parse_convert`).
 fn string_to_convop(w: String) -> Result(ConvOp, Nil) {
   case w {
     "i32.wrap_i64" -> Ok(I32WrapI64)
@@ -1234,6 +1367,8 @@ fn string_to_convop(w: String) -> Result(ConvOp, Nil) {
     "i64.extend8_s" -> Ok(I64Extend8S)
     "i64.extend16_s" -> Ok(I64Extend16S)
     "i64.extend32_s" -> Ok(I64Extend32S)
+    "demote.f64" -> Ok(F32DemoteF64)
+    "promote.f32" -> Ok(F64PromoteF32)
     _ ->
       case string.split(w, ".") {
         ["trunc_sat_s", f, i] -> {
@@ -1245,6 +1380,26 @@ fn string_to_convop(w: String) -> Result(ConvOp, Nil) {
           use from <- result.try(ty_fwidth(f))
           use to <- result.try(ty_iwidth(i))
           Ok(TruncSatU(from, to))
+        }
+        ["trunc_s", f, i] -> {
+          use from <- result.try(ty_fwidth(f))
+          use to <- result.try(ty_iwidth(i))
+          Ok(TruncS(from, to))
+        }
+        ["trunc_u", f, i] -> {
+          use from <- result.try(ty_fwidth(f))
+          use to <- result.try(ty_iwidth(i))
+          Ok(TruncU(from, to))
+        }
+        ["convert_s", i, f] -> {
+          use from <- result.try(ty_iwidth(i))
+          use to <- result.try(ty_fwidth(f))
+          Ok(ConvertS(from, to))
+        }
+        ["convert_u", i, f] -> {
+          use from <- result.try(ty_iwidth(i))
+          use to <- result.try(ty_fwidth(f))
+          Ok(ConvertU(from, to))
         }
         ["reinterpret_f2i", f] -> {
           use from <- result.try(ty_fwidth(f))

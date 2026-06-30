@@ -1,0 +1,24 @@
+; mem_table — a hand-authored Phase-2 golden exercising the IR2 textual additions in one
+; module: a funcref `table` declaration, an active `elem` segment, a `start` function,
+; memory.size / memory.grow, a sign-extending `mem.load` (i64 result), a float comparison
+; (`f.lt.64`), and a TRAPPING float->int convert (`trunc_s.f64.i32`). Written by reading
+; specs/phase-2/ir2-grammar-delta.md (never printer-generated — D7), so it is the
+; independent oracle that catches a printer+parser that collude on the same wrong grammar.
+module @mem_table {
+  numerics true
+  memory (min 1 max 4)
+  table @t0 min 2 max 8
+  elem @t0 ( values (i32.const 0) ) [ @worker, @setup ]
+  start @setup
+  func @worker ( %x:f64, %y:f64 ) -> (i32) {
+    let (%lt) = num f.lt.64 (%x, %y) ;
+    let (%n) = convert trunc_s.f64.i32 %x ;
+    let (%hi) = mem.load i64 1 signed %n offset=8 ;
+    return (%lt)
+  }
+  func @setup ( ) -> () {
+    let (%sz) = mem.size ;
+    let (%prev) = mem.grow i32.const 1 ;
+    return ()
+  }
+}

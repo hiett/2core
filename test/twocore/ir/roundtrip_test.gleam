@@ -10,10 +10,13 @@
 ////    structural `==` on `ir.Module` already compares them BIT-EXACTLY — so `==` (and
 ////    hence `module_equal`) is the correct equality here (NaN ≠ NaN under native float
 ////    `==`, but the IR never uses native floats). This is the D7 invariant.
-//// 2. **Golden suite** (the INDEPENDENT oracle): the three HAND-AUTHORED `.ir` files
-////    under `golden/` — written by reading the grammar, never printer-generated — parse
-////    to the expected `Module` values, and those values re-print + re-parse stably. Hand
-////    authoring is what defeats a printer+parser that collude on the same wrong grammar.
+//// 2. **Golden suite** (the INDEPENDENT oracle): the HAND-AUTHORED `.ir` files under
+////    `golden/` — the three Phase-1 programs (`add`/`sum_to`/`fib`) plus the Phase-2
+////    `mem_table` (table/elem/start, mem.size/grow, a result-typed sign-extending load, a
+////    float comparison, a trapping convert) — written by reading the grammar, never
+////    printer-generated — parse to the expected `Module` values, and those values re-print
+////    + re-parse stably. Hand authoring is what defeats a printer+parser that collude on
+////    the same wrong grammar.
 //// 3. **Negative corpus**: truncated input, a wrong sigil, an unknown op spelling, a
 ////    missing `(`, an unterminated block, a bad escape, a stray char — each returns a
 ////    typed `ParseError` (asserted by variant) and NONE panics (totality, D4).
@@ -261,12 +264,34 @@ fn int_ops(w: ir.IntWidth) -> List(ir.NumOp) {
   ]
 }
 
-/// Every float `NumOp` constructor at width `w`.
+/// Every float `NumOp` constructor at width `w` — the Phase-1 binary arithmetic plus the
+/// Phase-2 unary ops and the six comparisons (`«IR2-FROZEN»`).
 fn float_ops(w: ir.FloatWidth) -> List(ir.NumOp) {
-  [ir.FAdd(w), ir.FSub(w), ir.FMul(w), ir.FDiv(w), ir.FMin(w), ir.FMax(w)]
+  [
+    ir.FAdd(w),
+    ir.FSub(w),
+    ir.FMul(w),
+    ir.FDiv(w),
+    ir.FMin(w),
+    ir.FMax(w),
+    ir.FAbs(w),
+    ir.FNeg(w),
+    ir.FCeil(w),
+    ir.FFloor(w),
+    ir.FTrunc(w),
+    ir.FNearest(w),
+    ir.FSqrt(w),
+    ir.FCopysign(w),
+    ir.FEq(w),
+    ir.FNe(w),
+    ir.FLt(w),
+    ir.FGt(w),
+    ir.FLe(w),
+    ir.FGe(w),
+  ]
 }
 
-/// Every `NumOp` constructor at both widths (68 in total).
+/// Every `NumOp` constructor at both widths (29 integer + 20 float per width = 98 in total).
 fn all_numops() -> List(ir.NumOp) {
   list.flatten([
     int_ops(ir.W32),
@@ -305,10 +330,30 @@ fn all_convops() -> List(ir.ConvOp) {
     ir.BoxFloat(ir.FW64),
     ir.UnboxFloat(ir.FW32),
     ir.UnboxFloat(ir.FW64),
+    // Phase-2 (`«IR2-FROZEN»`): trapping float→int truncation, int→float convert (both
+    // signs, both widths each), and the two float-width changes.
+    ir.TruncS(ir.FW32, ir.W32),
+    ir.TruncS(ir.FW64, ir.W32),
+    ir.TruncS(ir.FW32, ir.W64),
+    ir.TruncS(ir.FW64, ir.W64),
+    ir.TruncU(ir.FW32, ir.W32),
+    ir.TruncU(ir.FW64, ir.W32),
+    ir.TruncU(ir.FW32, ir.W64),
+    ir.TruncU(ir.FW64, ir.W64),
+    ir.ConvertS(ir.W32, ir.FW32),
+    ir.ConvertS(ir.W64, ir.FW32),
+    ir.ConvertS(ir.W32, ir.FW64),
+    ir.ConvertS(ir.W64, ir.FW64),
+    ir.ConvertU(ir.W32, ir.FW32),
+    ir.ConvertU(ir.W64, ir.FW32),
+    ir.ConvertU(ir.W32, ir.FW64),
+    ir.ConvertU(ir.W64, ir.FW64),
+    ir.F32DemoteF64,
+    ir.F64PromoteF32,
   ]
 }
 
-/// Every `TrapReason` constructor.
+/// Every `TrapReason` constructor (Phase-1 five + the four Phase-2 additions, `«IR2-FROZEN»`).
 fn all_trapreasons() -> List(ir.TrapReason) {
   [
     ir.IntDivByZero,
@@ -316,6 +361,10 @@ fn all_trapreasons() -> List(ir.TrapReason) {
     ir.Unreachable,
     ir.IndirectCallTypeMismatch,
     ir.MemoryOutOfBounds,
+    ir.InvalidConversionToInteger,
+    ir.UndefinedElement,
+    ir.UninitializedElement,
+    ir.TableOutOfBounds,
   ]
 }
 
@@ -334,9 +383,12 @@ fn expr_corpus() -> List(ir.Expr) {
     ir.TermOp(ir.MakeTuple, [ir.Var("a"), ir.Var("b")]),
     ir.TermOp(ir.TupleGet(3), [ir.Var("t")]),
     ir.TermOp(ir.MakeCons, [ir.Var("h"), ir.Var("t")]),
-    // memory: a plain i32.load and a sign-extending i64.load8_s (distinct result widths
-    // prove the new `result` field round-trips and discriminates i32.load8_s vs
-    // i64.load8_s — same bytes+sign, different result type).
+    // memory: size/grow (Phase-2), a plain i32.load and a sign-extending i64.load8_s
+    // (distinct result widths prove the new `result` field round-trips and discriminates
+    // i32.load8_s vs i64.load8_s — same bytes+sign, different result type).
+    ir.MemSize,
+    ir.MemGrow(ir.ConstI32(1)),
+    ir.MemGrow(ir.Var("delta")),
     ir.MemLoad(ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32),
     ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 8, ir.TI64),
     ir.MemStore(ir.MemAccess(8, False), ir.Var("a"), ir.Var("v"), 16),
@@ -456,6 +508,60 @@ fn kitchen_sink_module() -> ir.Module {
   )
 }
 
+/// Expected `Module` for the Phase-2 golden `golden/mem_table.ir` (hand-built, independent
+/// of the printer). Exercises the new IR2 surface in one module: a funcref `table` decl, an
+/// active `elem` segment, a `start` function, `mem.size`/`mem.grow`, a sign-extending
+/// `mem.load` (i64 result), a float comparison (`f.lt.64`), and a TRAPPING float→int convert
+/// (`trunc_s.f64.i32`).
+fn mem_table_module() -> ir.Module {
+  ir.Module(
+    name: "mem_table",
+    uses_numerics: True,
+    memory: Some(ir.MemoryDecl(1, Some(4))),
+    globals: [],
+    imports: [],
+    functions: [
+      ir.Function(
+        name: "worker",
+        params: [ir.Local("x", ir.TF64), ir.Local("y", ir.TF64)],
+        result: [ir.TI32],
+        locals: [],
+        body: ir.Let(
+          ["lt"],
+          ir.Num(ir.FLt(ir.FW64), [ir.Var("x"), ir.Var("y")]),
+          ir.Let(
+            ["n"],
+            ir.Convert(ir.TruncS(ir.FW64, ir.W32), ir.Var("x")),
+            ir.Let(
+              ["hi"],
+              ir.MemLoad(ir.MemAccess(1, True), ir.Var("n"), 8, ir.TI64),
+              ir.Return([ir.Var("lt")]),
+            ),
+          ),
+        ),
+      ),
+      ir.Function(
+        name: "setup",
+        params: [],
+        result: [],
+        locals: [],
+        body: ir.Let(
+          ["sz"],
+          ir.MemSize,
+          ir.Let(["prev"], ir.MemGrow(ir.ConstI32(1)), ir.Return([])),
+        ),
+      ),
+    ],
+    exports: [],
+    data_segments: [],
+    tables: [ir.TableDecl("t0", 2, Some(8))],
+    elements: [
+      ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["worker", "setup"]),
+    ],
+    start: Some("setup"),
+  )
+}
+
 // ───────────────────────────── round-trip tests ─────────────────────────────
 
 pub fn numop_roundtrip_test() {
@@ -482,6 +588,32 @@ pub fn expr_surface_roundtrip_test() {
 
 pub fn module_level_roundtrip_test() {
   check_roundtrip(kitchen_sink_module())
+}
+
+/// The Phase-2 module-level surface (`«IR2-FROZEN»`): a module carrying a `table`, an active
+/// `elem` segment, and a `start` function round-trips losslessly.
+pub fn module_level_phase2_roundtrip_test() {
+  check_roundtrip(mem_table_module())
+}
+
+/// The `mem.load` result `ValType` (`«IR2-FROZEN»`) is NOT dropped: two loads with identical
+/// `MemAccess(1, signed)` but different result types (`i32.load8_s` vs `i64.load8_s`) are
+/// distinct `Module`s, and each round-trips. A printer/parser that ignored `result` would
+/// collapse them — this test fails closed on that bug.
+pub fn mem_load_result_type_discrimination_test() {
+  let m_i32 =
+    expr_module(
+      "ld",
+      ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI32),
+    )
+  let m_i64 =
+    expr_module(
+      "ld",
+      ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI64),
+    )
+  assert module_equal(m_i32, m_i64) == False
+  check_roundtrip(m_i32)
+  check_roundtrip(m_i64)
 }
 
 pub fn acceptance_programs_roundtrip_test() {
@@ -563,6 +695,15 @@ pub fn golden_fib_parses_to_expected_test() {
   assert parser.parse_module(read_golden("fib.ir")) == Ok(fib_module())
 }
 
+/// The Phase-2 golden parses to its hand-built expected `Module` — the independent oracle
+/// proving the printer and parser agree on the IR2 grammar additions (table/elem/start,
+/// mem.size/grow, the result-typed sign-extending load, the float comparison, and the
+/// trapping convert), not merely with each other.
+pub fn golden_mem_table_parses_to_expected_test() {
+  assert parser.parse_module(read_golden("mem_table.ir"))
+    == Ok(mem_table_module())
+}
+
 pub fn goldens_reprint_and_reparse_stably_test() {
   // print(parse(golden)) need not match the golden BYTES (the goldens carry hand
   // comments/whitespace), but the parsed Module must round-trip through the canonical
@@ -570,6 +711,7 @@ pub fn goldens_reprint_and_reparse_stably_test() {
   check_roundtrip(add_module())
   check_roundtrip(sum_to_module())
   check_roundtrip(fib_module())
+  check_roundtrip(mem_table_module())
 }
 
 // ───────────────────────────── module_equal tests ─────────────────────────────
@@ -673,6 +815,58 @@ pub fn negative_stray_char_test() {
   assert rejects("module @m { ! }")
 }
 
+pub fn negative_mem_load_missing_valtype_test() {
+  // The result valtype is REQUIRED (`«IR2-FROZEN»`): `mem.load 4 %a …` (no leading
+  // valtype) must fail where the valtype is expected — `4` is a number, not a valtype.
+  let r =
+    parser.parse_module(
+      "module @m { func @f () -> () { mem.load 4 %a offset=0 } }",
+    )
+  assert case r {
+    Error(parser.UnexpectedToken(_, _, "valtype", _)) -> True
+    _ -> False
+  }
+}
+
+pub fn negative_unknown_float_op_test() {
+  // `f.bogus.32` is not a real float-op spelling → UnknownOp (via float_mnemonic Error).
+  let r =
+    parser.parse_module(
+      "module @m { func @f () -> () { num f.bogus.32 (%a) } }",
+    )
+  assert case r {
+    Error(parser.UnknownOp(_, _, "f.bogus.32")) -> True
+    _ -> False
+  }
+}
+
+pub fn negative_unknown_convert_op_test() {
+  // `trunc_q.f64.i32` is not a real convert-op spelling → UnknownOp.
+  let r =
+    parser.parse_module(
+      "module @m { func @f () -> () { convert trunc_q.f64.i32 %a } }",
+    )
+  assert case r {
+    Error(parser.UnknownOp(_, _, "trunc_q.f64.i32")) -> True
+    _ -> False
+  }
+}
+
+pub fn negative_malformed_elem_test() {
+  // An `elem` whose offset parentheses are missing (`[` where `(` is required).
+  let r = parser.parse_module("module @m { elem @t0 [ @a ] }")
+  assert case r {
+    Error(parser.UnexpectedToken(_, _, "(", _)) -> True
+    _ -> False
+  }
+}
+
+pub fn negative_new_trapreasons_roundtrip_test() {
+  // The three new trap reasons are accepted by the parser (positive coverage paired with
+  // the negative `kaboom` case) so a dropped arm is caught.
+  assert rejects("module @m { func @f () -> () { trap not_a_reason } }")
+}
+
 pub fn negative_garbage_inputs_never_panic_test() {
   // A battery of malformed inputs: each must return Error (never panic). Reaching the
   // end of this list without crashing the runner IS the totality proof.
@@ -702,6 +896,23 @@ pub fn negative_garbage_inputs_never_panic_test() {
     "}{}{}{",
     "module @m { func @f ( %p ) -> () { return () } }",
     "module @m { func @f ( %p : ) -> () { return () } }",
+    // Phase-2 malformed forms (`«IR2-FROZEN»`): each must return Error, never panic.
+    "module @m { table }",
+    "module @m { table @t0 }",
+    "module @m { table @t0 min }",
+    "module @m { table @t0 min 2 max }",
+    "module @m { elem }",
+    "module @m { elem @t0 }",
+    "module @m { elem @t0 ( values (i32.const 0) ) }",
+    "module @m { elem @t0 ( values (i32.const 0) ) [ @a }",
+    "module @m { elem @t0 ( values (i32.const 0) ) [ %a ] }",
+    "module @m { start }",
+    "module @m { start %f }",
+    "module @m { func @f () -> () { mem.grow } }",
+    "module @m { func @f () -> () { mem.load } }",
+    "module @m { func @f () -> () { mem.load i32 } }",
+    "module @m { func @f () -> () { convert trunc_s.f64 %a } }",
+    "module @m { func @f () -> () { convert convert_s.f64.i32 %a } }",
   ]
   assert list.all(garbage, rejects)
 }

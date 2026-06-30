@@ -109,7 +109,7 @@ Unsafe profile are all **Phase 3** (deferred, not dropped).
 | Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
 |---|---|---|---|---|
 | **P2-01** Interface freeze (keystone) | [`01`](phase-2/01-interface-freeze.md) | **done** | — | IR2 + cell ABI + instantiation contract + rt_num float sigs frozen, build green. |
-| **P2-02** `.ir` printer/parser ext | [`02`](phase-2/02-ir-textual-form.md) | `unclaimed` | `«IR2-FROZEN»` | `.ir` round-trips the new variants (fast-follow, off critical path). |
+| **P2-02** `.ir` printer/parser ext | [`02`](phase-2/02-ir-textual-form.md) | **done** | `«IR2-FROZEN»` | `.ir` round-trips the new variants (fast-follow, off critical path). |
 | **P2-03** rt_state + globals + lifecycle | [`03`](phase-2/03-rt-state-lifecycle.md) | `unclaimed` | `«CELL-STATE-ABI-FROZEN»` | The per-instance pdict cell (opaque, fresh/reset, fail-closed) + mutable globals + one-instance-one-process. |
 | **P2-04** rt_mem (paged + oracle) | [`04`](phase-2/04-rt-mem.md) | `unclaimed` | `«CELL-STATE-ABI-FROZEN»` | Bounds-checked (no-wrap, trap-before-write) LE load/store/size/grow + data-init + Safe max-pages cap; rebuild-oracle differential + memory_trap/address/endianness `.wast`. |
 | **P2-05** rt_table + call_indirect | [`05`](phase-2/05-rt-table.md) | `unclaimed` | `«CELL-STATE-ABI-FROZEN»` | 3-fault fail-closed indirect dispatch (build-controlled, no ambient apply) + element-init. |

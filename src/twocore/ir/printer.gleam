@@ -78,13 +78,30 @@ pub fn print_module(module: Module) -> String {
     "  memory " <> memory_str(module.memory) <> "\n",
   ]
   let globals = list.map(module.globals, print_global)
+  let tables = list.map(module.tables, print_table)
   let imports = list.map(module.imports, print_import)
   let exports = list.map(module.exports, print_export)
   let data = list.map(module.data_segments, print_data)
+  let elements = list.map(module.elements, print_elem)
+  let start = case module.start {
+    Some(fn_name) -> ["  start @" <> fn_name <> "\n"]
+    None -> []
+  }
   let funcs = list.map(module.functions, fn(f) { print_func(f) <> "\n" })
 
   string_tree.from_strings(
-    list.flatten([header, globals, imports, exports, data, funcs, ["}\n"]]),
+    list.flatten([
+      header,
+      globals,
+      tables,
+      imports,
+      exports,
+      data,
+      elements,
+      start,
+      funcs,
+      ["}\n"],
+    ]),
   )
   |> string_tree.to_string
 }
@@ -153,6 +170,35 @@ fn print_data(d: ir.DataSegment) -> String {
   <> ") = "
   <> print_hexbytes(d.bytes)
   <> "\n"
+}
+
+/// Renders one funcref table declaration (Phase-2): `  table @name min N [max M]`.
+///
+/// Mirrors `memory`'s sizing but is NAMED (`@name`) because `call_indirect`/`elem`
+/// reference it. `min`/`max` are entry counts in canonical decimal; the ` max M` clause is
+/// omitted for an unbounded table (`max: None`). Total — every `TableDecl` has this form.
+fn print_table(t: ir.TableDecl) -> String {
+  let max = case t.max {
+    Some(m) -> " max " <> int.to_string(m)
+    None -> ""
+  }
+  "  table @" <> t.name <> " min " <> int.to_string(t.min) <> max <> "\n"
+}
+
+/// Renders one active element segment (Phase-2):
+/// `  elem @table ( <offset-expr> ) [ @fn, … ]`.
+///
+/// `offset` is a full constant expression (mirroring `data`'s offset form); the payload is
+/// a bracketed, comma-separated list of `@`-prefixed IR function names (`[]` for an empty
+/// segment), written into consecutive table entries from the offset. Total.
+fn print_elem(e: ir.ElementSegment) -> String {
+  "  elem @"
+  <> e.table
+  <> " ("
+  <> print_expr(2, e.offset)
+  <> ") ["
+  <> string.join(list.map(e.funcs, fn(f) { "@" <> f }), ", ")
+  <> "]\n"
 }
 
 /// Renders a whole function with its named-param header (`func @add (%p0:i32) -> (i32)`),
@@ -259,9 +305,8 @@ fn print_expr(indent: Int, e: Expr) -> String {
       "convert " <> convop_to_string(op) <> " " <> print_value(arg)
     TermOp(op, args) ->
       "term " <> termop_to_string(op) <> " " <> value_list(args)
-    // Phase-2: unit 02 fills the real spellings for these new memory.size/grow nodes.
-    MemSize -> todo
-    MemGrow(_delta) -> todo
+    MemSize -> "mem.size"
+    MemGrow(delta) -> "mem.grow " <> print_value(delta)
     MemLoad(op, addr, offset, result) ->
       "mem.load "
       <> print_valtype(result)
@@ -471,22 +516,23 @@ fn numop_to_string(op: NumOp) -> String {
     FDiv(w) -> "f.div." <> fwidth_str(w)
     FMin(w) -> "f.min." <> fwidth_str(w)
     FMax(w) -> "f.max." <> fwidth_str(w)
-    // Phase-2 float NumOps (`«IR2-FROZEN»`; spellings in ir2-grammar-delta.md). Unit 02
-    // fills the `f.<op>.<W>` renderings; transitional `todo` keeps the freeze compiling.
-    FAbs(_)
-    | FNeg(_)
-    | FCeil(_)
-    | FFloor(_)
-    | FTrunc(_)
-    | FNearest(_)
-    | FSqrt(_)
-    | FCopysign(_)
-    | FEq(_)
-    | FNe(_)
-    | FLt(_)
-    | FGt(_)
-    | FLe(_)
-    | FGe(_) -> todo
+    // Phase-2 float NumOps (`«IR2-FROZEN»`; spellings in ir2-grammar-delta.md). The
+    // comparisons are sign-AGNOSTIC (`f.lt.<W>`, not `f.lt_s`) — there is no signed/unsigned
+    // distinction for IEEE floats, so they cannot collide with the integer `i.lt_s`/`i.lt_u`.
+    FAbs(w) -> "f.abs." <> fwidth_str(w)
+    FNeg(w) -> "f.neg." <> fwidth_str(w)
+    FCeil(w) -> "f.ceil." <> fwidth_str(w)
+    FFloor(w) -> "f.floor." <> fwidth_str(w)
+    FTrunc(w) -> "f.trunc." <> fwidth_str(w)
+    FNearest(w) -> "f.nearest." <> fwidth_str(w)
+    FSqrt(w) -> "f.sqrt." <> fwidth_str(w)
+    FCopysign(w) -> "f.copysign." <> fwidth_str(w)
+    FEq(w) -> "f.eq." <> fwidth_str(w)
+    FNe(w) -> "f.ne." <> fwidth_str(w)
+    FLt(w) -> "f.lt." <> fwidth_str(w)
+    FGt(w) -> "f.gt." <> fwidth_str(w)
+    FLe(w) -> "f.le." <> fwidth_str(w)
+    FGe(w) -> "f.ge." <> fwidth_str(w)
   }
 }
 
@@ -495,6 +541,10 @@ fn numop_to_string(op: NumOp) -> String {
 /// spellings for the rest: `trunc_sat_s.<from>.<to>` (e.g. `trunc_sat_s.f64.i32`),
 /// `reinterpret_f2i.<fw>` / `reinterpret_i2f.<iw>`, and `box.<ty>` / `unbox.<ty>`
 /// for the explicit term↔numeric boxing bridge (`box.i32`, `unbox.f64`).
+///
+/// Phase-2 additions (`«IR2-FROZEN»`): the TRAPPING `trunc_s.<fw>.<iw>` / `trunc_u.<fw>.<iw>`
+/// (distinct from the saturating `trunc_sat_*`), the integer→float `convert_s.<iw>.<fw>` /
+/// `convert_u.<iw>.<fw>`, and the fixed `demote.f64` / `promote.f32`.
 fn convop_to_string(op: ConvOp) -> String {
   case op {
     I32WrapI64 -> "i32.wrap_i64"
@@ -515,15 +565,19 @@ fn convop_to_string(op: ConvOp) -> String {
     UnboxInt(w) -> "unbox." <> iwidth_ty(w)
     BoxFloat(w) -> "box." <> fwidth_ty(w)
     UnboxFloat(w) -> "unbox." <> fwidth_ty(w)
-    // Phase-2 ConvOps (`«IR2-FROZEN»`; spellings `trunc_s.<fw>.<iw>`,
-    // `convert_s.<iw>.<fw>`, `demote.f64`, `promote.f32` — see ir2-grammar-delta.md).
-    // Unit 02 fills these; transitional `todo` keeps the freeze compiling.
-    TruncS(_, _)
-    | TruncU(_, _)
-    | ConvertS(_, _)
-    | ConvertU(_, _)
-    | F32DemoteF64
-    | F64PromoteF32 -> todo
+    // Phase-2 ConvOps (`«IR2-FROZEN»`; spellings in ir2-grammar-delta.md). The TRAPPING
+    // truncations drop the `_sat` of the saturating forms (`trunc_s.<fw>.<iw>` vs
+    // `trunc_sat_s.<fw>.<iw>`), so their `string.split` heads differ and never collide.
+    // Operand order: trapping truncation is `<from-float>.<to-int>`; integer→float convert
+    // is `<from-int>.<to-float>`. `demote`/`promote` are fixed strings (one each in MVP).
+    TruncS(from, to) -> "trunc_s." <> fwidth_ty(from) <> "." <> iwidth_ty(to)
+    TruncU(from, to) -> "trunc_u." <> fwidth_ty(from) <> "." <> iwidth_ty(to)
+    ConvertS(from, to) ->
+      "convert_s." <> iwidth_ty(from) <> "." <> fwidth_ty(to)
+    ConvertU(from, to) ->
+      "convert_u." <> iwidth_ty(from) <> "." <> fwidth_ty(to)
+    F32DemoteF64 -> "demote.f64"
+    F64PromoteF32 -> "promote.f32"
   }
 }
 
