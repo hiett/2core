@@ -31,7 +31,7 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 | Unit | Doc | Owner / status | Depends on (freeze) | What it leaves when `done` |
 |---|---|---|---|---|
 | **01** Interface freeze | [`01`](phase-1/01-interface-freeze.md) | **done** | — | IR types, `.ir` grammar, runtime ABI, rt_num signatures (90 fns, `todo` bodies → 06), PipelineError stub all frozen; neutrality review signed off; 3 golden `.ir` + strawman test green. The keystones exist. |
-| **02** `.ir` printer & parser | [`02`](phase-1/02-ir-textual-form.md) | `unclaimed` | `«IR-FROZEN»` | `.ir` round-trips; every stage can dump/load IR as the inter-stage contract (D7). |
+| **02** `.ir` printer & parser | [`02`](phase-1/02-ir-textual-form.md) | **done** | `«IR-FROZEN»` | `.ir` round-trips the full surface (`parse(print(m))==m`, incl. NaN payloads/`-0.0`/±Inf); total parser; 3 goldens parse; `ir-grammar.md` reconciled to the implementation. |
 | **03** Core Erlang AST & printer | [`03`](phase-1/03-core-erlang-backend.md) | **done** | — | `.core` AST (`«CORE-AST»`) + pretty-printer; printed ASTs compile+run on real OTP-29 (add/fac/classify); atom escaping proven byte-identical to OTP `io_lib:write_string`. |
 | **04** `build_beam` driver & FFI | [`04`](phase-1/04-build-beam-driver.md) | **done** | — | `.core` text → loaded `.beam` proven (hand-written `.core` compiled, loaded, ran on BEAM); the `«FFI-SHIM»`; `gleam_erlang` added. |
 | **05** WASM decoder & AST | [`05`](phase-1/05-wasm-decoder.md) | **done** | — | `.wasm` → WASM AST (`«WASM-AST»`); LEB128 (spec vectors) + fail-closed/fuzz-proven decoding (no `let assert`/`panic`); 54 tests. |
@@ -99,6 +99,14 @@ broaden the `own` stdlib + BIF allowlist; then the Porffor bridge + its ABI `rt_
 
 ## Change log
 
+- **Unit 02 landed (`.ir` printer & parser).** Canonical printer (floats as raw hex bits)
+  + a total recursive-descent parser with its own positioned `ParseError`; round-trip
+  `parse(print(m))==m` over the full IR surface (all 68 NumOps, 26 ConvOps, every Expr
+  variant, NaN payloads/`-0.0`/±Inf bit-exact); the 3 hand-authored goldens parse; 25-input
+  garbage battery returns typed errors without panic. 237 tests. **`ir-grammar.md`
+  reconciled** to the (now-tested) implementation — notably `;` is a comment, not a
+  `let`/`charge` separator (fixing a conflict in the seeded grammar), trap-reason spellings
+  match the `TrapReason` ctor snake_case, and `data`/`ConvOp`/`TermOp` spellings finalized.
 - **Unit 10 landed (WASM validate & lower) — FULL `.wasm` → BEAM PIPELINE WORKS.** Real
   `wat2wasm` fixtures decode → validate → lower → emit_core → build_beam → run on the
   BEAM with spec-correct results: `add(2,3)=5` (+ wrap), `sum_to(100)=5050`, `fib(10)=55`.

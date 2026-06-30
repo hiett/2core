@@ -1,9 +1,19 @@
-# The `.ir` textual form — grammar (seeded strawman)
+# The `.ir` textual form — grammar
 
-> Owned by **unit 01** (frozen *with* the IR types). Implemented by **unit 02**
-> (printer + parser). This is a **seeded strawman**; unit 01 finalizes it to match the
-> frozen `ir.gleam`. It exists so the printer and parser target a *written grammar*
-> rather than each other (D7 — prevents printer/parser collusion).
+> Owned by **unit 01** (frozen *with* the IR types). Implemented and reconciled by
+> **unit 02** (printer + parser). It exists so the printer and parser target a *written
+> grammar* rather than each other (D7 — prevents printer/parser collusion).
+>
+> **The unit-02 implementation (`src/twocore/ir/{printer,parser}.gleam`) is now the
+> authoritative grammar** — it round-trips the full IR surface (237 tests). Six points
+> resolved during implementation and folded back here: `;` is a comment, **not** a
+> `let`/`charge` separator (the rhs/continuation are self-delimiting); trap reasons are
+> the uniform snake_case of the `TrapReason` ctor; `ConvOp` spellings are
+> `trunc_sat_{s,u}.<fw>.<iw>`, `reinterpret_{f2i,i2f}.<w>`, `box.<ty>`/`unbox.<ty>` plus
+> the fixed `i32.wrap_i64`/`extendK_s` forms; `TermOp` spellings are `make_tuple`,
+> `make_cons`, `tuple_get.<index>`; `data` is `data ( <offset-expr> ) = 0x<hex>`;
+> canonical whitespace is compact (`%name:ty`, no inner-paren padding) though the parser
+> is whitespace-insensitive.
 
 ## Design rules (from D7)
 
@@ -42,7 +52,7 @@ module @<name> {
   global @<name> : <valtype> [mut] = <expr>
   import "<capability>" "<name>" : <functype>          ; reached only via call_host
   export "<export-name>" = @<fnname>
-  data @<offset-expr> = <hexbytes>                       ; Phase-2
+  data ( <offset-expr> ) = 0x<hexbytes>                  ; Phase-2 (lowercase hex pairs; empty = `0x`)
 
   func @<name> ( <param>,* ) -> ( <valtype>* ) {        ; params are NAMED slots
     local %<name> : <valtype>
@@ -78,7 +88,7 @@ value := %<name>                  ; a binding reference
 ```
 expr :=
     ; sequencing
-    let ( %<name>,* ) = <expr> ; <expr>          ; bind rhs results, then continue
+    let ( %<name>,* ) = <expr> <expr>            ; bind rhs results, then continue (rhs is self-delimiting; no separator — `;` is a comment)
   | values ( <value>,* )                          ; forward values (tail of a block)
 
     ; ops
@@ -110,7 +120,7 @@ expr :=
 
     ; effects
   | trap <trapreason>
-  | charge <int> ; <expr>
+  | charge <int> <expr>                           ; no separator (`;` is a comment)
 
 loopparam := %<name> : <valtype> = <value>          ; name : type = initial value
 arm       := case <int> { <expr> }
@@ -120,7 +130,8 @@ arm       := case <int> { <expr> }
 numop      := i.add.32 | i.sub.32 | … | f.add.64 | …   ; a neutral, width-suffixed spelling
 convop     := i32.wrap_i64 | i64.extend_i32_s | trunc_sat_s.f64.i32 | box.i32 | …
 memaccess  := <bytes> [signed]
-trapreason := int_div_by_zero | int_overflow | unreachable | indirect_type_mismatch | mem_oob
+trapreason := int_div_by_zero | int_overflow | unreachable | indirect_call_type_mismatch | memory_out_of_bounds
+            ; uniform snake_case of the TrapReason constructor (matches unit 09 rt_trap atoms)
 ```
 
 > The textual spellings of `numop`/`convop`/`trapreason` are a 1:1 rendering of the
