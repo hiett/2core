@@ -104,7 +104,17 @@ pub fn instantiate(bytes: BitArray) -> Result(Instance, String) {
     build_beam.compile_and_load(bit_array.from_string(core_text))
     |> result.map_error(fn(e) { "build: " <> string.inspect(e) }),
   )
-  Ok(runner.Instance(module: mod_atom, exports: export_types(irmod)))
+  // Phase-2 run-ABI (E5): `load → instantiate → invoke`. Call the generated `instantiate/0`
+  // (emitted by unit 10) in THIS process so the per-instance cell — fresh memory, table, and
+  // globals + active element/data segments + start — is seeded before any export is invoked
+  // (one-instance-one-process: `catch_apply` runs inline). An instantiation-time trap (OOB
+  // active segment / trapping start) surfaces as `Error`, turning the module's dependent
+  // assertions into skips. NOTE: this is the MINIMAL seam to keep the cell seeded; unit 11
+  // owns the full run-ABI (per-instance process spawning, Safe-profile cap).
+  case ffi.catch_apply(mod_atom, atom.create("instantiate"), []) {
+    Ok(_) -> Ok(runner.Instance(module: mod_atom, exports: export_types(irmod)))
+    Error(trap) -> Error("instantiate: " <> trap)
+  }
 }
 
 /// Append a process-unique suffix to a module name so concurrent fixtures' modules do

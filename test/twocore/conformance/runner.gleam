@@ -360,9 +360,8 @@ fn at(src: String, line: Int) -> String {
 /// Decide whether our runtime trap `reason` text satisfies the spec's expected message
 /// `want`. The spec message is a SUBSTRING like `"integer divide by zero"`; our runtime
 /// raises `{wasm_trap, <kind>}` where `<kind>` is the snake_case `TrapReason` atom. We
-/// map our kind to the canonical spec phrase (per `rt_trap.spec_trap_message`, unit 09)
-/// and then check containment. Phase-1 trap kinds: `int_div_by_zero`, `int_overflow`,
-/// `unreachable`. (`want == ""` accepts any trap.)
+/// map our kind to the canonical spec phrase (per `rt_trap.spec_trap_message`) and then
+/// check containment. (`want == ""` accepts any trap.)
 pub fn trap_matches(reason: String, want: String) -> Bool {
   case want {
     "" -> True
@@ -376,15 +375,28 @@ pub fn trap_matches(reason: String, want: String) -> Bool {
   }
 }
 
+/// Map our raised `{wasm_trap, <kind>}` text to the WASM-spec trap-message phrase, keyed by
+/// the snake_case `TrapReason` atom present in `reason`. Mirrors `rt_trap.spec_trap_message`
+/// (the single source of truth) so Phase-2 memory / table / conversion traps are judged
+/// against their spec messages — not the underscore atom. The most-specific atoms are tested
+/// FIRST so e.g. `undefined_element` is not shadowed by a substring match.
 fn spec_phrase_of(reason: String) -> Result(String, Nil) {
-  case
-    string.contains(reason, "int_div_by_zero"),
-    string.contains(reason, "int_overflow"),
-    string.contains(reason, "unreachable")
-  {
-    True, _, _ -> Ok("integer divide by zero")
-    _, True, _ -> Ok("integer overflow")
-    _, _, True -> Ok("unreachable")
-    _, _, _ -> Error(Nil)
-  }
+  let kinds = [
+    #("int_div_by_zero", "integer divide by zero"),
+    #("invalid_conversion_to_integer", "invalid conversion to integer"),
+    #("int_overflow", "integer overflow"),
+    #("memory_out_of_bounds", "out of bounds memory access"),
+    #("table_out_of_bounds", "out of bounds table access"),
+    #("indirect_call_type_mismatch", "indirect call type mismatch"),
+    #("uninitialized_element", "uninitialized element"),
+    #("undefined_element", "undefined element"),
+    #("unreachable", "unreachable"),
+  ]
+  list.find_map(kinds, fn(kv) {
+    let #(atom_text, phrase) = kv
+    case string.contains(reason, atom_text) {
+      True -> Ok(phrase)
+      False -> Error(Nil)
+    }
+  })
 }

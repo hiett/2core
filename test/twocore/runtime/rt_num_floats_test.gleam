@@ -262,8 +262,10 @@ pub fn f64_compare_test() {
 }
 
 // ───────────────────── trapping float→int truncation ─────────────────────
-// Two DISTINCT traps: InvalidConversionToInteger on NaN/±Inf; IntOverflow on out-of-range
-// finite. Ranges are exact via the bignum truncation, so the boundary is precise.
+// Two DISTINCT traps (per `exec/numerics` + the spec test suite): ONLY NaN traps
+// InvalidConversionToInteger; ±Inf traps IntOverflow (like any out-of-range value), since
+// `trunc(±inf)` is simply outside every integer range. Ranges are exact via the bignum
+// truncation, so the boundary is precise.
 
 pub fn i32_trunc_f32_s_boundaries_test() {
   // 2^31 is exactly representable in f32 and is out of [-2^31, 2^31-1] → overflow.
@@ -277,13 +279,13 @@ pub fn i32_trunc_f32_s_boundaries_test() {
   |> should.equal(Ok(0x80000000))
   // -1.0 truncates to -1 = the unsigned bit pattern 0xFFFFFFFF.
   n.i32_trunc_f32_s(f32_bits(-1.0)) |> should.equal(Ok(0xFFFFFFFF))
-  // NaN / ±Inf → invalid conversion (NOT overflow).
+  // NaN → invalid conversion; ±Inf → integer overflow (the spec's distinct messages).
   n.i32_trunc_f32_s(f32_payload_nan)
   |> should.equal(Error(InvalidConversionToInteger))
   n.i32_trunc_f32_s(f32_pos_inf)
-  |> should.equal(Error(InvalidConversionToInteger))
+  |> should.equal(Error(IntOverflow))
   n.i32_trunc_f32_s(f32_neg_inf)
-  |> should.equal(Error(InvalidConversionToInteger))
+  |> should.equal(Error(IntOverflow))
 }
 
 pub fn i32_trunc_truncates_toward_zero_test() {
@@ -312,8 +314,8 @@ pub fn i64_trunc_test() {
   n.i64_trunc_f64_s(f64_bits(-2.9)) |> should.equal(Ok(norm64(-2)))
   // 1.0e19 > 2^63-1 (≈9.22e18) → overflow.
   n.i64_trunc_f64_s(f64_bits(1.0e19)) |> should.equal(Error(IntOverflow))
-  n.i64_trunc_f64_u(f64_neg_inf)
-  |> should.equal(Error(InvalidConversionToInteger))
+  // -Inf → integer overflow (not invalid conversion — that is NaN-only).
+  n.i64_trunc_f64_u(f64_neg_inf) |> should.equal(Error(IntOverflow))
 }
 
 // 2^32 / 2^64 two's-complement re-encoding helpers (test-side).

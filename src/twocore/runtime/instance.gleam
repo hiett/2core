@@ -92,6 +92,11 @@ pub type Mode {
 /// - `state_module`: implements the per-instance cell holder + mutable globals
 ///   (`rt_state`). `GlobalGet`/`GlobalSet` route here; the cell ABI is
 ///   `«CELL-STATE-ABI-FROZEN»` (the tier-O process-dictionary convention).
+/// - `safe_max_pages`: the build-time Safe max-pages cap (E3) `emit_core` bakes into the
+///   `instantiate/0` entry's `rt_mem:fresh(min, max, safe_cap)` call, so `memory.grow`
+///   cannot allocate past it even when the module declares `max_pages: None`. A FINITE
+///   default (`65536`, the i32 hard cap) makes the declared max govern for conformance;
+///   unit 11 tunes it for the Safe profile's resource bound.
 ///
 /// Phase-2 adds the memory/table/instance-state module fields below; because binding lives
 /// in this one record, that is a clean extension, not a retrofit. The cell↔threaded
@@ -108,6 +113,7 @@ pub type Binding {
     mem_module: String,
     table_module: String,
     state_module: String,
+    safe_max_pages: Int,
   )
 }
 
@@ -131,5 +137,9 @@ pub fn safe_default() -> Binding {
     mem_module: "twocore@runtime@rt_mem",
     table_module: "twocore@runtime@rt_table",
     state_module: "twocore@runtime@rt_state",
+    // The finite Safe max-pages cap baked into `rt_mem:fresh` (E3). `65536` = the i32 hard
+    // cap (2^16 pages = 4 GiB), so the module's DECLARED max governs for conformance; unit
+    // 11 lowers it to a real Safe resource bound.
+    safe_max_pages: 65_536,
   )
 }

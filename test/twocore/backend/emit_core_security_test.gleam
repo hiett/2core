@@ -28,7 +28,8 @@ import twocore/backend/emit_core
 import twocore/ir
 import twocore/runtime/instance
 
-/// The set of fixed runtime module names the `Binding` permits a `call` to target.
+/// The set of fixed runtime module names the `Binding` permits a `call` to target. Extended
+/// in Phase 2 with the memory/table/state modules — the new stateful-op authority (D3a).
 fn runtime_modules(b: instance.Binding) -> Set(String) {
   set.from_list([
     b.num_module,
@@ -36,6 +37,9 @@ fn runtime_modules(b: instance.Binding) -> Set(String) {
     b.host_module,
     b.meter_module,
     b.stdlib_module,
+    b.mem_module,
+    b.table_module,
+    b.state_module,
   ])
 }
 
@@ -156,31 +160,127 @@ pub fn no_ambient_authority_in_calls_test() {
   assert_calls_are_runtime(m, binding)
 }
 
-/// `CallIndirect` (the table-dispatch node) is NOT lowered to any `apply`/`call` — it
-/// returns a typed `Error`, so it cannot become an ambient-authority dispatch.
-pub fn call_indirect_does_not_lower_test() {
+/// Collect every `CApply` target `FName` in `e` (recursively). A `CApply`'s module/function
+/// is structurally an `FName` (a literal atom + arity) — there is NO `apply(Mod, F, Args)`
+/// form in the AST — so the IR cannot synthesise an ambient-authority dynamic apply.
+fn applies_in(e: CExpr) -> List(core_erlang.FName) {
+  let here = case e {
+    CApply(name, _) -> [name]
+    _ -> []
+  }
+  list.append(here, list.flat_map(children(e), applies_in))
+}
+
+/// A module exercising `call_indirect` AND every memory/global/table op + size/grow, plus a
+/// table/memory/global declaration with active element/data segments and a start — so the
+/// security walk covers the whole new stateful authority and the generated `instantiate/0`.
+fn stateful_module() -> ir.Module {
+  let target =
+    ir.Function(
+      name: "target",
+      params: [ir.Local("p0", ir.TI32)],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.Return([ir.Var("p0")]),
+    )
   let f =
     ir.Function(
       name: "f",
-      params: [ir.Local("i", ir.TI32)],
+      params: [ir.Local("p0", ir.TI32)],
       result: [ir.TI32],
       locals: [],
-      body: ir.CallIndirect("t", ir.Var("i"), ir.FuncType([], [ir.TI32]), []),
+      body: ir.Let(
+        [],
+        ir.MemStore(ir.MemAccess(4, False), ir.Var("p0"), ir.Var("p0"), 0),
+        ir.Let(
+          ["g"],
+          ir.GlobalGet("g0"),
+          ir.Let(
+            [],
+            ir.GlobalSet("g0", ir.Var("g")),
+            ir.Let(
+              ["ld"],
+              ir.MemLoad(ir.MemAccess(4, False), ir.Var("p0"), 0, ir.TI32),
+              ir.Let(
+                ["sz"],
+                ir.MemSize,
+                ir.Let(
+                  ["gr"],
+                  ir.MemGrow(ir.Var("sz")),
+                  ir.CallIndirect(
+                    "t0",
+                    ir.Var("ld"),
+                    ir.FuncType([ir.TI32], [ir.TI32]),
+                    [ir.Var("gr")],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
     )
-  let module =
-    ir.Module(
-      name: "twocore@test@ci",
-      uses_numerics: True,
-      memory: option.None,
-      globals: [],
-      imports: [],
-      functions: [f],
-      exports: [ir.ExportFn("f", "f")],
-      data_segments: [],
-      tables: [],
-      elements: [],
-      start: option.None,
-    )
-  assert emit_core.emit_module(module, instance.safe_default())
-    == Error(emit_core.UnsupportedNode("call_indirect"))
+  ir.Module(
+    name: "twocore@test@stateful",
+    uses_numerics: True,
+    memory: option.Some(ir.MemoryDecl(1, option.None)),
+    globals: [ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(0)]))],
+    imports: [],
+    functions: [target, f],
+    exports: [ir.ExportFn("f", "f")],
+    data_segments: [ir.DataSegment(ir.Values([ir.ConstI32(0)]), <<9, 9>>)],
+    tables: [ir.TableDecl("t0", 4, option.None)],
+    elements: [
+      ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["target"]),
+    ],
+    start: option.None,
+  )
+}
+
+/// EXTENDED security invariant: a module using `call_indirect` + every memory/global/table
+/// op (and the generated `instantiate/0`) still has NO ambient authority — every emitted
+/// `call` targets a fixed `Binding` runtime module with a literal function atom (a).
+pub fn stateful_ops_have_no_ambient_authority_test() {
+  let binding = instance.safe_default()
+  let assert Ok(m) = emit_core.emit_module(stateful_module(), binding)
+  assert_calls_are_runtime(m, binding)
+}
+
+/// (b) No data-driven `apply`: every `CApply` in the whole module (including the
+/// `call_indirect` lowering and the `instantiate/0` element closures) targets a literal
+/// `FName` whose module-LOCAL function name is NEVER one of the runtime module atoms — the
+/// dispatch is a closed set of compile-time-fixed `f<idx>` applies selected by a runtime
+/// integer, never `apply(Mod, F, Args)` of program/runtime data.
+pub fn call_indirect_dispatch_is_ambient_safe_test() {
+  let binding = instance.safe_default()
+  let allowed = runtime_modules(binding)
+  let assert Ok(m) = emit_core.emit_module(stateful_module(), binding)
+  let applies =
+    list.flat_map(m.defs, fn(d) {
+      let core_erlang.FunDef(_, v) = d
+      applies_in(v)
+    })
+  // Every apply is a static local FName — its name is never a runtime module atom (an
+  // apply can only reach a same-module function, never a cross-module/data-driven target).
+  list.each(applies, fn(name) {
+    let core_erlang.FName(n, _arity) = name
+    assert set.contains(allowed, n) == False
+  })
+  // (c) The three call_indirect faults are DELEGATED to `rt_table` via the seam call: the
+  // dispatch is one `call '<table_module>':'call_indirect'(Idx, TypeTag, Args)` whose
+  // `{error,E}` arm raises via `rt_trap` — emit_core emits no per-fault branching itself.
+  assert has_call(m, binding.table_module, "call_indirect")
+  assert has_call(m, binding.table_module, "init_elem")
+  assert has_call(m, binding.trap_module, "raise")
+}
+
+/// True iff some def in `m` contains a `call '<module>':'<fun>'(…)`.
+fn has_call(m: CModule, module: String, fun: String) -> Bool {
+  list.any(m.defs, fn(d) {
+    let core_erlang.FunDef(_, v) = d
+    list.any(calls_in(v), fn(pair) {
+      let #(mod, f) = pair
+      mod == CAtom(module) && f == CAtom(fun)
+    })
+  })
 }

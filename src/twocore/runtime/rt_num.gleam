@@ -1309,8 +1309,10 @@ fn f_ge(fmt: FloatFmt, a: Int, b: Int) -> Int {
   }
 }
 
-/// Trapping SIGNED float→int truncation to width `n`. `Error(InvalidConversionToInteger)`
-/// on NaN/`±Inf`; `Ok(0)` on `±0`; otherwise the EXACT toward-zero truncation `j`
+/// Trapping SIGNED float→int truncation to width `n`. Per `exec/numerics`, ONLY NaN traps
+/// `InvalidConversionToInteger`; `±Inf` (like any out-of-range value) traps `IntOverflow`
+/// (the spec test suite: `trunc(inf)` → "integer overflow", `trunc(nan)` → "invalid
+/// conversion to integer"). `Ok(0)` on `±0`; otherwise the EXACT toward-zero truncation `j`
 /// (bignum, via `trunc_integer`) is range-checked against `[-2^(n-1), 2^(n-1)-1]`:
 /// in range → `Ok(norm(j, n))` (the unsigned bit pattern, so `-1.0 → 0xFFFF…`), else
 /// `Error(IntOverflow)`. The exact `j` makes the boundary precise — `2^31` overflows but
@@ -1320,7 +1322,7 @@ fn trunc_trap_s(fmt: FloatFmt, bits: Int, n: Int) -> Result(Int, TrapReason) {
   let hi = pow2(n - 1) - 1
   case classify(fmt, bits) {
     CNan -> Error(InvalidConversionToInteger)
-    CInf(_) -> Error(InvalidConversionToInteger)
+    CInf(_) -> Error(IntOverflow)
     CZero(_) -> Ok(0)
     CFinite(_) -> {
       let j = trunc_integer(fmt, bits)
@@ -1332,15 +1334,16 @@ fn trunc_trap_s(fmt: FloatFmt, bits: Int, n: Int) -> Result(Int, TrapReason) {
   }
 }
 
-/// Trapping UNSIGNED float→int truncation to width `n`. `Error(InvalidConversionToInteger)`
-/// on NaN/`±Inf`; `Ok(0)` on `±0`; otherwise the EXACT toward-zero truncation `j` is
+/// Trapping UNSIGNED float→int truncation to width `n`. Per `exec/numerics`, ONLY NaN traps
+/// `InvalidConversionToInteger`; `±Inf` traps `IntOverflow` (spec test suite, as for the
+/// signed variant). `Ok(0)` on `±0`; otherwise the EXACT toward-zero truncation `j` is
 /// range-checked against `[0, 2^n-1]`: in range → `Ok(j)`, else `Error(IntOverflow)`
 /// (so any negative truncation, e.g. `-1.0`, overflows).
 fn trunc_trap_u(fmt: FloatFmt, bits: Int, n: Int) -> Result(Int, TrapReason) {
   let hi = pow2(n) - 1
   case classify(fmt, bits) {
     CNan -> Error(InvalidConversionToInteger)
-    CInf(_) -> Error(InvalidConversionToInteger)
+    CInf(_) -> Error(IntOverflow)
     CZero(_) -> Ok(0)
     CFinite(_) -> {
       let j = trunc_integer(fmt, bits)
@@ -1353,14 +1356,59 @@ fn trunc_trap_u(fmt: FloatFmt, bits: Int, n: Int) -> Result(Int, TrapReason) {
 }
 
 /// Convert the signed integer `v` to `target`'s bit pattern, rounding to nearest ties-to-
-/// even (`erlang:float/1`, verified ties-to-even on OTP 29, then f32-rounded for the f32
-/// target). Never traps, never overflows to Inf (`max|i64| = 2^63 < f32_max = 2^128`). The
-/// f32 path goes i*→f64→f32; f64's 53 significand bits satisfy the `≥ 2p+2` double-rounding
-/// bound for `p = 24`, so the result equals the correctly single-rounded f32.
+/// even. Never traps, never overflows to Inf (`max|i64| = 2^63 < f32_max = 2^128`).
+///
+/// The f64 path is a single correctly-rounded `erlang:float/1` (ties-to-even on OTP 29). The
+/// f32 path goes via f64, but a naive `i64 → f64 → f32` DOUBLE-ROUNDS for `|v| >= 2^53`
+/// (the i64→f64 step can land exactly on an f32 tie, losing the "strictly above" bit), so
+/// `int_to_f32_bits` pre-rounds the integer to 53 bits with a round-to-ODD sticky first —
+/// then the f64 is exact and the f64→f32 step rounds correctly (the standard
+/// double-rounding-avoidance trick). For `|v| < 2^53` the f64 is already exact (no
+/// pre-rounding), so i32→f32 and small i64→f32 are unaffected.
 fn int_to_float(target: FloatFmt, v: Int) -> Int {
   case target.total {
-    32 -> f32_round_to_bits(int.to_float(v))
+    32 -> int_to_f32_bits(v)
     _ -> f64_to_bits(int.to_float(v))
+  }
+}
+
+/// Convert the signed integer `v` to f32 bits with CORRECT single rounding, avoiding the
+/// `i64 → f64 → f32` double-rounding by pre-rounding `|v|` to 53 significant bits with a
+/// round-to-ODD sticky when `|v|` exceeds f64's 53-bit exact range. With an odd 53-bit
+/// intermediate, the subsequent f64→f32 round-to-nearest is provably the correctly-rounded
+/// f32 (the discarded low bits can never re-create a spurious tie).
+fn int_to_f32_bits(v: Int) -> Int {
+  case v == 0 {
+    True -> 0
+    False -> {
+      let neg = v < 0
+      let m = case neg {
+        True -> 0 - v
+        False -> v
+      }
+      let bl = bit_length(m)
+      let exact = case bl <= 53 {
+        // f64 holds `m` exactly → the single f64→f32 rounding is already correct.
+        True -> int.to_float(m)
+        False -> {
+          // Keep the top 53 bits; force the LSB odd if any low bit was dropped (sticky),
+          // so the f64 is exact AND the f32 rounding cannot double-round.
+          let shift = bl - 53
+          let high = int.bitwise_shift_right(m, shift)
+          let dropped = m - int.bitwise_shift_left(high, shift)
+          let high_odd = case dropped != 0 && int.bitwise_and(high, 1) == 0 {
+            True -> int.bitwise_or(high, 1)
+            False -> high
+          }
+          int.to_float(high_odd) *. int.to_float(pow2(shift))
+        }
+      }
+      let signed = case neg {
+        True -> 0.0 -. exact
+        False -> exact
+      }
+      f32_round_to_bits(signed)
+    }
   }
 }
 

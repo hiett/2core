@@ -371,3 +371,386 @@ pub fn zero_result_fn_e2e_test() {
   assert string.contains(trap, "wasm_trap")
   assert string.contains(trap, "int_div_by_zero")
 }
+
+// ════════════════════ Phase-2: stateful WASM end-to-end (load → instantiate → invoke) ════════════════════
+//
+// These are the headline Phase-2 proof: a hand-built IR2 `Module` with the generated
+// `instantiate/0` compiles, instantiates (seeding the per-instance cell), and runs spec-
+// correctly on the BEAM — memory round-trip, grow, mutable global, `call_indirect` + the 3
+// faults, a trapping `trunc`, and float ops. The instance's cell is process-local; `gleeunit`
+// runs each test synchronously in one process, so `instantiate` then `invoke` share it.
+
+/// Build a full Phase-2 module (memory/globals/tables/elements/data/start), exporting each
+/// function by its own name. `name` is namespaced; unique per test so loads don't clobber.
+fn full(
+  name: String,
+  memory: option.Option(ir.MemoryDecl),
+  globals: List(ir.GlobalDecl),
+  functions: List(ir.Function),
+  tables: List(ir.TableDecl),
+  elements: List(ir.ElementSegment),
+  data: List(ir.DataSegment),
+  start: option.Option(String),
+) -> ir.Module {
+  ir.Module(
+    name: "twocore@e2e@" <> name,
+    uses_numerics: True,
+    memory: memory,
+    globals: globals,
+    imports: [],
+    functions: functions,
+    exports: list.map(functions, fn(f) { ir.ExportFn(f.name, f.name) }),
+    data_segments: data,
+    tables: tables,
+    elements: elements,
+    start: start,
+  )
+}
+
+/// Run the generated `instantiate/0` (seeds the cell), asserting it succeeds.
+fn instantiate(mod: Atom) -> Nil {
+  let assert Ok(_) = catch_apply(mod, atom.create("instantiate"), [])
+  Nil
+}
+
+fn store_fn(name: String, bytes: Int) -> ir.Function {
+  ir.Function(
+    name: name,
+    params: [ir.Local("addr", ir.TI32), ir.Local("val", ir.TI32)],
+    result: [],
+    locals: [],
+    body: ir.Let(
+      [],
+      ir.MemStore(ir.MemAccess(bytes, False), ir.Var("addr"), ir.Var("val"), 0),
+      ir.Values([]),
+    ),
+  )
+}
+
+fn load_fn(
+  name: String,
+  bytes: Int,
+  signed: Bool,
+  result: ir.ValType,
+) -> ir.Function {
+  ir.Function(
+    name: name,
+    params: [ir.Local("addr", ir.TI32)],
+    result: [result],
+    locals: [],
+    body: ir.MemLoad(ir.MemAccess(bytes, signed), ir.Var("addr"), 0, result),
+  )
+}
+
+/// MEMORY round-trip: `i32.store` then `i32.load` returns the stored bits; and the width
+/// matrix sign-/zero-extends per `exec/memory` — a stored `0xFFFFFF80` reads back as itself
+/// at i32.load, `load8_s` sign-extends the low byte `0x80` → `0xFFFFFF80`, and `load16_u`
+/// zero-extends the low two bytes → `0xFF80`.
+pub fn memory_store_load_roundtrip_e2e_test() {
+  let mod =
+    load(full(
+      "mem",
+      option.Some(ir.MemoryDecl(1, option.None)),
+      [],
+      [
+        store_fn("store32", 4),
+        load_fn("load32", 4, False, ir.TI32),
+        load_fn("load8s", 1, True, ir.TI32),
+        load_fn("load16u", 2, False, ir.TI32),
+      ],
+      [],
+      [],
+      [],
+      option.None,
+    ))
+  instantiate(mod)
+  // round-trip a full i32 word at address 0.
+  let assert Ok(_) = catch_apply(mod, atom.create("store32"), [0, 305_419_896])
+  assert catch_apply(mod, atom.create("load32"), [0]) == Ok(305_419_896)
+  // little-endian + sign-/zero-extension on the width matrix.
+  let assert Ok(_) =
+    catch_apply(mod, atom.create("store32"), [0, 4_294_967_168])
+  assert catch_apply(mod, atom.create("load8s"), [0]) == Ok(4_294_967_168)
+  assert catch_apply(mod, atom.create("load16u"), [0]) == Ok(65_408)
+}
+
+/// MEMORY out-of-bounds load TRAPS (zero corruption): a load one byte past the single page
+/// traps "out of bounds memory access" (`exec/memory` — strictly-greater bound).
+pub fn memory_oob_load_traps_e2e_test() {
+  let mod =
+    load(full(
+      "memoob",
+      option.Some(ir.MemoryDecl(1, option.None)),
+      [],
+      [load_fn("load32", 4, False, ir.TI32)],
+      [],
+      [],
+      [],
+      option.None,
+    ))
+  instantiate(mod)
+  // last in-bounds 4-byte word starts at 65532; 65533 ends at 65537 > 65536 → trap.
+  assert catch_apply(mod, atom.create("load32"), [65_533]) |> is_trap
+}
+
+/// `memory.grow` grows + returns the OLD size, a load of the freshly-grown (zero-filled)
+/// region returns `0`, and a grow past the declared max returns `-1` without allocating
+/// (`memory.grow` semantics).
+pub fn memory_grow_e2e_test() {
+  let mod =
+    load(full(
+      "memgrow",
+      option.Some(ir.MemoryDecl(1, option.Some(3))),
+      [],
+      [
+        ir.Function(
+          "grow",
+          [ir.Local("d", ir.TI32)],
+          [ir.TI32],
+          [],
+          ir.MemGrow(ir.Var("d")),
+        ),
+        ir.Function("size", [], [ir.TI32], [], ir.MemSize),
+        load_fn("load32", 4, False, ir.TI32),
+      ],
+      [],
+      [],
+      [],
+      option.None,
+    ))
+  instantiate(mod)
+  assert catch_apply(mod, atom.create("size"), []) == Ok(1)
+  // grow(1) returns the OLD page count (1); the new region is in bounds and zero-filled.
+  assert catch_apply(mod, atom.create("grow"), [1]) == Ok(1)
+  assert catch_apply(mod, atom.create("size"), []) == Ok(2)
+  assert catch_apply(mod, atom.create("load32"), [65_536]) == Ok(0)
+  // grow past the declared max (2 + 5 > 3) returns -1 and does not allocate.
+  assert catch_apply(mod, atom.create("grow"), [5]) == Ok(-1)
+  assert catch_apply(mod, atom.create("size"), []) == Ok(2)
+}
+
+/// A mutable GLOBAL round-trips `global.set`/`global.get`, starting from its constant init.
+pub fn mutable_global_e2e_test() {
+  let mod =
+    load(full(
+      "global",
+      option.None,
+      [ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(7)]))],
+      [
+        ir.Function("get", [], [ir.TI32], [], ir.GlobalGet("g0")),
+        ir.Function(
+          "set",
+          [ir.Local("v", ir.TI32)],
+          [],
+          [],
+          ir.Let([], ir.GlobalSet("g0", ir.Var("v")), ir.Values([])),
+        ),
+      ],
+      [],
+      [],
+      [],
+      option.None,
+    ))
+  instantiate(mod)
+  assert catch_apply(mod, atom.create("get"), []) == Ok(7)
+  let assert Ok(_) = catch_apply(mod, atom.create("set"), [99])
+  assert catch_apply(mod, atom.create("get"), []) == Ok(99)
+}
+
+/// `call_indirect` to the RIGHT type runs, and each of the three faults traps with the spec
+/// reason (`UndefinedElement` for OOB index, `UninitializedElement` for a null slot,
+/// `IndirectCallTypeMismatch` for a wrong type) — never via a data-driven `apply`.
+pub fn call_indirect_e2e_test() {
+  let inc =
+    ir.Function(
+      "inc",
+      [ir.Local("x", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Let(
+        ["r"],
+        ir.Num(ir.IAdd(ir.W32), [ir.Var("x"), ir.ConstI32(1)]),
+        ir.Return([ir.Var("r")]),
+      ),
+    )
+  let callfn =
+    ir.Function(
+      "callfn",
+      [ir.Local("idx", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.CallIndirect("t0", ir.Var("idx"), ir.FuncType([ir.TI32], [ir.TI32]), [
+        ir.ConstI32(41),
+      ]),
+    )
+  let callwrong =
+    ir.Function(
+      "callwrong",
+      [ir.Local("idx", ir.TI32)],
+      [ir.TI64],
+      [],
+      ir.CallIndirect("t0", ir.Var("idx"), ir.FuncType([ir.TI64], [ir.TI64]), [
+        ir.ConstI64(0),
+      ]),
+    )
+  let mod =
+    load(full(
+      "ci",
+      option.None,
+      [],
+      [inc, callfn, callwrong],
+      [ir.TableDecl("t0", 4, option.None)],
+      [ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["inc"])],
+      [],
+      option.None,
+    ))
+  instantiate(mod)
+  // slot 0 holds `inc` with type [i32]->[i32]: dispatch runs.
+  assert catch_apply(mod, atom.create("callfn"), [0]) == Ok(42)
+  // index past the table bound (size 4).
+  let assert Error(undef) = catch_apply(mod, atom.create("callfn"), [10])
+  assert string.contains(undef, "undefined_element")
+  // in-bounds but null (uninitialised) slot.
+  let assert Error(uninit) = catch_apply(mod, atom.create("callfn"), [2])
+  assert string.contains(uninit, "uninitialized_element")
+  // right slot, wrong expected type ([i64]->[i64] vs the stored [i32]->[i32]).
+  let assert Error(mismatch) = catch_apply(mod, atom.create("callwrong"), [0])
+  assert string.contains(mismatch, "indirect_call_type_mismatch")
+}
+
+/// A trapping `i32.trunc_f32_s`: in-range truncates toward zero; NaN traps "invalid
+/// conversion to integer"; ±Inf and out-of-range trap "integer overflow" (`exec/numerics`).
+pub fn trapping_trunc_e2e_test() {
+  let mod =
+    load(full(
+      "trunc",
+      option.None,
+      [],
+      [
+        ir.Function(
+          "trunc",
+          [ir.Local("x", ir.TF32)],
+          [ir.TI32],
+          [],
+          ir.Convert(ir.TruncS(ir.FW32, ir.W32), ir.Var("x")),
+        ),
+      ],
+      [],
+      [],
+      [],
+      option.None,
+    ))
+  instantiate(mod)
+  // 3.7 → 3 (toward zero).
+  assert catch_apply(mod, atom.create("trunc"), [1_080_452_301]) == Ok(3)
+  // NaN → invalid conversion to integer.
+  let assert Error(nan) =
+    catch_apply(mod, atom.create("trunc"), [2_143_289_344])
+  assert string.contains(nan, "invalid_conversion_to_integer")
+  // 2^31 (just out of i32 range) → integer overflow.
+  let assert Error(ov) = catch_apply(mod, atom.create("trunc"), [1_325_400_064])
+  assert string.contains(ov, "int_overflow")
+  // +Inf → integer overflow (NOT invalid conversion).
+  let assert Error(inf) =
+    catch_apply(mod, atom.create("trunc"), [2_139_095_040])
+  assert string.contains(inf, "int_overflow")
+}
+
+/// Float ops through codegen: an ordered comparison (`f32.lt`) yields an i32 0/1, and
+/// `f32.sqrt(4.0)` returns the bit pattern of `2.0`.
+pub fn float_compare_and_sqrt_e2e_test() {
+  let mod =
+    load(full(
+      "flt",
+      option.None,
+      [],
+      [
+        ir.Function(
+          "lt",
+          [ir.Local("a", ir.TF32), ir.Local("b", ir.TF32)],
+          [ir.TI32],
+          [],
+          ir.Num(ir.FLt(ir.FW32), [ir.Var("a"), ir.Var("b")]),
+        ),
+        ir.Function(
+          "sqrtf",
+          [ir.Local("x", ir.TF32)],
+          [ir.TF32],
+          [],
+          ir.Num(ir.FSqrt(ir.FW32), [ir.Var("x")]),
+        ),
+      ],
+      [],
+      [],
+      [],
+      option.None,
+    ))
+  instantiate(mod)
+  // 1.0 < 2.0 → 1; 2.0 < 1.0 → 0 (f32 bit patterns).
+  assert catch_apply(mod, atom.create("lt"), [1_065_353_216, 1_073_741_824])
+    == Ok(1)
+  assert catch_apply(mod, atom.create("lt"), [1_073_741_824, 1_065_353_216])
+    == Ok(0)
+  // sqrt(4.0) == 2.0  (0x40800000 → 0x40000000).
+  assert catch_apply(mod, atom.create("sqrtf"), [1_082_130_432])
+    == Ok(1_073_741_824)
+}
+
+/// An out-of-bounds active DATA segment traps AT INSTANTIATION (`instantiate/0` raises
+/// "out of bounds memory access" — the cell is never left half-initialised).
+pub fn oob_data_segment_traps_at_instantiation_e2e_test() {
+  let mod =
+    load(full(
+      "dataoob",
+      option.Some(ir.MemoryDecl(1, option.None)),
+      [],
+      [],
+      [],
+      [],
+      [ir.DataSegment(ir.Values([ir.ConstI32(65_535)]), <<1, 2, 3>>)],
+      option.None,
+    ))
+  let assert Error(reason) = catch_apply(mod, atom.create("instantiate"), [])
+  assert string.contains(reason, "memory_out_of_bounds")
+}
+
+/// An out-of-bounds active ELEMENT segment traps AT INSTANTIATION (`instantiate/0` raises
+/// "out of bounds table access").
+pub fn oob_element_segment_traps_at_instantiation_e2e_test() {
+  let target =
+    ir.Function(
+      "target",
+      [ir.Local("p0", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Return([
+        ir.Var("p0"),
+      ]),
+    )
+  let mod =
+    load(full(
+      "elemoob",
+      option.None,
+      [],
+      [target],
+      [ir.TableDecl("t0", 2, option.None)],
+      [
+        ir.ElementSegment("t0", ir.Values([ir.ConstI32(1)]), [
+          "target",
+          "target",
+        ]),
+      ],
+      [],
+      option.None,
+    ))
+  let assert Error(reason) = catch_apply(mod, atom.create("instantiate"), [])
+  assert string.contains(reason, "table_out_of_bounds")
+}
+
+/// True iff an invoke result is a trap (any `{wasm_trap, _}` error).
+fn is_trap(r: Result(Int, String)) -> Bool {
+  case r {
+    Error(t) -> string.contains(t, "wasm_trap")
+    Ok(_) -> False
+  }
+}

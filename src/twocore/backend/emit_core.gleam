@@ -45,14 +45,20 @@
 //// results and metering binders) and fresh `letrec` function atoms (join points and loop
 //// heads), each guaranteed not to collide with any name already present in the function.
 ////
-//// ## Scope (Phase 1)
+//// ## Scope (Phase 2)
 ////
-//// In: `Values`/`Return`/`Num`/`Convert`/`Let`/`If`/`Switch`/`Block`/`Break`/`Loop`/
-//// `Continue`/`CallDirect`/`CallHost`/`Trap`/`Charge`. Out (returns a typed `EmitError`,
-//// never a panic): `CallIndirect`, `MemLoad`/`MemStore`, `GlobalGet`/`GlobalSet`,
-//// `TermOp`, and the term↔numeric boxing `Convert`s — none are exercised by the Phase-1
-//// corpus.
+//// In: the Phase-1 surface (`Values`/`Return`/`Num`/`Convert`/`Let`/`If`/`Switch`/`Block`/
+//// `Break`/`Loop`/`Continue`/`CallDirect`/`CallHost`/`Trap`/`Charge`) PLUS the stateful ops
+//// — `MemLoad`/`MemStore`/`MemSize`/`MemGrow`/`GlobalGet`/`GlobalSet`/`CallIndirect` — and
+//// the new float `NumOp`s (`FAbs`…`FGe`/`FCopysign`) and `ConvOp`s (trapping `TruncS`/`TruncU`,
+//// total `ConvertS`/`ConvertU`/`F32DemoteF64`/`F64PromoteF32`). All stateful ops route through
+//// the ONE state-access seam (`seam_call`) — a direct `call '<binding.X_module>':'op'(...)`
+//// for the tier-O cell strategy, no ambient authority (E1/D3a). The backend also emits the
+//// generated `instantiate/0` entry (E5) that seeds the per-instance cell and runs the active
+//// element/data segments + start. Out (returns a typed `EmitError`, never a panic): `TermOp`
+//// and the four term↔numeric boxing `Convert`s (still Phase-3 deferrals).
 
+import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
@@ -61,51 +67,63 @@ import gleam/result
 import gleam/set.{type Set}
 import gleam/string
 import twocore/backend/core_erlang.{
-  type CClause, type CExpr, type CModule, type FName, type FunDef, CApply, CAtom,
-  CCall, CCase, CClause, CCons, CFun, CInt, CLet, CLetrec, CNil, CTuple, CValues,
-  CVar, FName, FunDef, PAtom, PInt, PTuple, PVar,
+  type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
+  type FunDef, CApply, CAtom, CBinary, CBitSeg, CCall, CCase, CClause, CCons,
+  CFun, CInt, CLet, CLetrec, CNil, CTuple, CValues, CVar, FName, FunDef, PAtom,
+  PCons, PInt, PNil, PTuple, PVar,
 }
 import twocore/ir.{
-  type ConvOp, type Expr, type Function, type IntWidth, type Module, type NumOp,
-  type SwitchArm, type TrapReason, type Value, Block, BoxFloat, BoxInt, Break,
-  CallDirect, CallHost, CallIndirect, Charge, ConstF32, ConstF64, ConstI32,
-  ConstI64, Continue, Convert, ConvertS, ConvertU, F32DemoteF64, F64PromoteF32,
-  FAbs, FAdd, FCeil, FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe, FLt, FMax,
-  FMin, FMul, FNe, FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64, GlobalGet,
-  GlobalSet, I32Extend16S, I32Extend8S, I32WrapI64, I64Extend16S, I64Extend32S,
-  I64Extend8S, I64ExtendI32S, I64ExtendI32U, IAdd, IAnd, IClz, ICtz, IDivS,
-  IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe,
-  IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If,
-  IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
-  InvalidConversionToInteger, Let, Loop, MemGrow, MemLoad, MemSize, MemStore,
-  MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF, Return, Switch,
-  SwitchArm, TableOutOfBounds, TermOp, Trap, TruncS, TruncSatS, TruncSatU,
-  TruncU, UnboxFloat, UnboxInt, UndefinedElement, UninitializedElement,
-  Unreachable, Values, Var, W32, W64,
+  type ConvOp, type Expr, type FuncType, type Function, type IntWidth,
+  type Module, type NumOp, type SwitchArm, type TrapReason, type ValType,
+  type Value, Block, BoxFloat, BoxInt, Break, CallDirect, CallHost, CallIndirect,
+  Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue, Convert, ConvertS,
+  ConvertU, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil, FCopysign, FDiv, FEq,
+  FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe, FNearest, FNeg, FSqrt, FSub,
+  FTrunc, FW32, FW64, FuncType, GlobalGet, GlobalSet, I32Extend16S, I32Extend8S,
+  I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S, I64ExtendI32S,
+  I64ExtendI32U, IAdd, IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU,
+  IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS, IRemU,
+  IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If, IndirectCallTypeMismatch,
+  IntDivByZero, IntOverflow, InvalidConversionToInteger, Let, Loop, MemGrow,
+  MemLoad, MemSize, MemStore, MemoryOutOfBounds, Num, ReinterpretFToI,
+  ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm,
+  TableOutOfBounds, TermOp, Trap, TruncS, TruncSatS, TruncSatU, TruncU,
+  UnboxFloat, UnboxInt, UndefinedElement, UninitializedElement, Unreachable,
+  Values, Var, W32, W64,
 }
 import twocore/runtime/instance.{type Binding}
 
 // ─────────────────────────────── error type (D4) ───────────────────────────────
 
 /// This stage's own error type (D4 — there is no shared `StageError`). `emit_module`
-/// returns `Error(EmitError)` — never a panic — for any IR node outside the Phase-1
-/// lowering surface or for a structurally inconsistent IR.
+/// returns `Error(EmitError)` — never a panic — for any IR node outside the lowering
+/// surface or for a structurally inconsistent IR.
 ///
-/// - `UnsupportedNode(node)`: an IR node not lowered in Phase 1 (e.g. `"call_indirect"`,
-///   `"mem_load"`, `"global_get"`, `"term_op"`, or a term↔numeric boxing `Convert`).
-///   `node` is a stable lowercase tag for the node kind.
+/// - `UnsupportedNode(node)`: an IR node not lowered (Phase-2 leaves only `"term_op"`
+///   and the four term↔numeric boxing `Convert`s — `"box_int"`/`"unbox_int"`/
+///   `"box_float"`/`"unbox_float"` — out of scope). `node` is a stable lowercase tag for
+///   the node kind. The Phase-2 stateful ops (memory/global/table/size/grow) and the
+///   trapping/total `Convert`s are now lowered through the state-access seam, so they no
+///   longer appear here.
 /// - `ArityMismatch(expected, got)`: a value-list arity clash — a `Let`/join-point bind
 ///   whose name count (`expected`) does not equal the number of values produced (`got`).
 /// - `UnboundLabel(label)`: a `Break`/`Continue` referencing a label not on the
 ///   enclosing block/loop stack, or a `Continue` targeting a `Block` (which has no
 ///   back-edge).
-/// - `UnknownFunction(name)`: a `CallDirect` or `ExportFn` naming a function the module
-///   does not define.
+/// - `UnknownFunction(name)`: a `CallDirect`, `ExportFn`, `ElementSegment` func, or
+///   `start` naming a function the module does not define.
+/// - `NonConstInit(detail)`: a `GlobalDecl.init` / data-or-element-segment `offset`
+///   expression that is not a Phase-2 constant literal (`t.const` → `Values([Const])`),
+///   so the `instantiate/0` entry cannot constant-fold it to a bit pattern. `detail` is a
+///   human-readable reason. (Validation upstream already enforces the const-expr rule;
+///   this is the fail-closed backend defence — never a panic, never arbitrary emitted
+///   code in the seed decl.)
 pub type EmitError {
   UnsupportedNode(node: String)
   ArityMismatch(expected: Int, got: Int)
   UnboundLabel(label: String)
   UnknownFunction(name: String)
+  NonConstInit(detail: String)
 }
 
 // ─────────────────────────────── internal state ───────────────────────────────
@@ -123,6 +141,7 @@ type Ctx {
     binding: Binding,
     fn_arity: Dict(String, Int),
     fn_results: Dict(String, Int),
+    fn_sig: Dict(String, FuncType),
   )
 }
 
@@ -230,7 +249,16 @@ pub fn emit_module(
   let fn_results =
     list.map(module.functions, fn(f) { #(f.name, list.length(f.result)) })
     |> dict.from_list
-  let ctx = Ctx(binding: binding, fn_arity: fn_arity, fn_results: fn_results)
+  let fn_sig =
+    list.map(module.functions, fn(f) { #(f.name, ir.signature(f)) })
+    |> dict.from_list
+  let ctx =
+    Ctx(
+      binding: binding,
+      fn_arity: fn_arity,
+      fn_results: fn_results,
+      fn_sig: fn_sig,
+    )
   use defs <- result.try(
     list.try_map(module.functions, fn(f) { emit_function(f, ctx) }),
   )
@@ -238,11 +266,15 @@ pub fn emit_module(
     module.exports,
     fn_arity,
   ))
+  // The generated instantiation entry (E5) — seeds the fresh per-instance cell and runs
+  // the active element/data segments + start in WASM spec order. Always emitted and
+  // exported so the harness (unit 11) can call `instantiate/0` in the instance process.
+  use inst_def <- result.try(emit_instantiate(module, ctx))
   Ok(core_erlang.CModule(
     name: module.name,
-    exports: export_names,
+    exports: list.append(export_names, [FName("instantiate", 0)]),
     attributes: [],
-    defs: list.append(defs, wrappers),
+    defs: list.append(list.append(defs, wrappers), [inst_def]),
   ))
 }
 
@@ -333,17 +365,74 @@ fn emit(
     Trap(reason) ->
       Ok(#(raise_trap(ctx, CAtom(trap_reason_atom(reason))), state))
     Charge(cost, body) -> emit_charge(cost, body, cont, state, ctx)
-    // Out of Phase-1 scope — typed error, never a panic. The Phase-2 stateful ops
-    // (memory/global/table/size/grow) are wired by unit 10 through the emit_core
-    // state-access seam (`«CELL-STATE-ABI-FROZEN»`); transitional `UnsupportedNode`
-    // arms keep the freeze compiling.
-    CallIndirect(..) -> Error(UnsupportedNode("call_indirect"))
-    MemSize -> Error(UnsupportedNode("mem_size"))
-    MemGrow(..) -> Error(UnsupportedNode("mem_grow"))
-    MemLoad(..) -> Error(UnsupportedNode("mem_load"))
-    MemStore(..) -> Error(UnsupportedNode("mem_store"))
-    GlobalGet(..) -> Error(UnsupportedNode("global_get"))
-    GlobalSet(..) -> Error(UnsupportedNode("global_set"))
+    // ── Phase-2 stateful ops — routed through the ONE state-access seam (`seam_call`),
+    // each a direct `call '<binding.X_module>':'op'(...)` with no ambient authority. ──
+    MemSize ->
+      apply_cont(
+        cont,
+        [seam_call(ctx.binding.mem_module, "size", [])],
+        state,
+        ctx,
+      )
+    MemGrow(delta) ->
+      apply_cont(
+        cont,
+        [seam_call(ctx.binding.mem_module, "grow", [emit_value(delta)])],
+        state,
+        ctx,
+      )
+    MemLoad(op, addr, offset, result) -> {
+      // `load(Bytes, Signed, ResultWidth, Addr, Off)` → `{ok,V}`/`{error,R}` (trapping).
+      let call =
+        seam_call(ctx.binding.mem_module, "load", [
+          CInt(op.bytes),
+          bool_atom(op.signed),
+          CInt(result_width(result)),
+          emit_value(addr),
+          CInt(offset),
+        ])
+      emit_trapping_result(call, cont, state, ctx)
+    }
+    MemStore(op, addr, value, offset) -> {
+      // `store(Bytes, Addr, Val, Off)` → `{ok,_}`/`{error,R}`; a ZERO-RESULT ordered
+      // effect (`op.signed` is irrelevant for stores — `storeN` writes the low N bytes).
+      // Eval order is addr → value → store: the args are already atomic `Value`s, so
+      // left-to-right `call` arg order fixes addr-before-value; the store is the single
+      // sequenced effect (non-DCE, non-reorderable, E6).
+      let call =
+        seam_call(ctx.binding.mem_module, "store", [
+          CInt(op.bytes),
+          emit_value(addr),
+          emit_value(value),
+          CInt(offset),
+        ])
+      let #(effect, state2) = trapping_effect(call, ctx, state)
+      emit_zero_effect(effect, cont, state2, ctx)
+    }
+    GlobalGet(name) ->
+      apply_cont(
+        cont,
+        [
+          seam_call(ctx.binding.state_module, "global_get", [
+            core_binary_string(name),
+          ]),
+        ],
+        state,
+        ctx,
+      )
+    GlobalSet(name, value) -> {
+      // A pure (non-trapping) ZERO-RESULT ordered effect.
+      let effect =
+        seam_call(ctx.binding.state_module, "global_set", [
+          core_binary_string(name),
+          emit_value(value),
+        ])
+      emit_zero_effect(effect, cont, state, ctx)
+    }
+    CallIndirect(_table, index, ty, args) ->
+      emit_call_indirect(index, ty, args, cont, state, ctx)
+    // Out of scope — typed error, never a panic. Only the term layer (`TermOp`) and the
+    // term↔numeric boxing `Convert`s remain unlowered (handled in `emit_convert`).
     TermOp(..) -> Error(UnsupportedNode("term_op"))
   }
 }
@@ -493,53 +582,125 @@ fn emit_num(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let call =
-    CCall(
-      CAtom(ctx.binding.num_module),
-      CAtom(num_op_name(op)),
+    seam_call(
+      ctx.binding.num_module,
+      num_op_name(op),
       list.map(args, emit_value),
     )
   case is_trapping(op) {
     False -> apply_cont(cont, [call], state, ctx)
-    True -> {
-      // A trapping op yields EXACTLY ONE value (or raises). Reduce it to a single bound
-      // variable `rvar` via a `case` whose BOTH clauses yield one value — the unwrapped
-      // `{ok,X}` result, or the never-returning `raise` on `{error,E}` — then thread that
-      // single value through `cont` normally. Binding once and threading once keeps the
-      // two `case` arms arity-consistent (both yield 1) regardless of the surrounding
-      // value-list arity: a 0-result function (cont yields `<>`) or a multi-value join
-      // point would break a structure that inlined `cont` into only the `ok` arm, because
-      // then the `error` arm's lone `raise` value would disagree with the `ok` arm's arity
-      // (the Core compiler rejects that as a "return count mismatch").
-      let #(xvar, state2) = fresh_var(state)
-      let #(evar, state3) = fresh_var(state2)
-      let #(rvar, state4) = fresh_var(state3)
-      let result_case =
-        CCase(call, [
-          CClause(
-            [PTuple([PAtom("ok"), PVar(xvar)])],
-            CAtom("true"),
-            CVar(xvar),
-          ),
-          CClause(
-            [PTuple([PAtom("error"), PVar(evar)])],
-            CAtom("true"),
-            raise_trap(ctx, CVar(evar)),
-          ),
-        ])
-      use #(rest, state5) <- result.try(apply_cont(
-        cont,
-        [CVar(rvar)],
-        state4,
-        ctx,
-      ))
-      Ok(#(CLet([rvar], result_case, rest), state5))
-    }
+    True -> emit_trapping_result(call, cont, state, ctx)
   }
 }
 
-/// Lower a `Convert` op. Numeric width/sign/reinterpret/saturating-truncation
-/// conversions route through `binding.num_module` (the same chokepoint). The
-/// term↔numeric boxing conversions are out of Phase-1 scope → `Error(UnsupportedNode)`.
+// ─────────────────────────── the state-access seam + dispositions ───────────────────────────
+
+/// Emit a direct call to a fixed runtime module field of the `Binding` — THE state-access
+/// seam (E1). `module` is always a build-controlled `twocore@runtime@*` atom (one of
+/// `binding.{num,trap,host,meter,stdlib,mem,table,state}_module`), never a program value;
+/// `fn_name` is always a literal atom (D3a — no ambient authority). For the cell strategy
+/// every stateful op is a `call '<module>':'<fn_name>'(args)`; the Phase-3 `threaded`
+/// retrofit expands THIS one helper rather than every op site.
+fn seam_call(module: String, fn_name: String, args: List(CExpr)) -> CExpr {
+  CCall(CAtom(module), CAtom(fn_name), args)
+}
+
+/// Dispose a trapping `Result(Int, TrapReason)` producer — the verified `case`-and-`raise`
+/// shape shared by trapping `Num`, `MemLoad`, and trapping `Convert`.
+///
+/// A trapping op yields EXACTLY ONE value (or raises). Reduce it to a single bound variable
+/// `rvar` via a `case` whose BOTH clauses yield one value — the unwrapped `{ok,X}` result,
+/// or the never-returning `raise` on `{error,E}` — then thread that single value through
+/// `cont` normally. Binding once and threading once keeps the two `case` arms arity-
+/// consistent (both yield 1) regardless of the surrounding value-list arity: a 0-result
+/// function (`cont` yields `<>`) or a multi-value join point would break a structure that
+/// inlined `cont` into only the `ok` arm, because then the `error` arm's lone `raise` value
+/// would disagree with the `ok` arm's arity (the Core compiler rejects that as a "return
+/// count mismatch").
+fn emit_trapping_result(
+  produced: CExpr,
+  cont: Cont,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(xvar, state2) = fresh_var(state)
+  let #(evar, state3) = fresh_var(state2)
+  let #(rvar, state4) = fresh_var(state3)
+  let result_case =
+    CCase(produced, [
+      CClause([PTuple([PAtom("ok"), PVar(xvar)])], CAtom("true"), CVar(xvar)),
+      CClause(
+        [PTuple([PAtom("error"), PVar(evar)])],
+        CAtom("true"),
+        raise_trap(ctx, CVar(evar)),
+      ),
+    ])
+  use #(rest, state5) <- result.try(apply_cont(cont, [CVar(rvar)], state4, ctx))
+  Ok(#(CLet([rvar], result_case, rest), state5))
+}
+
+/// Reduce a trapping zero-result `Result(Nil, TrapReason)` producer (`MemStore`,
+/// `init_elem`, `init_data`) to a SINGLE discardable value: `{ok,_}` → `'ok'`,
+/// `{error,E}` → `raise(E)`. Returns the reduced `case` expression (one value), ready to be
+/// sequenced as an ordered effect by `emit_zero_effect`.
+fn trapping_effect(
+  call: CExpr,
+  ctx: Ctx,
+  state: EmitState,
+) -> #(CExpr, EmitState) {
+  let #(wild, state2) = fresh_var(state)
+  let #(evar, state3) = fresh_var(state2)
+  let reduced =
+    CCase(call, [
+      CClause([PTuple([PAtom("ok"), PVar(wild)])], CAtom("true"), CAtom("ok")),
+      CClause(
+        [PTuple([PAtom("error"), PVar(evar)])],
+        CAtom("true"),
+        raise_trap(ctx, CVar(evar)),
+      ),
+    ])
+  #(reduced, state3)
+}
+
+/// Sequence a ZERO-RESULT ordered effect: `let <g> = <effect> in <rest>` with `g`
+/// discarded and `<rest>` emitted under `cont` disposing ZERO values. Non-DCE, non-
+/// reorderable (E6): Core `let` is strict, so the effect always runs before `<rest>` and
+/// is never eliminated.
+fn emit_zero_effect(
+  effect: CExpr,
+  cont: Cont,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(g, state2) = fresh_var(state)
+  use #(rest, state3) <- result.try(apply_cont(cont, [], state2, ctx))
+  Ok(#(CLet([g], effect, rest), state3))
+}
+
+/// The Erlang atom `'true'`/`'false'` for a `Bool` — `MemLoad`'s `Signed` argument.
+fn bool_atom(b: Bool) -> CExpr {
+  case b {
+    True -> CAtom("true")
+    False -> CAtom("false")
+  }
+}
+
+/// The load result width in bits — `W(result)` from the load's result `ValType`: 32 for
+/// `TI32`/`TF32`, 64 for `TI64`/`TF64` (raw-bits rep: `f32.load` == `i32.load` byte-wise, so
+/// only width+sign matter). `TTerm` cannot be a numeric load result; defaulted to 32.
+fn result_width(t: ValType) -> Int {
+  case t {
+    TI32 | TF32 | TTerm -> 32
+    TI64 | TF64 -> 64
+  }
+}
+
+/// Lower a `Convert` op. Numeric width/sign/reinterpret/saturating-truncation/int→float/
+/// demote/promote conversions route through `binding.num_module` (the same chokepoint) as a
+/// bare `call` (total — never traps). The TRAPPING float→int truncations (`TruncS`/`TruncU`)
+/// return `Result(Int, TrapReason)` and route through the verified `case`-and-`raise` shape
+/// (`emit_trapping_result`), exactly like `IDivS` — `is_trapping_conv` decides which. The
+/// four term↔numeric boxing conversions remain out of scope → `Error(UnsupportedNode)`.
 fn emit_convert(
   op: ConvOp,
   arg: Value,
@@ -549,15 +710,13 @@ fn emit_convert(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case conv_op_name(op) {
     Error(node) -> Error(UnsupportedNode(node))
-    Ok(fn_name) ->
-      apply_cont(
-        cont,
-        [
-          CCall(CAtom(ctx.binding.num_module), CAtom(fn_name), [emit_value(arg)]),
-        ],
-        state,
-        ctx,
-      )
+    Ok(fn_name) -> {
+      let call = seam_call(ctx.binding.num_module, fn_name, [emit_value(arg)])
+      case is_trapping_conv(op) {
+        True -> emit_trapping_result(call, cont, state, ctx)
+        False -> apply_cont(cont, [call], state, ctx)
+      }
+    }
   }
 }
 
@@ -647,6 +806,87 @@ fn resolve_stdlib(capability: String, name: String) -> Option(String) {
   case capability, name {
     "std", "gcd" -> Some("gcd")
     _, _ -> None
+  }
+}
+
+/// Lower a `CallIndirect` to the 3-fault, ambient-free dispatch (E3): a single seam call
+/// `call '<table_module>':'call_indirect'(Idx, TypeTag, ArgList)` — the runtime type-check
+/// and the three traps (bounds → null → type) live INSIDE `rt_table`, never here.
+///
+/// - `index`: the runtime table index — the ONLY program-derived value that reaches the
+///   dispatch. The dispatched target is a build-controlled closure stored in the slot at
+///   instantiation (never `apply(Mod, F, Args)` with `Mod`/`F` from data) — D3a.
+/// - `ty`: the call-site's expected `FuncType`, emitted as a compile-time-canonical
+///   `TypeTag` term via `func_type_term` (the SAME renderer the element-segment entry uses,
+///   so `rt_table`'s structural `==` guard holds at run time).
+/// - `args`: spread into a proper Core list `ArgList`.
+///
+/// The result is `Result(List(Int), TrapReason)`: `{ok,V}`/`{error,R}` → `case`-and-`raise`
+/// (`emit_trapping_result`) binding the result LIST `V`, then the list is unpacked into
+/// `len(ty.results)` values and disposed through `cont`. The IR's `table` name is ignored
+/// (the MVP cell holds a single funcref table).
+fn emit_call_indirect(
+  index: Value,
+  ty: FuncType,
+  args: List(Value),
+  cont: Cont,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let r = list.length(ty.results)
+  let call =
+    seam_call(ctx.binding.table_module, "call_indirect", [
+      emit_value(index),
+      func_type_term(ty),
+      core_list(list.map(args, emit_value)),
+    ])
+  // Bind one var to the unwrapped result LIST (or raise on `{error,R}`), then unpack it.
+  let #(xvar, state2) = fresh_var(state)
+  let #(evar, state3) = fresh_var(state2)
+  let #(lvar, state4) = fresh_var(state3)
+  let result_case =
+    CCase(call, [
+      CClause([PTuple([PAtom("ok"), PVar(xvar)])], CAtom("true"), CVar(xvar)),
+      CClause(
+        [PTuple([PAtom("error"), PVar(evar)])],
+        CAtom("true"),
+        raise_trap(ctx, CVar(evar)),
+      ),
+    ])
+  use #(rest, state5) <- result.try(unpack_result_list(
+    lvar,
+    r,
+    cont,
+    state4,
+    ctx,
+  ))
+  Ok(#(CLet([lvar], result_case, rest), state5))
+}
+
+/// Unpack the result LIST bound to `lvar` (length `r`, the callee's result count) into `r`
+/// Core values and dispose them through `cont`. `r == 0` disposes zero values (the list is
+/// `[]`, discarded); otherwise a `case lvar of <[V1,…,Vr]> -> …` destructures the list and
+/// continues with the elements.
+fn unpack_result_list(
+  lvar: String,
+  r: Int,
+  cont: Cont,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case r {
+    0 -> apply_cont(cont, [], state, ctx)
+    _ -> {
+      let #(names, state2) = fresh_n_vars(state, r)
+      use #(rest, state3) <- result.try(apply_cont(
+        cont,
+        list.map(names, CVar),
+        state2,
+        ctx,
+      ))
+      let clause = CClause([list_pattern(names)], CAtom("true"), rest)
+      Ok(#(CCase(CVar(lvar), [clause]), state3))
+    }
   }
 }
 
@@ -880,6 +1120,348 @@ fn core_list(exprs: List(CExpr)) -> CExpr {
   list.fold_right(exprs, CNil, fn(acc, e) { CCons(e, acc) })
 }
 
+/// A proper Core LIST PATTERN `[N1, N2, …]` of variable binders (`PCons` chain ending in
+/// `PNil`). Used to destructure a `call_indirect` result list and a closure's args list.
+fn list_pattern(names: List(String)) -> CPat {
+  list.fold_right(names, PNil, fn(acc, n) { PCons(PVar(n), acc) })
+}
+
+// ─────────────────────────────── the FuncType / binary-literal renderers ───────────────────────────────
+
+/// Render an `ir.FuncType` as a build-controlled, compile-time-canonical Core TERM
+/// `{[paramtype-atoms…], [resulttype-atoms…]}` — the `call_indirect` `TypeTag`.
+///
+/// This is the SINGLE renderer used at BOTH the call site (the expected type) and the
+/// element-segment entry (the slot's stored type tag), so `rt_table`'s exact structural
+/// guard `entry_type == expected_type` holds at run time (both terms are byte-identical when
+/// the `FuncType`s are structurally equal). `rt_table` never inspects the term's shape — it
+/// only stores and `==`-compares it — so any canonical encoding works provided it is
+/// produced here and nowhere else.
+fn func_type_term(ty: FuncType) -> CExpr {
+  let FuncType(params, results) = ty
+  CTuple([
+    core_list(list.map(params, valtype_atom)),
+    core_list(list.map(results, valtype_atom)),
+  ])
+}
+
+/// The canonical valtype atom used inside a `func_type_term` (`'i32'`/`'i64'`/`'f32'`/
+/// `'f64'`/`'term'`). Self-consistent — only its use on both sides of the `==` guard matters.
+fn valtype_atom(t: ValType) -> CExpr {
+  CAtom(case t {
+    TI32 -> "i32"
+    TI64 -> "i64"
+    TF32 -> "f32"
+    TF64 -> "f64"
+    TTerm -> "term"
+  })
+}
+
+/// A Core binary STRING literal of `s`'s UTF-8 bytes (e.g. `"g0"` → `<<"g0">>`), byte-exact
+/// with the BEAM binary a Gleam `String` is — so `rt_state.global_get(name: String)` /
+/// `seed`'s global-name keys match. Emitted as a `CBinary` of 8-bit integer segments.
+fn core_binary_string(s: String) -> CExpr {
+  core_binary_bytes(bit_array.from_string(s))
+}
+
+/// A Core binary literal of the raw `bytes` (a data-segment payload), each byte an 8-bit
+/// `'integer'` segment — byte-exact with a BEAM `binary`/Gleam `BitArray`.
+fn core_binary_bytes(bytes: BitArray) -> CExpr {
+  CBinary(byte_segments(bytes, []))
+}
+
+/// Peel `bytes` into one little-endian-irrelevant 8-bit segment per byte (accumulated in
+/// reverse, then restored). A non-byte-aligned tail (never produced here) ends the scan.
+fn byte_segments(bytes: BitArray, acc: List(CBitSeg)) -> List(CBitSeg) {
+  case bytes {
+    <<b:size(8), rest:bits>> -> byte_segments(rest, [byte_seg(b), ..acc])
+    _ -> list.reverse(acc)
+  }
+}
+
+/// One unsigned 8-bit integer binary segment `#<B>(8,1,'integer',['unsigned','big'])`.
+fn byte_seg(b: Int) -> CBitSeg {
+  CBitSeg(value: CInt(b), size: CInt(8), unit: 1, segtype: "integer", flags: [
+    "unsigned",
+    "big",
+  ])
+}
+
+// ─────────────────────────────── the instantiate/0 entry (E5) ───────────────────────────────
+
+/// Emit the generated `'instantiate'/0` entry (the frozen instantiation contract, §C).
+///
+/// Its body runs, in WASM spec order, inside the instance's owned process: (1) seed the
+/// FRESH per-instance cell (`rt_state:seed` with a build-controlled `StateDecl` term whose
+/// `mem = rt_mem:fresh(min, max, safe_cap)`, `table = rt_table:new(min, max)`, and globals
+/// from their constant-folded inits); (2) write each active ELEMENT segment
+/// (`rt_table:init_elem`); (3) write each active DATA segment (`rt_mem:init_data`); (4) run
+/// the `start` function. Element BEFORE data (spec instantiation order). Steps 2–4 are
+/// trap-at-instantiation: each is reduced to one discardable value (`{ok,_}` → `'ok'`,
+/// `{error,E}` → `raise`) and `let`-sequenced, so a segment-OOB / trapping-start raises and
+/// fails instantiation. The body returns `'ok'` on success.
+///
+/// Returns `Error(NonConstInit)` if a global init / segment offset is not a constant
+/// literal, or `Error(UnknownFunction)` if an element/`start` function is undefined.
+fn emit_instantiate(module: Module, ctx: Ctx) -> Result(FunDef, EmitError) {
+  let state0 =
+    EmitState(
+      counter: 0,
+      vars: set.new(),
+      fns: set.from_list(dict.keys(ctx.fn_arity)),
+      labels: [],
+    )
+  use #(decl_term, state1) <- result.try(state_decl_term(module, ctx, state0))
+  let seed_effect = seam_call(ctx.binding.state_module, "seed", [decl_term])
+  use #(elem_fx, state2) <- result.try(element_segment_effects(
+    module.elements,
+    ctx,
+    state1,
+  ))
+  use #(data_fx, state3) <- result.try(data_segment_effects(
+    module.data_segments,
+    ctx,
+    state2,
+  ))
+  use start_fx <- result.try(start_effects(module, ctx))
+  let effects = list.flatten([[seed_effect], elem_fx, data_fx, start_fx])
+  let #(body, _state4) = chain_effects(effects, state3)
+  Ok(FunDef(FName("instantiate", 0), CFun([], body)))
+}
+
+/// Sequence a list of zero-result ordered effects into nested `let <g> = <effect> in …`,
+/// ending in `'ok'`. Each `let` is strict, so every effect runs in order (non-DCE, E6); the
+/// discarded binders are fresh wildcards.
+fn chain_effects(
+  effects: List(CExpr),
+  state: EmitState,
+) -> #(CExpr, EmitState) {
+  case effects {
+    [] -> #(CAtom("ok"), state)
+    [e, ..rest] -> {
+      let #(g, state2) = fresh_var(state)
+      let #(tail, state3) = chain_effects(rest, state2)
+      #(CLet([g], e, tail), state3)
+    }
+  }
+}
+
+/// Build the `StateDecl` Core TERM seed passed to `rt_state:seed` — the Gleam record
+/// `StateDecl(mem, globals, table)` compiles to `{state_decl, Mem, Globals, Table}`:
+/// `Mem = rt_mem:fresh(MinPages, MaxOpt, SafeCap)` (a 0-page memory when the module declares
+/// none), `Table = rt_table:new(Min, MaxOpt)` (the first declared table, or an empty one),
+/// `Globals = [{NameBin, InitBits}…]`. `SafeCap` is the build-time `binding.safe_max_pages`.
+fn state_decl_term(
+  module: Module,
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(min_pages, mem_max) = case module.memory {
+    Some(m) -> #(m.min_pages, option_int_term(m.max_pages))
+    None -> #(0, CAtom("none"))
+  }
+  let mem =
+    seam_call(ctx.binding.mem_module, "fresh", [
+      CInt(min_pages),
+      mem_max,
+      CInt(ctx.binding.safe_max_pages),
+    ])
+  let table = case module.tables {
+    [t, ..] ->
+      seam_call(ctx.binding.table_module, "new", [
+        CInt(t.min),
+        option_int_term(t.max),
+      ])
+    [] -> seam_call(ctx.binding.table_module, "new", [CInt(0), CAtom("none")])
+  }
+  use globals <- result.try(global_pairs(module.globals))
+  Ok(#(CTuple([CAtom("state_decl"), mem, globals, table]), state))
+}
+
+/// The `[{NameBin, InitBits}…]` Core list of a module's globals — each `GlobalDecl.init`
+/// constant-folded to a bit pattern. `Error(NonConstInit)` if any init is non-constant.
+fn global_pairs(globals: List(ir.GlobalDecl)) -> Result(CExpr, EmitError) {
+  use pairs <- result.try(
+    list.try_map(globals, fn(g) {
+      use bits <- result.try(const_fold(g.init))
+      Ok(CTuple([core_binary_string(g.name), CInt(bits)]))
+    }),
+  )
+  Ok(core_list(pairs))
+}
+
+/// Render an `Option(Int)` as a Core term — `Some(n)` → `{some, n}`, `None` → `none` (the
+/// Gleam `Option` runtime shape `rt_mem.fresh` / `rt_table.new` expect for `max`).
+fn option_int_term(o: Option(Int)) -> CExpr {
+  case o {
+    Some(n) -> CTuple([CAtom("some"), CInt(n)])
+    None -> CAtom("none")
+  }
+}
+
+/// Build the ordered `init_elem` effects for the active element segments. Each →
+/// `case call '<table_module>':'init_elem'(Off, Entries) of {ok,_}->'ok'; {error,E}->raise`,
+/// where `Entries` is a list of `{TypeTag, Closure}` (see `element_entry`). `Off` is the
+/// constant-folded offset.
+fn element_segment_effects(
+  segs: List(ir.ElementSegment),
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(List(CExpr), EmitState), EmitError) {
+  list.try_fold(segs, #([], state), fn(acc, seg) {
+    let #(effects, st) = acc
+    use offset <- result.try(const_fold(seg.offset))
+    use #(entries, st2) <- result.try(build_entries(seg.funcs, ctx, st))
+    let call =
+      seam_call(ctx.binding.table_module, "init_elem", [
+        CInt(offset),
+        core_list(entries),
+      ])
+    let #(effect, st3) = trapping_effect(call, ctx, st2)
+    Ok(#(list.append(effects, [effect]), st3))
+  })
+}
+
+/// Build the `{TypeTag, Closure}` entry list for an element segment's `funcs`.
+fn build_entries(
+  funcs: List(String),
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(List(CExpr), EmitState), EmitError) {
+  list.try_fold(funcs, #([], state), fn(acc, fname) {
+    let #(entries, st) = acc
+    use #(entry, st2) <- result.try(element_entry(fname, ctx, st))
+    Ok(#(list.append(entries, [entry]), st2))
+  })
+}
+
+/// One element-segment entry `{TypeTag, Closure}`: the function's IR `FuncType` (via the
+/// SAME `func_type_term` renderer the call site uses, so `rt_table`'s guard 3 matches) paired
+/// with a build-controlled closure over its compile-time-fixed module-local name (§3 —
+/// the integer index is the only runtime data; the function name is a literal).
+/// `Error(UnknownFunction)` if `fname` is not a defined function.
+fn element_entry(
+  fname: String,
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case dict.get(ctx.fn_sig, fname) {
+    Error(_) -> Error(UnknownFunction(fname))
+    Ok(sig) -> {
+      let arity = result.unwrap(dict.get(ctx.fn_arity, fname), 0)
+      let r = result.unwrap(dict.get(ctx.fn_results, fname), 0)
+      let #(closure, state2) = element_closure(fname, arity, r, state)
+      Ok(#(CTuple([func_type_term(sig), closure]), state2))
+    }
+  }
+}
+
+/// A build-controlled element-segment closure `fun(Args) -> Results` adapting the
+/// `fn(List(Int)) -> List(Int)` table-entry ABI to a static `apply 'f<idx>'/arity`: unpack
+/// the args list to the function's static `arity`, apply the COMPILE-TIME-LITERAL name, then
+/// re-wrap the `function_return`-packaged result back into a list (0 → `[]`, 1 → `[v]`, N →
+/// `[v1…vn]`). Never a data-driven `apply` (D3a).
+fn element_closure(
+  fname: String,
+  arity: Int,
+  r: Int,
+  state: EmitState,
+) -> #(CExpr, EmitState) {
+  let #(argsvar, state1) = fresh_var(state)
+  let #(argnames, state2) = fresh_n_vars(state1, arity)
+  let applied = CApply(FName(fname, arity), list.map(argnames, CVar))
+  let #(wrapped, state3) = wrap_result_list(applied, r, state2)
+  let body = case arity {
+    0 -> wrapped
+    _ ->
+      CCase(CVar(argsvar), [
+        CClause([list_pattern(argnames)], CAtom("true"), wrapped),
+      ])
+  }
+  #(CFun([argsvar], body), state3)
+}
+
+/// Re-wrap a `function_return`-packaged call result into the `List(Int)` the table-entry ABI
+/// returns: 0 results → `[]` (binding+discarding the dummy so the call still RUNS — its trap
+/// still propagates); 1 result → `[V]`; N≥2 → destructure the `{V1,…,Vn}` tuple → `[V1,…,Vn]`.
+fn wrap_result_list(
+  produced: CExpr,
+  r: Int,
+  state: EmitState,
+) -> #(CExpr, EmitState) {
+  case r {
+    0 -> {
+      let #(g, state2) = fresh_var(state)
+      #(CLet([g], produced, CNil), state2)
+    }
+    1 -> #(CCons(produced, CNil), state)
+    _ -> {
+      let #(names, state2) = fresh_n_vars(state, r)
+      let clause =
+        CClause(
+          [PTuple(list.map(names, PVar))],
+          CAtom("true"),
+          core_list(list.map(names, CVar)),
+        )
+      #(CCase(produced, [clause]), state2)
+    }
+  }
+}
+
+/// Build the ordered `init_data` effects for the active data segments. Each →
+/// `case call '<mem_module>':'init_data'(Off, Bytes) of {ok,_}->'ok'; {error,E}->raise`,
+/// `Bytes` the segment payload as a `CBinary` literal, `Off` the constant-folded offset.
+fn data_segment_effects(
+  segs: List(ir.DataSegment),
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(List(CExpr), EmitState), EmitError) {
+  list.try_fold(segs, #([], state), fn(acc, seg) {
+    let #(effects, st) = acc
+    use offset <- result.try(const_fold(seg.offset))
+    let call =
+      seam_call(ctx.binding.mem_module, "init_data", [
+        CInt(offset),
+        core_binary_bytes(seg.bytes),
+      ])
+    let #(effect, st2) = trapping_effect(call, ctx, st)
+    Ok(#(list.append(effects, [effect]), st2))
+  })
+}
+
+/// The `start` effect (if any): `apply 'f<idx>'/0()` — a trap inside it propagates (raises)
+/// and fails instantiation. `Error(UnknownFunction)` if `start` names no defined function.
+fn start_effects(module: Module, ctx: Ctx) -> Result(List(CExpr), EmitError) {
+  case module.start {
+    None -> Ok([])
+    Some(name) ->
+      case dict.get(ctx.fn_arity, name) {
+        Error(_) -> Error(UnknownFunction(name))
+        Ok(arity) -> Ok([CApply(FName(name, arity), [])])
+      }
+  }
+}
+
+/// Constant-fold a Phase-2 constant-literal init/offset `Expr` (`Values([Const])`) to its
+/// raw bit-pattern `Int`. `Error(NonConstInit)` for any non-constant shape (e.g. an
+/// imported-global `GlobalGet`, an extended-const chain, or a multi-value form) — fail-
+/// closed, never a panic, never arbitrary emitted code in the seed decl.
+fn const_fold(expr: Expr) -> Result(Int, EmitError) {
+  case expr {
+    Values([v]) -> const_value_bits(v)
+    _ -> Error(NonConstInit("non-constant init/offset expression"))
+  }
+}
+
+/// The raw bit pattern of a constant `Value`; `Error(NonConstInit)` for a `Var` (a
+/// non-constant operand).
+fn const_value_bits(v: Value) -> Result(Int, EmitError) {
+  case v {
+    ConstI32(b) | ConstI64(b) | ConstF32(b) | ConstF64(b) -> Ok(b)
+    Var(_) -> Error(NonConstInit("variable in constant init/offset"))
+  }
+}
+
 // ─────────────────────────────── the NumOp → rt_num name table ───────────────────────────────
 
 /// Map a `NumOp` to its `rt_num` function name (the chokepoint table; MUST match the
@@ -923,23 +1505,22 @@ pub fn num_op_name(op: NumOp) -> String {
     FDiv(f) -> fw(f) <> "_div"
     FMin(f) -> fw(f) <> "_min"
     FMax(f) -> fw(f) <> "_max"
-    // Phase-2 float NumOps (`«RTNUM2-SIG-FROZEN»`). Unit 10 maps these to the frozen
-    // `rt_num` names (`f32_abs`, `f64_lt`, …); transitional `todo` keeps the freeze
-    // compiling without committing the chokepoint table early.
-    FAbs(_)
-    | FNeg(_)
-    | FCeil(_)
-    | FFloor(_)
-    | FTrunc(_)
-    | FNearest(_)
-    | FSqrt(_)
-    | FCopysign(_)
-    | FEq(_)
-    | FNe(_)
-    | FLt(_)
-    | FGt(_)
-    | FLe(_)
-    | FGe(_) -> todo
+    // Phase-2 float NumOps (`«RTNUM2-SIG-FROZEN»`) — all TOTAL (stay out of `is_trapping`).
+    // Unary/copysign produce the width's float bits; the 6 comparisons produce an i32 0/1.
+    FAbs(f) -> fw(f) <> "_abs"
+    FNeg(f) -> fw(f) <> "_neg"
+    FCeil(f) -> fw(f) <> "_ceil"
+    FFloor(f) -> fw(f) <> "_floor"
+    FTrunc(f) -> fw(f) <> "_trunc"
+    FNearest(f) -> fw(f) <> "_nearest"
+    FSqrt(f) -> fw(f) <> "_sqrt"
+    FCopysign(f) -> fw(f) <> "_copysign"
+    FEq(f) -> fw(f) <> "_eq"
+    FNe(f) -> fw(f) <> "_ne"
+    FLt(f) -> fw(f) <> "_lt"
+    FGt(f) -> fw(f) <> "_gt"
+    FLe(f) -> fw(f) <> "_le"
+    FGe(f) -> fw(f) <> "_ge"
   }
 }
 
@@ -975,16 +1556,28 @@ fn conv_op_name(op: ConvOp) -> Result(String, String) {
     UnboxInt(_) -> Error("unbox_int")
     BoxFloat(_) -> Error("box_float")
     UnboxFloat(_) -> Error("unbox_float")
-    // Phase-2 ConvOps (`«RTNUM2-SIG-FROZEN»`). The trapping `TruncS/U` need the
-    // `case`-and-`raise` lowering (NOT a bare call) and the convert/demote/promote map to
-    // `rt_num` names — both owned by unit 10. Transitional `Error` keeps the freeze
-    // compiling (no codegen committed yet).
-    TruncS(_, _) -> Error("trunc_s")
-    TruncU(_, _) -> Error("trunc_u")
-    ConvertS(_, _) -> Error("convert_s")
-    ConvertU(_, _) -> Error("convert_u")
-    F32DemoteF64 -> Error("f32_demote_f64")
-    F64PromoteF32 -> Error("f64_promote_f32")
+    // Phase-2 ConvOps (`«RTNUM2-SIG-FROZEN»`). TRAPPING float→int truncation
+    // (`i{to}_trunc_f{from}_{s,u}`) — `emit_convert` routes these through the
+    // `case`-and-`raise` shape (see `is_trapping_conv`), NOT a bare call.
+    TruncS(from, to) -> Ok(iw(to) <> "_trunc_f" <> fwn(from) <> "_s")
+    TruncU(from, to) -> Ok(iw(to) <> "_trunc_f" <> fwn(from) <> "_u")
+    // int→float conversion + float width change — all TOTAL (bare call, never trap).
+    ConvertS(from, to) -> Ok(fw(to) <> "_convert_" <> iw(from) <> "_s")
+    ConvertU(from, to) -> Ok(fw(to) <> "_convert_" <> iw(from) <> "_u")
+    F32DemoteF64 -> Ok("f32_demote_f64")
+    F64PromoteF32 -> Ok("f64_promote_f32")
+  }
+}
+
+/// `True` for the TRAPPING float→int truncations (`TruncS`/`TruncU`) — those return
+/// `Result(Int, TrapReason)` (trap `InvalidConversionToInteger` on NaN/±Inf,
+/// `IntOverflow` out of range) and need the `case`-and-`raise` lowering. Every other
+/// `ConvOp` is total (a bare `call`). Getting this wrong either drops a mandated trap or
+/// wraps a total op in a spurious `case` (unit-10 grounded fact).
+fn is_trapping_conv(op: ConvOp) -> Bool {
+  case op {
+    TruncS(_, _) | TruncU(_, _) -> True
+    _ -> False
   }
 }
 

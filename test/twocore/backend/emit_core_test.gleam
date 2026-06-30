@@ -14,8 +14,9 @@ import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/option
 import twocore/backend/core_erlang.{
-  type CExpr, CApply, CAtom, CCall, CCase, CClause, CCons, CFun, CInt, CLet,
-  CLetrec, CNil, CVar, FName, FunDef, PAtom, PInt, PTuple, PVar,
+  type CExpr, CApply, CAtom, CBinary, CCall, CCase, CClause, CCons, CFun, CInt,
+  CLet, CLetrec, CNil, CTuple, CVar, FName, FunDef, PAtom, PCons, PInt, PNil,
+  PTuple, PVar,
 }
 import twocore/backend/emit_core
 import twocore/ir
@@ -87,6 +88,7 @@ fn applies_to(e: CExpr, name: String) -> Bool {
       })
     CFun(_, b) -> applies_to(b, name)
     CCons(h, t) -> applies_to(h, name) || applies_to(t, name)
+    CTuple(xs) -> list.any(xs, applies_to(_, name))
     _ -> False
   }
 }
@@ -543,19 +545,441 @@ pub fn num_op_name_matches_rt_num_test() {
   })
 }
 
+// ───────────────────────────── Phase-2 stateful-op goldens (the seam) ─────────────────────────────
+
+/// Build a single-function module whose body is exactly `body` (tail position), with the
+/// given params/result, exported by name. Lets the stateful-op shape be asserted directly.
+fn op_module(
+  name: String,
+  params: List(ir.Local),
+  result: List(ir.ValType),
+  body: ir.Expr,
+) -> ir.Module {
+  module_with(ir.Function(
+    name: name,
+    params: params,
+    result: result,
+    locals: [],
+    body: body,
+  ))
+}
+
+/// `MemSize` → a bare `call '<mem_module>':'size'()` (an i32; no trap).
+pub fn mem_size_is_bare_call_test() {
+  let b = binding()
+  let assert CCall(CAtom(mem), CAtom("size"), []) =
+    body_of(op_module("f", [], [ir.TI32], ir.MemSize), "f")
+  assert mem == b.mem_module
+}
+
+/// `MemGrow(delta)` → a bare `call '<mem_module>':'grow'(Delta)` (i32; effectful).
+pub fn mem_grow_is_bare_call_test() {
+  let b = binding()
+  let assert CCall(CAtom(mem), CAtom("grow"), [CVar("d")]) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("d", ir.TI32)],
+        [ir.TI32],
+        ir.MemGrow(ir.Var("d")),
+      ),
+      "f",
+    )
+  assert mem == b.mem_module
+}
+
+/// `MemLoad(MemAccess(bytes,signed), addr, off, result)` → a trapping `Result`: a `case`
+/// over `call '<mem_module>':'load'(Bytes, Signed, ResultWidth, Addr, Off)` raising on
+/// `{error,_}`. `i32.load8_s` walks to `Signed='true'` + `ResultWidth=32`.
+pub fn mem_load_is_trapping_case_test() {
+  let b = binding()
+  let assert CLet(
+    [r],
+    CCase(
+      CCall(
+        CAtom(mem),
+        CAtom("load"),
+        [CInt(1), CAtom("true"), CInt(32), CVar("a"), CInt(8)],
+      ),
+      [
+        CClause([PTuple([PAtom("ok"), PVar(x)])], CAtom("true"), CVar(x2)),
+        CClause(
+          [PTuple([PAtom("error"), PVar(e)])],
+          CAtom("true"),
+          CCall(CAtom(trap), CAtom("raise"), [CVar(e2)]),
+        ),
+      ],
+    ),
+    CVar(r2),
+  ) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("a", ir.TI32)],
+        [ir.TI32],
+        ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 8, ir.TI32),
+      ),
+      "f",
+    )
+  assert mem == b.mem_module
+  assert trap == b.trap_module
+  assert x == x2
+  assert e == e2
+  assert r == r2
+}
+
+/// `i64.load8_s` differs from `i32.load8_s` ONLY in the emitted `ResultWidth` (64 vs 32) —
+/// same `bytes`+`signed` — confirming `result` disambiguates the sign-extension width (E2).
+pub fn mem_load_result_width_disambiguates_test() {
+  let assert CLet(_, CCase(CCall(_, _, [_, _, CInt(w32), ..]), _), _) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("a", ir.TI32)],
+        [ir.TI32],
+        ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI32),
+      ),
+      "f",
+    )
+  let assert CLet(_, CCase(CCall(_, _, [_, _, CInt(w64), ..]), _), _) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("a", ir.TI32)],
+        [ir.TI64],
+        ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI64),
+      ),
+      "f",
+    )
+  assert w32 == 32
+  assert w64 == 64
+}
+
+/// `MemStore` → a ZERO-RESULT ordered effect: `let <_> = <case over
+/// call '<mem_module>':'store'(Bytes, Addr, Val, Off)> in <rest>`, the `case` reduced to a
+/// single discardable value (`{ok,_}`→`'ok'`, `{error,E}`→`raise`). The store sequences
+/// before the rest (non-DCE) with eval order addr → value → store.
+pub fn mem_store_is_ordered_effect_test() {
+  let b = binding()
+  let assert CLet(
+    [_g],
+    CCase(
+      CCall(
+        CAtom(mem),
+        CAtom("store"),
+        [CInt(4), CVar("a"), CVar("v"), CInt(0)],
+      ),
+      [
+        CClause([PTuple([PAtom("ok"), PVar(_)])], CAtom("true"), CAtom("ok")),
+        CClause(
+          [PTuple([PAtom("error"), PVar(e)])],
+          CAtom("true"),
+          CCall(CAtom(trap), CAtom("raise"), [CVar(e2)]),
+        ),
+      ],
+    ),
+    CAtom("ok"),
+  ) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("a", ir.TI32), ir.Local("v", ir.TI32)],
+        [],
+        ir.MemStore(ir.MemAccess(4, False), ir.Var("a"), ir.Var("v"), 0),
+      ),
+      "f",
+    )
+  assert mem == b.mem_module
+  assert trap == b.trap_module
+  assert e == e2
+}
+
+/// `GlobalGet(name)` → a bare `call '<state_module>':'global_get'(NameBin)` where `NameBin`
+/// is a Core binary STRING literal (`<<"g0">>`), not an atom (the frozen `rt_state` head
+/// takes a `String`/binary).
+pub fn global_get_is_binary_name_call_test() {
+  let b = binding()
+  let assert CCall(CAtom(state), CAtom("global_get"), [CBinary(_)]) =
+    body_of(op_module("f", [], [ir.TI32], ir.GlobalGet("g0")), "f")
+  assert state == b.state_module
+}
+
+/// `GlobalSet(name, value)` → a ZERO-RESULT ordered effect: `let <_> =
+/// call '<state_module>':'global_set'(NameBin, Val) in <rest>` (pure — no trap `case`).
+pub fn global_set_is_ordered_effect_test() {
+  let b = binding()
+  let assert CLet(
+    [_g],
+    CCall(CAtom(state), CAtom("global_set"), [CBinary(_), CVar("v")]),
+    CAtom("ok"),
+  ) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("v", ir.TI32)],
+        [],
+        ir.GlobalSet("g0", ir.Var("v")),
+      ),
+      "f",
+    )
+  assert state == b.state_module
+}
+
+/// `CallIndirect(table, index, ty, args)` → a `case` over `call '<table_module>':
+/// 'call_indirect'(Idx, TypeTag, ArgList)` raising on `{error,_}`, where `TypeTag` is the
+/// compile-time canonical `{[params],[results]}` term and `ArgList` is a proper Core list.
+/// The `{ok,V}` result list is then unpacked (here r=1 → `[V]`).
+pub fn call_indirect_is_seam_dispatch_test() {
+  let b = binding()
+  let assert CLet(
+    [lv],
+    CCase(
+      CCall(
+        CAtom(table),
+        CAtom("call_indirect"),
+        [
+          CVar("i"),
+          CTuple([CCons(CAtom("i32"), CNil), CCons(CAtom("i32"), CNil)]),
+          CCons(CVar("x"), CNil),
+        ],
+      ),
+      [
+        CClause([PTuple([PAtom("ok"), PVar(_)])], CAtom("true"), CVar(_)),
+        CClause(
+          [PTuple([PAtom("error"), PVar(_)])],
+          CAtom("true"),
+          CCall(CAtom(trap), CAtom("raise"), [CVar(_)]),
+        ),
+      ],
+    ),
+    CCase(CVar(lv2), [CClause([PCons(PVar(n), PNil)], CAtom("true"), CVar(n2))]),
+  ) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("i", ir.TI32), ir.Local("x", ir.TI32)],
+        [ir.TI32],
+        ir.CallIndirect("t0", ir.Var("i"), ir.FuncType([ir.TI32], [ir.TI32]), [
+          ir.Var("x"),
+        ]),
+      ),
+      "f",
+    )
+  assert table == b.table_module
+  assert trap == b.trap_module
+  assert lv == lv2
+  assert n == n2
+}
+
+/// A TRAPPING `Convert` (`TruncS`) → the `case`-and-`raise` shape over
+/// `call '<num_module>':'i32_trunc_f32_s'(A)` (NOT a bare call) — `trunc_f*` traps NaN/±Inf/
+/// out-of-range (`exec/numerics`).
+pub fn trapping_trunc_is_case_and_raise_test() {
+  let b = binding()
+  let assert CLet(
+    [r],
+    CCase(
+      CCall(CAtom(num), CAtom("i32_trunc_f32_s"), [CVar("x")]),
+      [
+        CClause([PTuple([PAtom("ok"), PVar(_)])], CAtom("true"), CVar(_)),
+        CClause(
+          [PTuple([PAtom("error"), PVar(_)])],
+          CAtom("true"),
+          CCall(CAtom(_), CAtom("raise"), [CVar(_)]),
+        ),
+      ],
+    ),
+    CVar(r2),
+  ) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("x", ir.TF32)],
+        [ir.TI32],
+        ir.Convert(ir.TruncS(ir.FW32, ir.W32), ir.Var("x")),
+      ),
+      "f",
+    )
+  assert num == b.num_module
+  assert r == r2
+}
+
+/// A TOTAL `Convert` (`ConvertS`/`F32DemoteF64`/`F64PromoteF32`) → a bare `num_module` call
+/// (never wrapped in a trap `case` — these conversions never trap).
+pub fn total_convert_is_bare_call_test() {
+  let b = binding()
+  let assert CCall(CAtom(num), CAtom("f32_convert_i32_s"), [CVar("x")]) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("x", ir.TI32)],
+        [ir.TF32],
+        ir.Convert(ir.ConvertS(ir.W32, ir.FW32), ir.Var("x")),
+      ),
+      "f",
+    )
+  assert num == b.num_module
+  let assert CCall(CAtom(_), CAtom("f32_demote_f64"), [CVar("x")]) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("x", ir.TF64)],
+        [ir.TF32],
+        ir.Convert(ir.F32DemoteF64, ir.Var("x")),
+      ),
+      "f",
+    )
+  let assert CCall(CAtom(_), CAtom("f64_promote_f32"), [CVar("x")]) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("x", ir.TF32)],
+        [ir.TF64],
+        ir.Convert(ir.F64PromoteF32, ir.Var("x")),
+      ),
+      "f",
+    )
+}
+
+/// A float comparison (`FLt`) → a bare `call '<num_module>':'f32_lt'(A,B)` (an i32 0/1).
+pub fn float_compare_is_bare_call_test() {
+  let b = binding()
+  let assert CCall(CAtom(num), CAtom("f32_lt"), [CVar("a"), CVar("b")]) =
+    body_of(
+      op_module(
+        "f",
+        [ir.Local("a", ir.TF32), ir.Local("b", ir.TF32)],
+        [ir.TI32],
+        ir.Num(ir.FLt(ir.FW32), [ir.Var("a"), ir.Var("b")]),
+      ),
+      "f",
+    )
+  assert num == b.num_module
+}
+
+// ───────────────────────────── the instantiate/0 entry golden ─────────────────────────────
+
+/// A module exercising the whole instantiation contract: a memory + an active data segment,
+/// a table + an active element segment (referencing `elemfn`), a global with a constant
+/// init, and a `start` function.
+fn full_module() -> ir.Module {
+  let elemfn =
+    ir.Function(
+      name: "elemfn",
+      params: [ir.Local("p0", ir.TI32)],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.Return([ir.Var("p0")]),
+    )
+  let initfn =
+    ir.Function(
+      name: "init",
+      params: [],
+      result: [],
+      locals: [],
+      body: ir.Values([]),
+    )
+  ir.Module(
+    name: "twocore@test@full",
+    uses_numerics: True,
+    memory: option.Some(ir.MemoryDecl(1, option.Some(2))),
+    globals: [ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(42)]))],
+    imports: [],
+    functions: [elemfn, initfn],
+    exports: [],
+    data_segments: [ir.DataSegment(ir.Values([ir.ConstI32(0)]), <<1, 2, 3>>)],
+    tables: [ir.TableDecl("t0", 4, option.None)],
+    elements: [ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["elemfn"])],
+    start: option.Some("init"),
+  )
+}
+
+/// True iff `e` (recursively) contains a `call '<module>':'<fn>'(…)`.
+fn contains_call(e: CExpr, module: String, fun: String) -> Bool {
+  case e {
+    CCall(CAtom(m), CAtom(f), args) ->
+      { m == module && f == fun }
+      || list.any(args, contains_call(_, module, fun))
+    CCall(m, f, args) ->
+      contains_call(m, module, fun)
+      || contains_call(f, module, fun)
+      || list.any(args, contains_call(_, module, fun))
+    CLet(_, a, b) ->
+      contains_call(a, module, fun) || contains_call(b, module, fun)
+    CLetrec(defs, b) ->
+      list.any(defs, fn(d) {
+        let FunDef(_, v) = d
+        contains_call(v, module, fun)
+      })
+      || contains_call(b, module, fun)
+    CCase(a, cs) ->
+      contains_call(a, module, fun)
+      || list.any(cs, fn(c) {
+        let CClause(_, g, bd) = c
+        contains_call(g, module, fun) || contains_call(bd, module, fun)
+      })
+    CFun(_, b) -> contains_call(b, module, fun)
+    CCons(h, t) ->
+      contains_call(h, module, fun) || contains_call(t, module, fun)
+    CTuple(xs) -> list.any(xs, contains_call(_, module, fun))
+    _ -> False
+  }
+}
+
+/// THE `instantiate/0` golden: it is exported, and its body sequences (in order)
+/// `seed` → `init_elem` → `init_data` → `apply 'init'/0` → `'ok'`, each init step a
+/// trap-at-instantiation `case`, with the element entry a `CFun`-wrapped STATIC `apply` of
+/// `elemfn` (no dynamic apply).
+pub fn instantiate_entry_golden_test() {
+  let b = binding()
+  let assert Ok(cm) = emit_core.emit_module(full_module(), b)
+  // Exported as `instantiate/0`.
+  assert list.contains(cm.exports, FName("instantiate", 0))
+  let assert Ok(FunDef(_, CFun([], body))) =
+    list.find(cm.defs, fn(d) {
+      let FunDef(FName(n, _), _) = d
+      n == "instantiate"
+    })
+  // Step 1: seed — `{state_decl, fresh(...), [{<<"g0">>,42}], new(...)}`.
+  let assert CLet([_], seed_rhs, rest1) = body
+  let assert CCall(
+    CAtom(state),
+    CAtom("seed"),
+    [CTuple([CAtom("state_decl"), mem_fresh, globals, table_new])],
+  ) = seed_rhs
+  assert state == b.state_module
+  let assert CCall(CAtom(_), CAtom("fresh"), [CInt(1), _, CInt(65_536)]) =
+    mem_fresh
+  let assert CCall(CAtom(_), CAtom("new"), [CInt(4), _]) = table_new
+  let assert CCons(CTuple([CBinary(_), CInt(42)]), CNil) = globals
+  // Step 2: element segment BEFORE data segment, each a trap `case` over its seam call.
+  let assert CLet([_], elem_rhs, rest2) = rest1
+  assert contains_call(elem_rhs, b.table_module, "init_elem")
+  // The element entry is a build-controlled closure that STATICALLY applies `elemfn`.
+  assert applies_to(elem_rhs, "elemfn")
+  // Step 3: data segment.
+  let assert CLet([_], data_rhs, rest3) = rest2
+  assert contains_call(data_rhs, b.mem_module, "init_data")
+  // Step 4: the start function, applied statically, then `'ok'`.
+  let assert CLet([_], CApply(FName("init", 0), []), CAtom("ok")) = rest3
+}
+
 // ───────────────────────────── fail-closed error paths (never panic) ─────────────────────────────
 
-/// Out-of-scope IR nodes return a typed `EmitError` — never a panic (D4 fail-closed).
+/// The remaining out-of-scope IR nodes return a typed `EmitError` — never a panic (D4
+/// fail-closed). Phase 2 lowers the stateful ops + numeric `Convert`s, so only the term
+/// layer (`TermOp`) and the four term↔numeric boxing `Convert`s stay unsupported.
 pub fn out_of_scope_nodes_error_test() {
-  let call_indirect = ir.CallIndirect("t", ir.Var("i"), ir.FuncType([], []), [])
-  assert emit_one(call_indirect)
-    == Error(emit_core.UnsupportedNode("call_indirect"))
-  assert emit_one(ir.GlobalGet("g"))
-    == Error(emit_core.UnsupportedNode("global_get"))
-  assert emit_one(ir.MemLoad(ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32))
-    == Error(emit_core.UnsupportedNode("mem_load"))
+  assert emit_one(ir.TermOp(ir.MakeTuple, [ir.Var("a")]))
+    == Error(emit_core.UnsupportedNode("term_op"))
   assert emit_one(ir.Convert(ir.BoxInt(ir.W32), ir.Var("a")))
     == Error(emit_core.UnsupportedNode("box_int"))
+  assert emit_one(ir.Convert(ir.UnboxInt(ir.W32), ir.Var("a")))
+    == Error(emit_core.UnsupportedNode("unbox_int"))
+  assert emit_one(ir.Convert(ir.BoxFloat(ir.FW32), ir.Var("a")))
+    == Error(emit_core.UnsupportedNode("box_float"))
+  assert emit_one(ir.Convert(ir.UnboxFloat(ir.FW32), ir.Var("a")))
+    == Error(emit_core.UnsupportedNode("unbox_float"))
 }
 
 /// A `CallDirect` to an undefined function is `Error(UnknownFunction)`.

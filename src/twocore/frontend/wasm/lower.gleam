@@ -1711,19 +1711,39 @@ fn num_op(instr: ast.Instr) -> Result(#(Int, ir.NumOp), Nil) {
     ast.F64Div -> Ok(#(2, ir.FDiv(ir.FW64)))
     ast.F64Min -> Ok(#(2, ir.FMin(ir.FW64)))
     ast.F64Max -> Ok(#(2, ir.FMax(ir.FW64)))
-    // NOTE — the remaining 14 float NumOps (`FAbs`/`FNeg`/`FCeil`/`FFloor`/`FTrunc`/
-    // `FNearest`/`FSqrt`/`FCopysign` and the 6 comparisons `FEq`/`FNe`/`FLt`/`FGt`/`FLe`/
-    // `FGe`, per width) are DEFERRED here. The opcode→NumOp mapping is trivial
-    // (`FSqrt(FW32)`, `FGt(FW64)`, … — see the unit-09 doc §4), but emit_core's
-    // `num_op_name` (backend/emit_core.gleam ~942) `todo`s — it PANICS, rather than
-    // returning a graceful `Error(UnsupportedNode)` — on exactly these ops (it has not yet
-    // wired them to `rt_num`). Unlike the mem/global/call/`Convert` nodes (which emit_core
-    // skips cleanly via `UnsupportedNode`), lowering one of these would crash the conformance
-    // runner on the float-using fixtures (`if`/`loop`/`br`/`return` use `f32.gt`/`f32.ne`/…).
-    // Leaving them unmapped yields the same net conformance outcome the spec intends (those
-    // modules skip — they fail to lower rather than fail to emit). Add the full `FAbs..FGe`
-    // block the moment unit 10 implements those float `rt_num` mappings (or converts that
-    // `todo` to a graceful `UnsupportedNode`).
+    // Float UNARY (arity 1, → the operand's float width) and COMPARISONS (arity 2, → i32).
+    // CROSS-REACH (unit 10): these were deferred only because emit_core's `num_op_name`
+    // PANICKED on them; unit 10 now maps `FAbs..FGe`/`FCopysign` to the frozen `rt_num`
+    // float names, so lowering them here makes the float comparison/unary modules
+    // lower → emit → run end-to-end.
+    ast.F32Abs -> Ok(#(1, ir.FAbs(ir.FW32)))
+    ast.F32Neg -> Ok(#(1, ir.FNeg(ir.FW32)))
+    ast.F32Ceil -> Ok(#(1, ir.FCeil(ir.FW32)))
+    ast.F32Floor -> Ok(#(1, ir.FFloor(ir.FW32)))
+    ast.F32Trunc -> Ok(#(1, ir.FTrunc(ir.FW32)))
+    ast.F32Nearest -> Ok(#(1, ir.FNearest(ir.FW32)))
+    ast.F32Sqrt -> Ok(#(1, ir.FSqrt(ir.FW32)))
+    ast.F32Copysign -> Ok(#(2, ir.FCopysign(ir.FW32)))
+    ast.F64Abs -> Ok(#(1, ir.FAbs(ir.FW64)))
+    ast.F64Neg -> Ok(#(1, ir.FNeg(ir.FW64)))
+    ast.F64Ceil -> Ok(#(1, ir.FCeil(ir.FW64)))
+    ast.F64Floor -> Ok(#(1, ir.FFloor(ir.FW64)))
+    ast.F64Trunc -> Ok(#(1, ir.FTrunc(ir.FW64)))
+    ast.F64Nearest -> Ok(#(1, ir.FNearest(ir.FW64)))
+    ast.F64Sqrt -> Ok(#(1, ir.FSqrt(ir.FW64)))
+    ast.F64Copysign -> Ok(#(2, ir.FCopysign(ir.FW64)))
+    ast.F32Eq -> Ok(#(2, ir.FEq(ir.FW32)))
+    ast.F32Ne -> Ok(#(2, ir.FNe(ir.FW32)))
+    ast.F32Lt -> Ok(#(2, ir.FLt(ir.FW32)))
+    ast.F32Gt -> Ok(#(2, ir.FGt(ir.FW32)))
+    ast.F32Le -> Ok(#(2, ir.FLe(ir.FW32)))
+    ast.F32Ge -> Ok(#(2, ir.FGe(ir.FW32)))
+    ast.F64Eq -> Ok(#(2, ir.FEq(ir.FW64)))
+    ast.F64Ne -> Ok(#(2, ir.FNe(ir.FW64)))
+    ast.F64Lt -> Ok(#(2, ir.FLt(ir.FW64)))
+    ast.F64Gt -> Ok(#(2, ir.FGt(ir.FW64)))
+    ast.F64Le -> Ok(#(2, ir.FLe(ir.FW64)))
+    ast.F64Ge -> Ok(#(2, ir.FGe(ir.FW64)))
     _ -> Error(Nil)
   }
 }
