@@ -37,7 +37,7 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 | **05** WASM decoder & AST | [`05`](phase-1/05-wasm-decoder.md) | `unclaimed` | — | `.wasm` → WASM AST (`«WASM-AST»`); LEB128 + fail-closed decoding; frontend input ready. |
 | **06** `rt_num` numerics (`bif`) | [`06`](phase-1/06-rt-num-numerics.md) | **done** | `«RTNUM-SIG-FROZEN»` | All 90 bodies implemented; the numeric-fidelity reference (tier-P), 40 spec-corner/property tests. Build now **zero-warning**. |
 | **07** Conformance harness & corpus | [`07`](phase-1/07-conformance-harness.md) | `unclaimed` | — (engine side); IR/backend (compare side) | The spec-suite oracle + the Phase-1 acceptance corpus; "is our output spec-correct?" answerable. |
-| **08** `emit_core` (IR → Core) | [`08`](phase-1/08-emit-core.md) | `unclaimed` | `«IR-FROZEN»`,`«CORE-AST»`,`«ABI-FROZEN»`,`«RTNUM-SIG-FROZEN»` | The backend: structured control → `letrec`+tail-calls; the binding chokepoint; codegen security-invariant test. |
+| **08** `emit_core` (IR → Core) | [`08`](phase-1/08-emit-core.md) | **done** | `«IR-FROZEN»`,`«CORE-AST»`,`«ABI-FROZEN»`,`«RTNUM-SIG-FROZEN»` | **The backend works end-to-end:** hand-written IR → Core Erlang → loaded `.beam` → correct results (add/wrap/shift, `sum_to(100k)` constant-space, fib/fac, div traps, deny-all host, stdlib gcd); binding chokepoint + security-invariant test pass. |
 | **09** Runtime defaults | [`09`](phase-1/09-runtime-defaults.md) | **done** | `«ABI-FROZEN»` | `rt_trap.raise/1`, `rt_host.call_host/3` (deny-all), `rt_meter.charge/1` (tier-O pdict fuel), `rt_stdlib.gcd/2` (own), `rt_bif` (build-time allowlist). 34 fail-closed/security tests. |
 | **10** WASM validate & lower | [`10`](phase-1/10-wasm-validate-and-lower.md) | `unclaimed` | `«WASM-AST»` (validate); `«IR-FROZEN»` (lower) | `full` validation (security boundary) + WASM AST → shared IR. |
 | **11** ir_lower, linker, Safe profile, CLI (capstone) | [`11`](phase-1/11-ir-lower-linker-cli.md) | `unclaimed` | all of the above | The `ir_lower` pass, the linker + Safe profile, the per-stage CLI (decision #5), and the **end-to-end differential acceptance** — Phase-1 goal proven. |
@@ -99,6 +99,27 @@ broaden the `own` stdlib + BIF allowlist; then the Porffor bridge + its ABI `rt_
 
 ## Change log
 
+- **Unit 08 landed (emit_core) — BACKEND PROVEN END-TO-END.** Hand-written IR compiles to
+  Core Erlang and runs on the real BEAM: `add(7,35)=42`, i32 wrap & shift-masking,
+  `sum_to(100000)=5000050000` in **constant space** (letrec tail-`apply` back-edge),
+  `fib(20)=6765`, `fac(10)=3628800`; `div_u(_,0)`/`div_s(INT_MIN,-1)` trap as
+  `{wasm_trap,…}`; a host import is rejected `{capability_denied,…}` (deny-all); and
+  `CallHost("std","gcd")` → `rt_stdlib:gcd`. Binding chokepoint + the structural codegen
+  security-invariant test pass. 130 tests, zero warnings. **Pinned notes for downstream:**
+  - **Unit 10 (lower):** emit_core IGNORES `Function.locals` (Phase-1 corpus has none).
+    Lowering must make WASM locals flow through `Let`/`LoopParam`/params — i.e. emit an
+    explicit zero-init `Let` for each declared WASM local at function entry, and turn
+    mutable locals that are live across control flow into `LoopParam` (SSA). Numeric
+    `Convert` ops (wrap/extend/reinterpret/trunc_sat) ALREADY lower in emit_core; only the
+    four term↔numeric **boxing** Converts are `UnsupportedNode` (not needed for the WASM
+    numeric path).
+  - **Unit 11 (ir_lower):** the `("std","gcd")→rt_stdlib:gcd` resolution currently also
+    lives as a small `resolve_stdlib` table in emit_core; ir_lower's allowlist
+    (`rt_bif`) must stay ALIGNED with it (same triple). `CallHost` cap/name are emitted
+    as atoms (faithful for deny-all; revisit only if a permissive host needs binaries).
+  - Added a test-only `test/twocore_emit_test_ffi.erl` (`catch_apply/3`) so Gleam tests
+    can rescue an error-class trap without crashing the runner (gleam_erlang 1.3 has no
+    generic rescue).
 - **Unit 09 landed (Safe-mode runtime defaults).** `rt_trap`/`rt_host`/`rt_meter`/
   `rt_stdlib`/`rt_bif` + 34 security/fail-closed tests; zero warnings. **Pinned
   cross-unit conventions** (units 08 & 11 must follow):
