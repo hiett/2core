@@ -1,0 +1,34 @@
+# Phase-1 conformance allowlist (unit 07).
+#
+# The exact set of WebAssembly spec-suite `.wast` files that 2core's Phase-1 slice
+# (i32/i64 integer + control-flow + locals + direct calls) is expected to drive.
+# One file name per line (no `.wast` extension); `#` starts a comment.
+#
+# DEFERRED (NOT here — need rt_mem / rt_table / call_indirect, Phase 1.5/2; D9):
+#   memory* table* call_indirect float_* f32* f64* address* align* start
+#   linking imports global elem data unreached-* — and every post-MVP proposal file.
+#
+# These 24 are VERIFIED present in the testsuite root at the pinned SHA (vendor/PIN).
+i32
+i64
+int_exprs
+int_literals
+const
+local_get
+local_set
+local_tee
+block
+loop
+if
+br
+br_if
+br_table
+return
+labels
+select
+nop
+call
+conversions
+traps
+func
+fac

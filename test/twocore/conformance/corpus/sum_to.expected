@@ -1,0 +1,4 @@
+# sum_to(n) = 1+2+...+n = n*(n+1)/2 via loop/break/continue (constant-space BEAM loop).
+# Cross-checked via wasmtime (Tier-B): sum_to(10)=55, sum_to(100)=5050.
+invoke sum_to i32:10 => return i32:55
+invoke sum_to i32:100 => return i32:5050

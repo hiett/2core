@@ -1,0 +1,18 @@
+# Args are RAW u32 bit patterns (-7 = 0xFFFFFFF9 = 4294967289).
+# Signed/unsigned divide pair on a value that differs:
+#   div_s(-7,2) = -3 = 0xFFFFFFFD = 4294967293 ; div_u(-7,2) = 2147483644
+#   (source: spec i32.wast "div_s" / "div_u").
+invoke divs i32:4294967289 i32:2 => return i32:4294967293
+invoke divu i32:4294967289 i32:2 => return i32:2147483644
+# rem_s(-7,2) = -1 = 0xFFFFFFFF = 4294967295 (source: spec i32.wast "rem_s").
+invoke rems i32:4294967289 i32:2 => return i32:4294967295
+# Shift count >= width is masked mod 32: shl(1,32)=1 (count 0), shl(1,33)=2 (count 1)
+# (source: spec i32.wast "shl"; the WASM shift-count masking rule).
+invoke shl i32:1 i32:32 => return i32:1
+invoke shl i32:1 i32:33 => return i32:2
+# div_s(INT_MIN,-1) TRAPS signed overflow (INT_MIN = 0x80000000 = 2147483648,
+# -1 = 0xFFFFFFFF = 4294967295) (source: spec i32.wast assert_trap "integer overflow").
+invoke divs i32:2147483648 i32:4294967295 => trap integer overflow
+# div_u(_,0) TRAPS divide by zero
+# (source: spec i32.wast assert_trap "integer divide by zero").
+invoke divu i32:10 i32:0 => trap integer divide by zero

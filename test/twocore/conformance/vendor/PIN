@@ -1,0 +1,16 @@
+# Pinned toolchain + corpus versions for the Phase-1 conformance suite (unit 07).
+#
+# `vendor.sh` reads this file; CI must install these exact versions and fail if they
+# drift. Bumping any line is a deliberate, reviewed change (the baked-in expected
+# values in the `.wast` files are only trustworthy against a known suite revision).
+
+# github.com/WebAssembly/testsuite — the source of the spec `.wast` files.
+TESTSUITE_SHA=193e551ff22663995b1ac95dc62344133669e14b
+
+# wabt (provides wat2wasm / wast2json / spectest-interp).
+WABT_VERSION=1.0.41
+
+# wasmtime — Tier-B reference engine (authored / random inputs only).
+# Verified invoke syntax for this version (flags + function BEFORE the module,
+# call arguments AFTER it):  wasmtime run --invoke <fn> <module.wasm> <arg> <arg> ...
+WASMTIME_VERSION=46.0.1

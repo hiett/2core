@@ -1,0 +1,11 @@
+# Float VALUES are raw IEEE-754 bit patterns (D5 — never BEAM doubles).
+# f32 1.5 = 0x3FC00000 = 1069547520 ; f64 2.5 = 0x4004000000000000 = 4612811918334230528
+# (wasmtime cross-check of the value; bits from IEEE-754).
+invoke f32const => return f32:1069547520
+invoke f64const => return f64:4612811918334230528
+# trunc_sat float->int (rt_num float path): trunc_sat_f32_s(3.5) = 3
+# (arg f32 3.5 = 0x40600000 = 1080033280).
+invoke f32toi f32:1080033280 => return i32:3
+# trunc_sat_f64_s(-2.5) = -2 (truncate toward zero) = 0xFFFFFFFE = 4294967294
+# (arg f64 -2.5 = 0xC004000000000000 = 13836183955189006336).
+invoke f64toi f64:13836183955189006336 => return i32:4294967294

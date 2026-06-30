@@ -1,0 +1,4 @@
+# fib via if + direct self-call + recursion. Cross-checked via wasmtime (Tier-B):
+# fib(10)=55, fib(20)=6765.
+invoke fib i32:10 => return i32:55
+invoke fib i32:20 => return i32:6765

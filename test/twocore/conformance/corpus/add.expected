@@ -1,0 +1,8 @@
+# add(i32,i32): direct numeric op, params, export, end-to-end plumbing.
+# add(2,3)=5 (self-evident; wasmtime cross-check).
+invoke add i32:2 i32:3 => return i32:5
+# i32.add wraps two's-complement mod 2^32: 0x7FFFFFFF + 1 = 0x80000000 = 2147483648
+# (source: spec i32.wast "add" — wrapping is modulo arithmetic).
+invoke add i32:2147483647 i32:1 => return i32:2147483648
+# i32.mul wraps mod 2^32: 65536*65536 = 2^32 -> 0 (source: spec i32.wast "mul").
+invoke mul i32:65536 i32:65536 => return i32:0

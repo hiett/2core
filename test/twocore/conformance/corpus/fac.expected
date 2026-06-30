@@ -1,0 +1,4 @@
+# fac via if + direct self-call + recursion. The spec bakes fac into fac.wast
+# (allowlisted); cross-checked via wasmtime: fac(5)=120, fac(10)=3628800.
+invoke fac i32:5 => return i32:120
+invoke fac i32:10 => return i32:3628800

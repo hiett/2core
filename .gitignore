@@ -3,3 +3,24 @@
 /build
 erl_crash.dump
 .idea/
+
+# Unit-07 conformance fixtures: the full vendored spec-suite (wast2json output) is
+# LARGE and regenerated on demand by test/twocore/conformance/vendor/vendor.sh, so it
+# is NOT committed. Only a small CURATED subset (negated below) is tracked so that
+# `gleam test` runs in a fresh checkout. (The cloned testsuite lives under /build,
+# already ignored above.)
+/test/twocore/conformance/fixtures/*
+# i64 is the flagship: assert_return + assert_trap (integer div/rem) + assert_invalid,
+# all passing through our pipeline. The rest add control/locals/recursion variety.
+!/test/twocore/conformance/fixtures/i64.json
+!/test/twocore/conformance/fixtures/i64.*.wasm
+!/test/twocore/conformance/fixtures/nop.json
+!/test/twocore/conformance/fixtures/nop.*.wasm
+!/test/twocore/conformance/fixtures/int_literals.json
+!/test/twocore/conformance/fixtures/int_literals.*.wasm
+!/test/twocore/conformance/fixtures/local_get.json
+!/test/twocore/conformance/fixtures/local_get.*.wasm
+!/test/twocore/conformance/fixtures/labels.json
+!/test/twocore/conformance/fixtures/labels.*.wasm
+!/test/twocore/conformance/fixtures/fac.json
+!/test/twocore/conformance/fixtures/fac.*.wasm

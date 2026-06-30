@@ -1,0 +1,137 @@
+//// The conformance oracle — the SINGLE place a result is judged spec-correct.
+////
+//// Two rules, both straight from the WebAssembly spec
+//// (<https://webassembly.github.io/spec/core/>):
+////
+//// 1. **Bit-pattern equality for concrete values.** Integers and concrete floats
+////    compare by EXACT unsigned bit pattern, masked to the type's width. This is
+////    correct for floats too because 2core stores floats as raw IEEE-754 bits (D5),
+////    so a returned `f32` IS its `0x????????` pattern — `-0.0` (`0x80000000`) and
+////    `+0.0` (`0x00000000`) are therefore (correctly) distinct, and the wast2json
+////    `value` is the decimal of those same bits.
+//// 2. **NaN by CLASS, never by bit-equality.** A NaN has many valid encodings, so an
+////    expected NaN matches a whole class of patterns
+////    (<https://webassembly.github.io/spec/core/syntax/values.html#floating-point>,
+////    <https://webassembly.github.io/spec/core/exec/numerics.html>):
+////      - a value is a NaN of a width iff its exponent field is all-ones AND its
+////        payload (mantissa) is non-zero;
+////      - **canonical** ⇔ payload is exactly the MSB bit (`0x40_0000` for f32,
+////        `0x8_0000_0000_0000` for f64);
+////      - **arithmetic** ⇔ payload MSB is set, the rest arbitrary;
+////      - the **sign bit is ignored** for both.
+////    (Canonical is a strict subset of arithmetic.)
+
+import gleam/int
+import twocore/conformance/fixture.{
+  type NanKind, type SpecValue, Arithmetic, Canonical, F32Bits, F32Nan, F64Bits,
+  F64Nan, I32Val, I64Val,
+}
+
+// IEEE-754 binary32 field masks (sign|exp[8]|payload[23]).
+const f32_exp_mask: Int = 0xFF
+
+const f32_payload_mask: Int = 0x7FFFFF
+
+const f32_payload_msb: Int = 0x400000
+
+// IEEE-754 binary64 field masks (sign|exp[11]|payload[52]).
+const f64_exp_mask: Int = 0x7FF
+
+const f64_payload_mask: Int = 0xFFFFFFFFFFFFF
+
+const f64_payload_msb: Int = 0x8000000000000
+
+/// True iff `actual` satisfies the spec's `expected`.
+///
+/// The comparison is driven by `expected`'s type: concrete `expected` (`I32Val`,
+/// `I64Val`, `F32Bits`, `F64Bits`) demands an EXACT width-masked bit match against
+/// `actual`'s raw bits; a NaN `expected` (`F32Nan`, `F64Nan`) demands `actual` be a
+/// NaN of the right CLASS (sign ignored). `actual` is expected to be a concrete value
+/// (the BEAM returns concrete bits); its own tag is not trusted — only its raw bits
+/// are read and reinterpreted at `expected`'s width, so an `actual` tagged loosely
+/// (e.g. all results carried as one numeric family) still compares correctly.
+pub fn matches(actual: SpecValue, expected: SpecValue) -> Bool {
+  case expected {
+    I32Val(e) -> mask(raw_bits(actual), 32) == mask(e, 32)
+    I64Val(e) -> mask(raw_bits(actual), 64) == mask(e, 64)
+    F32Bits(e) -> mask(raw_bits(actual), 32) == mask(e, 32)
+    F64Bits(e) -> mask(raw_bits(actual), 64) == mask(e, 64)
+    F32Nan(k) -> is_f32_nan(mask(raw_bits(actual), 32), k)
+    F64Nan(k) -> is_f64_nan(mask(raw_bits(actual), 64), k)
+  }
+}
+
+/// Compare a list of actual results against the expected list: same length and every
+/// position `matches`. Phase-1 functions return 0 or 1 result; this generalises to the
+/// multi-value case for free.
+pub fn matches_all(actual: List(SpecValue), expected: List(SpecValue)) -> Bool {
+  case actual, expected {
+    [], [] -> True
+    [a, ..ar], [e, ..er] ->
+      case matches(a, e) {
+        True -> matches_all(ar, er)
+        False -> False
+      }
+    _, _ -> False
+  }
+}
+
+/// The raw unsigned bit pattern carried by a concrete `SpecValue`. NaN-class values
+/// carry no concrete bits and yield `0` (they are only ever the `expected`, never the
+/// `actual`, so this is never read for them).
+fn raw_bits(v: SpecValue) -> Int {
+  case v {
+    I32Val(b) | I64Val(b) | F32Bits(b) | F64Bits(b) -> b
+    F32Nan(_) | F64Nan(_) -> 0
+  }
+}
+
+/// Mask `n` to the low `width` bits (`width` ∈ {32, 64}) — the unsigned bit pattern.
+fn mask(n: Int, width: Int) -> Int {
+  int.bitwise_and(n, two_pow(width) - 1)
+}
+
+fn two_pow(n: Int) -> Int {
+  case n {
+    32 -> 0x100000000
+    64 -> 0x10000000000000000
+    _ -> do_two_pow(n, 1)
+  }
+}
+
+fn do_two_pow(n: Int, acc: Int) -> Int {
+  case n {
+    0 -> acc
+    _ -> do_two_pow(n - 1, acc * 2)
+  }
+}
+
+/// True iff the 32-bit pattern `bits` is a NaN of class `kind` (sign ignored).
+fn is_f32_nan(bits: Int, kind: NanKind) -> Bool {
+  let exp = int.bitwise_and(int.bitwise_shift_right(bits, 23), f32_exp_mask)
+  let payload = int.bitwise_and(bits, f32_payload_mask)
+  let is_nan = exp == f32_exp_mask && payload != 0
+  nan_class(is_nan, payload, f32_payload_msb, kind)
+}
+
+/// True iff the 64-bit pattern `bits` is a NaN of class `kind` (sign ignored).
+fn is_f64_nan(bits: Int, kind: NanKind) -> Bool {
+  let exp = int.bitwise_and(int.bitwise_shift_right(bits, 52), f64_exp_mask)
+  let payload = int.bitwise_and(bits, f64_payload_mask)
+  let is_nan = exp == f64_exp_mask && payload != 0
+  nan_class(is_nan, payload, payload_msb_64(), kind)
+}
+
+fn payload_msb_64() -> Int {
+  f64_payload_msb
+}
+
+fn nan_class(is_nan: Bool, payload: Int, msb: Int, kind: NanKind) -> Bool {
+  case is_nan, kind {
+    False, _ -> False
+    // Canonical: payload is exactly the single MSB bit (rest zero).
+    True, Canonical -> payload == msb
+    // Arithmetic: payload MSB set, remaining bits arbitrary (canonical included).
+    True, Arithmetic -> int.bitwise_and(payload, msb) != 0
+  }
+}

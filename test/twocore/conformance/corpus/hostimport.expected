@@ -1,0 +1,5 @@
+# A host import under the Safe deny-all host must be REJECTED end-to-end (fail-closed,
+# D9/D4): the module must NOT compile to a runnable instance. (The Phase-1 decoder does
+# not model the import section, so the exported funcidx falls out of range and the
+# pipeline rejects with a typed error rather than silently running a wrong module.)
+reject
