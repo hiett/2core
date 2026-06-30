@@ -41,10 +41,13 @@
 ////   Gleam's `/` and `%` are TOTAL (`x / 0 == 0`), so these functions check the
 ////   divisor explicitly BEFORE dividing.
 
+import gleam/float
 import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/order
-import twocore/ir.{type TrapReason, IntDivByZero, IntOverflow}
+import twocore/ir.{
+  type TrapReason, IntDivByZero, IntOverflow, InvalidConversionToInteger,
+}
 
 // ───────────────────── private integer representation helpers ─────────────────────
 
@@ -1117,6 +1120,250 @@ pub fn f64_max(a: Int, b: Int) -> Int {
   fmax(f64_fmt, a, b)
 }
 
+// ───────────────────── private float workers (Phase-2 unit 06) ─────────────────────
+
+/// The rounding direction for `round_to_integral`: toward `+∞` (`RCeil`), toward `-∞`
+/// (`RFloor`), toward zero (`RTrunc`), or to the nearest integer with ties broken to even
+/// (`RNearest`) — the latter being the WASM/IEEE default for `f*.nearest`.
+type RoundMode {
+  RCeil
+  RFloor
+  RTrunc
+  RNearest
+}
+
+/// `1` if `r > 0`, else `0` — the round-away carry used by `ceil`/`floor` when the
+/// truncated value has a nonzero fractional remainder `r`.
+fn bump(r: Int) -> Int {
+  case r > 0 {
+    True -> 1
+    False -> 0
+  }
+}
+
+/// Encode the signed integer `v = (sign==0 ? m : -m)` exactly into `fmt`'s bit pattern.
+///
+/// Only ever called from `round_to_integral`, where the integral magnitude `m` is within
+/// the format's exact-integer range (`m ≤ 2^mbits`, i.e. ≤ 2^23 for f32 and ≤ 2^52 for
+/// f64), so the `int.to_float` round-trip introduces NO rounding and cannot overflow.
+/// `sign` is the operand's sign bit (`0` positive, `1` negative). Returns the raw bits.
+fn encode_int_magnitude(fmt: FloatFmt, sign: Int, m: Int) -> Int {
+  let v = case sign {
+    0 -> m
+    _ -> 0 - m
+  }
+  case fmt.total {
+    32 -> f32_round_to_bits(int.to_float(v))
+    _ -> f64_to_bits(int.to_float(v))
+  }
+}
+
+/// Round a float `bits` to an integral float of the same `fmt`, per `mode`.
+///
+/// Drives `ceil`/`floor`/`trunc`/`nearest`, which ARE in the spec's nondeterministic-NaN
+/// set, so a NaN operand yields the canonical NaN. `±Inf` is returned unchanged and `±0`
+/// is returned as the SAME signed zero. A finite operand is decomposed exactly (no native
+/// double), rounded per `mode`, and—crucially—a zero magnitude result is emitted as the
+/// signed zero matching the operand's sign (`ceil(-0.5) = -0`, `floor(0.5) = +0`,
+/// `nearest(-0.3) = -0`). `RNearest` resolves ties to even via an exact remainder-vs-half
+/// comparison (NOT `erlang:round/1`, which is ties-away-from-zero). Returns the raw bits.
+fn round_to_integral(fmt: FloatFmt, bits: Int, mode: RoundMode) -> Int {
+  case classify(fmt, bits) {
+    CNan -> canonical_nan(fmt)
+    CInf(_) -> bits
+    CZero(_) -> bits
+    CFinite(sign) -> {
+      let #(_, sig, exp2) = decompose(fmt, bits)
+      case exp2 >= 0 {
+        // Already integral (no fractional bits): identity.
+        True -> bits
+        False -> {
+          let f = 0 - exp2
+          let q = sig / pow2(f)
+          let r = sig - q * pow2(f)
+          let m = case mode {
+            RTrunc -> q
+            RCeil ->
+              case sign == 0 {
+                True -> q + bump(r)
+                False -> q
+              }
+            RFloor ->
+              case sign == 1 {
+                True -> q + bump(r)
+                False -> q
+              }
+            RNearest -> {
+              let half = pow2(f - 1)
+              case int.compare(r, half) {
+                order.Lt -> q
+                order.Gt -> q + 1
+                // Exact tie: pick the even neighbour.
+                order.Eq ->
+                  case q % 2 == 0 {
+                    True -> q
+                    False -> q + 1
+                  }
+              }
+            }
+          }
+          case m == 0 {
+            True -> float_zero(fmt, sign)
+            False -> encode_int_magnitude(fmt, sign, m)
+          }
+        }
+      }
+    }
+  }
+}
+
+/// IEEE square root on raw `fmt` bits. NaN → canonical NaN; `-Inf` and any negative finite
+/// → canonical NaN; `+Inf` → `+Inf`; `±0` → that same signed zero; a positive finite is
+/// decoded to a native double, rooted, and re-rounded to `fmt`. `float.square_root` is
+/// reached ONLY on a positive-finite `d`, where it never returns `Error`, so the
+/// `let assert Ok` is genuinely unreachable-on-`Error`. The f32 path through the f64 root
+/// is correctly single-rounded (f64's 53 significand bits ≥ 2·24+2). Returns raw bits.
+fn fsqrt(fmt: FloatFmt, bits: Int) -> Int {
+  case classify(fmt, bits) {
+    CNan -> canonical_nan(fmt)
+    CInf(0) -> bits
+    CInf(_) -> canonical_nan(fmt)
+    CZero(_) -> bits
+    // Negative finite (sign bit set) → NaN.
+    CFinite(1) -> canonical_nan(fmt)
+    // Positive finite (sign bit 0): the only remaining case.
+    CFinite(_) -> {
+      let d = decode_float(fmt, bits)
+      let assert Ok(s) = float.square_root(d)
+      case fmt.total {
+        32 -> f32_round_to_bits(s)
+        _ -> f64_to_bits(s)
+      }
+    }
+  }
+}
+
+/// Total order of two non-NaN floats. `Ok(order)` is the IEEE ordering of `a` and `b`
+/// (with `+0`/`-0` comparing `Eq` and `+Inf > finite > -Inf`); `Error(Nil)` iff EITHER
+/// operand is NaN (the unordered case). `±Inf` is ordered by its sign WITHOUT decoding —
+/// decoding Inf/NaN bits to a native double would `badmatch` — so only zero/finite
+/// operands ever reach `decode_float`.
+fn fcmp(fmt: FloatFmt, a: Int, b: Int) -> Result(order.Order, Nil) {
+  case classify(fmt, a), classify(fmt, b) {
+    CNan, _ -> Error(Nil)
+    _, CNan -> Error(Nil)
+    CInf(0), CInf(0) -> Ok(order.Eq)
+    CInf(1), CInf(1) -> Ok(order.Eq)
+    CInf(0), _ -> Ok(order.Gt)
+    _, CInf(0) -> Ok(order.Lt)
+    CInf(1), _ -> Ok(order.Lt)
+    _, CInf(1) -> Ok(order.Gt)
+    _, _ -> {
+      let da = decode_float(fmt, a)
+      let db = decode_float(fmt, b)
+      case da <. db {
+        True -> Ok(order.Lt)
+        False ->
+          case da >. db {
+            True -> Ok(order.Gt)
+            False -> Ok(order.Eq)
+          }
+      }
+    }
+  }
+}
+
+/// `f*.eq` worker: `1` iff `a` and `b` are ordered-equal (`+0 == -0`); any NaN → `0`.
+fn f_eq(fmt: FloatFmt, a: Int, b: Int) -> Int {
+  bool_to_i32(fcmp(fmt, a, b) == Ok(order.Eq))
+}
+
+/// `f*.ne` worker: `1` iff `a` and `b` are NOT ordered-equal; any NaN → `1`.
+fn f_ne(fmt: FloatFmt, a: Int, b: Int) -> Int {
+  bool_to_i32(fcmp(fmt, a, b) != Ok(order.Eq))
+}
+
+/// `f*.lt` worker: `1` iff `a < b`; any NaN → `0`.
+fn f_lt(fmt: FloatFmt, a: Int, b: Int) -> Int {
+  bool_to_i32(fcmp(fmt, a, b) == Ok(order.Lt))
+}
+
+/// `f*.gt` worker: `1` iff `a > b`; any NaN → `0`.
+fn f_gt(fmt: FloatFmt, a: Int, b: Int) -> Int {
+  bool_to_i32(fcmp(fmt, a, b) == Ok(order.Gt))
+}
+
+/// `f*.le` worker: `1` iff `a <= b` (`Lt` or `Eq`); any NaN → `0`.
+fn f_le(fmt: FloatFmt, a: Int, b: Int) -> Int {
+  case fcmp(fmt, a, b) {
+    Ok(order.Lt) | Ok(order.Eq) -> 1
+    _ -> 0
+  }
+}
+
+/// `f*.ge` worker: `1` iff `a >= b` (`Gt` or `Eq`); any NaN → `0`.
+fn f_ge(fmt: FloatFmt, a: Int, b: Int) -> Int {
+  case fcmp(fmt, a, b) {
+    Ok(order.Gt) | Ok(order.Eq) -> 1
+    _ -> 0
+  }
+}
+
+/// Trapping SIGNED float→int truncation to width `n`. `Error(InvalidConversionToInteger)`
+/// on NaN/`±Inf`; `Ok(0)` on `±0`; otherwise the EXACT toward-zero truncation `j`
+/// (bignum, via `trunc_integer`) is range-checked against `[-2^(n-1), 2^(n-1)-1]`:
+/// in range → `Ok(norm(j, n))` (the unsigned bit pattern, so `-1.0 → 0xFFFF…`), else
+/// `Error(IntOverflow)`. The exact `j` makes the boundary precise — `2^31` overflows but
+/// the largest f32 strictly below it does not.
+fn trunc_trap_s(fmt: FloatFmt, bits: Int, n: Int) -> Result(Int, TrapReason) {
+  let lo = int_min_signed(n)
+  let hi = pow2(n - 1) - 1
+  case classify(fmt, bits) {
+    CNan -> Error(InvalidConversionToInteger)
+    CInf(_) -> Error(InvalidConversionToInteger)
+    CZero(_) -> Ok(0)
+    CFinite(_) -> {
+      let j = trunc_integer(fmt, bits)
+      case j >= lo && j <= hi {
+        True -> Ok(norm(j, n))
+        False -> Error(IntOverflow)
+      }
+    }
+  }
+}
+
+/// Trapping UNSIGNED float→int truncation to width `n`. `Error(InvalidConversionToInteger)`
+/// on NaN/`±Inf`; `Ok(0)` on `±0`; otherwise the EXACT toward-zero truncation `j` is
+/// range-checked against `[0, 2^n-1]`: in range → `Ok(j)`, else `Error(IntOverflow)`
+/// (so any negative truncation, e.g. `-1.0`, overflows).
+fn trunc_trap_u(fmt: FloatFmt, bits: Int, n: Int) -> Result(Int, TrapReason) {
+  let hi = pow2(n) - 1
+  case classify(fmt, bits) {
+    CNan -> Error(InvalidConversionToInteger)
+    CInf(_) -> Error(InvalidConversionToInteger)
+    CZero(_) -> Ok(0)
+    CFinite(_) -> {
+      let j = trunc_integer(fmt, bits)
+      case j >= 0 && j <= hi {
+        True -> Ok(j)
+        False -> Error(IntOverflow)
+      }
+    }
+  }
+}
+
+/// Convert the signed integer `v` to `target`'s bit pattern, rounding to nearest ties-to-
+/// even (`erlang:float/1`, verified ties-to-even on OTP 29, then f32-rounded for the f32
+/// target). Never traps, never overflows to Inf (`max|i64| = 2^63 < f32_max = 2^128`). The
+/// f32 path goes i*→f64→f32; f64's 53 significand bits satisfy the `≥ 2p+2` double-rounding
+/// bound for `p = 24`, so the result equals the correctly single-rounded f32.
+fn int_to_float(target: FloatFmt, v: Int) -> Int {
+  case target.total {
+    32 -> f32_round_to_bits(int.to_float(v))
+    _ -> f64_to_bits(int.to_float(v))
+  }
+}
+
 // ───────────────────────── «RTNUM2-SIG-FROZEN» — Phase-2 float/convert heads ─────────────────────────
 // SIGNATURES frozen by unit 01 (`todo` bodies); BODIES implemented by unit 06; the
 // `NumOp/ConvOp → fn-name` map in `emit_core` (unit 10) MUST match these names. Operands
@@ -1125,148 +1372,175 @@ pub fn f64_max(a: Int, b: Int) -> Int {
 
 // ── f32 unary (raw bits → raw bits) ──────────────────────────────────────────
 
-/// `f32.abs` — clear the sign bit (NaN preserved as canonical). Returns the bit pattern.
-pub fn f32_abs(_a: Int) -> Int {
-  todo
+/// `f32.abs` — clear the sign bit. A PURE sign-bit op: it does NOT canonicalize NaN
+/// (the spec does not list `abs` in `nans`), so a NaN operand keeps its payload, only its
+/// sign cleared. Returns the raw bit pattern.
+pub fn f32_abs(a: Int) -> Int {
+  case sign_of(f32_fmt, a) {
+    1 -> flip_sign(f32_fmt, a)
+    _ -> a
+  }
 }
 
-/// `f32.neg` — flip the sign bit (including for NaN/±0). Returns the bit pattern.
-pub fn f32_neg(_a: Int) -> Int {
-  todo
+/// `f32.neg` — flip the sign bit (including for NaN/±0). PURE sign-bit op; preserves the
+/// NaN payload (does NOT canonicalize). Returns the raw bit pattern.
+pub fn f32_neg(a: Int) -> Int {
+  flip_sign(f32_fmt, a)
 }
 
-/// `f32.ceil` — round toward +∞ (NaN→canonical NaN; ±Inf/±0 preserved). Bit pattern.
-pub fn f32_ceil(_a: Int) -> Int {
-  todo
+/// `f32.ceil` — round toward +∞ (NaN→canonical NaN; ±Inf/±0 preserved; small fractions
+/// yield the operand-signed zero, e.g. `ceil(-0.5) = -0`). Bit pattern.
+pub fn f32_ceil(a: Int) -> Int {
+  round_to_integral(f32_fmt, a, RCeil)
 }
 
-/// `f32.floor` — round toward −∞. Bit pattern.
-pub fn f32_floor(_a: Int) -> Int {
-  todo
+/// `f32.floor` — round toward −∞ (NaN→canonical; ±Inf/±0 preserved; `floor(0.5) = +0`).
+/// Bit pattern.
+pub fn f32_floor(a: Int) -> Int {
+  round_to_integral(f32_fmt, a, RFloor)
 }
 
-/// `f32.trunc` — round toward zero. Bit pattern.
-pub fn f32_trunc(_a: Int) -> Int {
-  todo
+/// `f32.trunc` — round toward zero (NaN→canonical; ±Inf/±0 preserved; `trunc(-0.7) = -0`).
+/// Bit pattern.
+pub fn f32_trunc(a: Int) -> Int {
+  round_to_integral(f32_fmt, a, RTrunc)
 }
 
-/// `f32.nearest` — round to nearest, ties to even. Bit pattern.
-pub fn f32_nearest(_a: Int) -> Int {
-  todo
+/// `f32.nearest` — round to nearest, ties to even (NaN→canonical; `nearest(2.5) = 2`,
+/// `nearest(3.5) = 4`, `nearest(0.5) = +0`). Bit pattern.
+pub fn f32_nearest(a: Int) -> Int {
+  round_to_integral(f32_fmt, a, RNearest)
 }
 
-/// `f32.sqrt` — IEEE square root (sqrt of a negative → canonical NaN). Bit pattern.
-pub fn f32_sqrt(_a: Int) -> Int {
-  todo
+/// `f32.sqrt` — IEEE square root. NaN/`-Inf`/negative → canonical NaN; `+Inf` → `+Inf`;
+/// `±0` → that signed zero; positive finite → correctly-rounded root. Bit pattern.
+pub fn f32_sqrt(a: Int) -> Int {
+  fsqrt(f32_fmt, a)
 }
 
-/// `f32.copysign(a, b)` — magnitude of `a` with the sign of `b`. Bit pattern.
-pub fn f32_copysign(_a: Int, _b: Int) -> Int {
-  todo
+/// `f32.copysign(a, b)` — magnitude (and NaN payload) of `a` with the sign of `b`. A PURE
+/// sign-bit op: it does NOT canonicalize NaN. Returns the raw bit pattern.
+pub fn f32_copysign(a: Int, b: Int) -> Int {
+  case sign_of(f32_fmt, a) == sign_of(f32_fmt, b) {
+    True -> a
+    False -> flip_sign(f32_fmt, a)
+  }
 }
 
 // ── f64 unary (raw bits → raw bits) ──────────────────────────────────────────
 
-/// `f64.abs` — clear the sign bit. Bit pattern.
-pub fn f64_abs(_a: Int) -> Int {
-  todo
+/// `f64.abs` — clear the sign bit. PURE sign-bit op; preserves the NaN payload (does NOT
+/// canonicalize). Bit pattern.
+pub fn f64_abs(a: Int) -> Int {
+  case sign_of(f64_fmt, a) {
+    1 -> flip_sign(f64_fmt, a)
+    _ -> a
+  }
 }
 
-/// `f64.neg` — flip the sign bit. Bit pattern.
-pub fn f64_neg(_a: Int) -> Int {
-  todo
+/// `f64.neg` — flip the sign bit. PURE sign-bit op; preserves the NaN payload. Bit pattern.
+pub fn f64_neg(a: Int) -> Int {
+  flip_sign(f64_fmt, a)
 }
 
-/// `f64.ceil` — round toward +∞. Bit pattern.
-pub fn f64_ceil(_a: Int) -> Int {
-  todo
+/// `f64.ceil` — round toward +∞ (NaN→canonical; ±Inf/±0 preserved; `ceil(-0.5) = -0`).
+/// Bit pattern.
+pub fn f64_ceil(a: Int) -> Int {
+  round_to_integral(f64_fmt, a, RCeil)
 }
 
-/// `f64.floor` — round toward −∞. Bit pattern.
-pub fn f64_floor(_a: Int) -> Int {
-  todo
+/// `f64.floor` — round toward −∞ (NaN→canonical; ±Inf/±0 preserved; `floor(0.5) = +0`).
+/// Bit pattern.
+pub fn f64_floor(a: Int) -> Int {
+  round_to_integral(f64_fmt, a, RFloor)
 }
 
-/// `f64.trunc` — round toward zero. Bit pattern.
-pub fn f64_trunc(_a: Int) -> Int {
-  todo
+/// `f64.trunc` — round toward zero (NaN→canonical; ±Inf/±0 preserved). Bit pattern.
+pub fn f64_trunc(a: Int) -> Int {
+  round_to_integral(f64_fmt, a, RTrunc)
 }
 
-/// `f64.nearest` — round to nearest, ties to even. Bit pattern.
-pub fn f64_nearest(_a: Int) -> Int {
-  todo
+/// `f64.nearest` — round to nearest, ties to even (NaN→canonical; `nearest(2.5) = 2`).
+/// Bit pattern.
+pub fn f64_nearest(a: Int) -> Int {
+  round_to_integral(f64_fmt, a, RNearest)
 }
 
-/// `f64.sqrt` — IEEE square root (sqrt of a negative → canonical NaN). Bit pattern.
-pub fn f64_sqrt(_a: Int) -> Int {
-  todo
+/// `f64.sqrt` — IEEE square root. NaN/`-Inf`/negative → canonical NaN; `+Inf` → `+Inf`;
+/// `±0` → that signed zero; positive finite → correctly-rounded root. Bit pattern.
+pub fn f64_sqrt(a: Int) -> Int {
+  fsqrt(f64_fmt, a)
 }
 
-/// `f64.copysign(a, b)` — magnitude of `a` with the sign of `b`. Bit pattern.
-pub fn f64_copysign(_a: Int, _b: Int) -> Int {
-  todo
+/// `f64.copysign(a, b)` — magnitude (and NaN payload) of `a` with the sign of `b`. PURE
+/// sign-bit op; does NOT canonicalize NaN. Bit pattern.
+pub fn f64_copysign(a: Int, b: Int) -> Int {
+  case sign_of(f64_fmt, a) == sign_of(f64_fmt, b) {
+    True -> a
+    False -> flip_sign(f64_fmt, a)
+  }
 }
 
 // ── float comparisons → i32 truth value (0/1) ────────────────────────────────
 
 /// `f32.eq` — ordered equality (`+0 == -0`; any NaN → `0`). Returns `1`/`0`.
-pub fn f32_eq(_a: Int, _b: Int) -> Int {
-  todo
+pub fn f32_eq(a: Int, b: Int) -> Int {
+  f_eq(f32_fmt, a, b)
 }
 
 /// `f32.ne` — ordered/unordered inequality (any NaN → `1`). Returns `1`/`0`.
-pub fn f32_ne(_a: Int, _b: Int) -> Int {
-  todo
+pub fn f32_ne(a: Int, b: Int) -> Int {
+  f_ne(f32_fmt, a, b)
 }
 
 /// `f32.lt` — ordered less-than (NaN → `0`). Returns `1`/`0`.
-pub fn f32_lt(_a: Int, _b: Int) -> Int {
-  todo
+pub fn f32_lt(a: Int, b: Int) -> Int {
+  f_lt(f32_fmt, a, b)
 }
 
 /// `f32.gt` — ordered greater-than (NaN → `0`). Returns `1`/`0`.
-pub fn f32_gt(_a: Int, _b: Int) -> Int {
-  todo
+pub fn f32_gt(a: Int, b: Int) -> Int {
+  f_gt(f32_fmt, a, b)
 }
 
 /// `f32.le` — ordered less-than-or-equal (NaN → `0`). Returns `1`/`0`.
-pub fn f32_le(_a: Int, _b: Int) -> Int {
-  todo
+pub fn f32_le(a: Int, b: Int) -> Int {
+  f_le(f32_fmt, a, b)
 }
 
 /// `f32.ge` — ordered greater-than-or-equal (NaN → `0`). Returns `1`/`0`.
-pub fn f32_ge(_a: Int, _b: Int) -> Int {
-  todo
+pub fn f32_ge(a: Int, b: Int) -> Int {
+  f_ge(f32_fmt, a, b)
 }
 
-/// `f64.eq` — ordered equality. Returns `1`/`0`.
-pub fn f64_eq(_a: Int, _b: Int) -> Int {
-  todo
+/// `f64.eq` — ordered equality (`+0 == -0`; any NaN → `0`). Returns `1`/`0`.
+pub fn f64_eq(a: Int, b: Int) -> Int {
+  f_eq(f64_fmt, a, b)
 }
 
-/// `f64.ne` — ordered/unordered inequality. Returns `1`/`0`.
-pub fn f64_ne(_a: Int, _b: Int) -> Int {
-  todo
+/// `f64.ne` — ordered/unordered inequality (any NaN → `1`). Returns `1`/`0`.
+pub fn f64_ne(a: Int, b: Int) -> Int {
+  f_ne(f64_fmt, a, b)
 }
 
-/// `f64.lt` — ordered less-than. Returns `1`/`0`.
-pub fn f64_lt(_a: Int, _b: Int) -> Int {
-  todo
+/// `f64.lt` — ordered less-than (NaN → `0`). Returns `1`/`0`.
+pub fn f64_lt(a: Int, b: Int) -> Int {
+  f_lt(f64_fmt, a, b)
 }
 
-/// `f64.gt` — ordered greater-than. Returns `1`/`0`.
-pub fn f64_gt(_a: Int, _b: Int) -> Int {
-  todo
+/// `f64.gt` — ordered greater-than (NaN → `0`). Returns `1`/`0`.
+pub fn f64_gt(a: Int, b: Int) -> Int {
+  f_gt(f64_fmt, a, b)
 }
 
-/// `f64.le` — ordered less-than-or-equal. Returns `1`/`0`.
-pub fn f64_le(_a: Int, _b: Int) -> Int {
-  todo
+/// `f64.le` — ordered less-than-or-equal (NaN → `0`). Returns `1`/`0`.
+pub fn f64_le(a: Int, b: Int) -> Int {
+  f_le(f64_fmt, a, b)
 }
 
-/// `f64.ge` — ordered greater-than-or-equal. Returns `1`/`0`.
-pub fn f64_ge(_a: Int, _b: Int) -> Int {
-  todo
+/// `f64.ge` — ordered greater-than-or-equal (NaN → `0`). Returns `1`/`0`.
+pub fn f64_ge(a: Int, b: Int) -> Int {
+  f_ge(f64_fmt, a, b)
 }
 
 // ── TRAPPING float→int truncation → Result(Int, TrapReason) ──────────────────
@@ -1274,100 +1548,120 @@ pub fn f64_ge(_a: Int, _b: Int) -> Int {
 // truncated magnitude is out of the target's range; else `Ok(bits)` (truncate toward 0).
 // Distinct from the total saturating `*_trunc_sat_*` above.
 
-/// `i32.trunc_f32_s` — trapping signed f32 → i32.
-pub fn i32_trunc_f32_s(_a: Int) -> Result(Int, TrapReason) {
-  todo
+/// `i32.trunc_f32_s` — trapping signed f32 → i32. `Error(InvalidConversionToInteger)` on
+/// NaN/±Inf; `Error(IntOverflow)` if the toward-zero truncation is outside
+/// `[-2^31, 2^31-1]`; else `Ok(bits)` (the unsigned i32 bit pattern).
+pub fn i32_trunc_f32_s(a: Int) -> Result(Int, TrapReason) {
+  trunc_trap_s(f32_fmt, a, 32)
 }
 
-/// `i32.trunc_f32_u` — trapping unsigned f32 → i32.
-pub fn i32_trunc_f32_u(_a: Int) -> Result(Int, TrapReason) {
-  todo
+/// `i32.trunc_f32_u` — trapping unsigned f32 → i32. `Error(InvalidConversionToInteger)` on
+/// NaN/±Inf; `Error(IntOverflow)` if the truncation is outside `[0, 2^32-1]` (so any
+/// negative value traps); else `Ok(bits)`.
+pub fn i32_trunc_f32_u(a: Int) -> Result(Int, TrapReason) {
+  trunc_trap_u(f32_fmt, a, 32)
 }
 
-/// `i32.trunc_f64_s` — trapping signed f64 → i32.
-pub fn i32_trunc_f64_s(_a: Int) -> Result(Int, TrapReason) {
-  todo
+/// `i32.trunc_f64_s` — trapping signed f64 → i32. Same trap split as `i32_trunc_f32_s`.
+pub fn i32_trunc_f64_s(a: Int) -> Result(Int, TrapReason) {
+  trunc_trap_s(f64_fmt, a, 32)
 }
 
-/// `i32.trunc_f64_u` — trapping unsigned f64 → i32.
-pub fn i32_trunc_f64_u(_a: Int) -> Result(Int, TrapReason) {
-  todo
+/// `i32.trunc_f64_u` — trapping unsigned f64 → i32. Same trap split as `i32_trunc_f32_u`.
+pub fn i32_trunc_f64_u(a: Int) -> Result(Int, TrapReason) {
+  trunc_trap_u(f64_fmt, a, 32)
 }
 
-/// `i64.trunc_f32_s` — trapping signed f32 → i64.
-pub fn i64_trunc_f32_s(_a: Int) -> Result(Int, TrapReason) {
-  todo
+/// `i64.trunc_f32_s` — trapping signed f32 → i64. Range `[-2^63, 2^63-1]`; trap split as
+/// the i32 signed variant.
+pub fn i64_trunc_f32_s(a: Int) -> Result(Int, TrapReason) {
+  trunc_trap_s(f32_fmt, a, 64)
 }
 
-/// `i64.trunc_f32_u` — trapping unsigned f32 → i64.
-pub fn i64_trunc_f32_u(_a: Int) -> Result(Int, TrapReason) {
-  todo
+/// `i64.trunc_f32_u` — trapping unsigned f32 → i64. Range `[0, 2^64-1]`; trap split as the
+/// i32 unsigned variant.
+pub fn i64_trunc_f32_u(a: Int) -> Result(Int, TrapReason) {
+  trunc_trap_u(f32_fmt, a, 64)
 }
 
-/// `i64.trunc_f64_s` — trapping signed f64 → i64.
-pub fn i64_trunc_f64_s(_a: Int) -> Result(Int, TrapReason) {
-  todo
+/// `i64.trunc_f64_s` — trapping signed f64 → i64. Range `[-2^63, 2^63-1]`.
+pub fn i64_trunc_f64_s(a: Int) -> Result(Int, TrapReason) {
+  trunc_trap_s(f64_fmt, a, 64)
 }
 
-/// `i64.trunc_f64_u` — trapping unsigned f64 → i64.
-pub fn i64_trunc_f64_u(_a: Int) -> Result(Int, TrapReason) {
-  todo
+/// `i64.trunc_f64_u` — trapping unsigned f64 → i64. Range `[0, 2^64-1]`.
+pub fn i64_trunc_f64_u(a: Int) -> Result(Int, TrapReason) {
+  trunc_trap_u(f64_fmt, a, 64)
 }
 
 // ── int→float conversion → Int (round to nearest, ties to even). Never traps. ─
 // Operand is the raw integer bit pattern (interpreted signed for `*_s`, unsigned for
 // `*_u`); the result is the raw float bit pattern.
 
-/// `f32.convert_i32_s` — signed i32 → f32.
-pub fn f32_convert_i32_s(_a: Int) -> Int {
-  todo
+/// `f32.convert_i32_s` — signed i32 → f32 (operand read as two's-complement; round to
+/// nearest ties-to-even). Bit pattern.
+pub fn f32_convert_i32_s(a: Int) -> Int {
+  int_to_float(f32_fmt, signed(a, 32))
 }
 
-/// `f32.convert_i32_u` — unsigned i32 → f32.
-pub fn f32_convert_i32_u(_a: Int) -> Int {
-  todo
+/// `f32.convert_i32_u` — unsigned i32 → f32 (operand read as the raw value). Bit pattern.
+pub fn f32_convert_i32_u(a: Int) -> Int {
+  int_to_float(f32_fmt, a)
 }
 
-/// `f32.convert_i64_s` — signed i64 → f32.
-pub fn f32_convert_i64_s(_a: Int) -> Int {
-  todo
+/// `f32.convert_i64_s` — signed i64 → f32 (round to nearest ties-to-even; the f64
+/// intermediate yields the correctly single-rounded f32). Bit pattern.
+pub fn f32_convert_i64_s(a: Int) -> Int {
+  int_to_float(f32_fmt, signed(a, 64))
 }
 
-/// `f32.convert_i64_u` — unsigned i64 → f32.
-pub fn f32_convert_i64_u(_a: Int) -> Int {
-  todo
+/// `f32.convert_i64_u` — unsigned i64 → f32. Bit pattern.
+pub fn f32_convert_i64_u(a: Int) -> Int {
+  int_to_float(f32_fmt, a)
 }
 
-/// `f64.convert_i32_s` — signed i32 → f64.
-pub fn f64_convert_i32_s(_a: Int) -> Int {
-  todo
+/// `f64.convert_i32_s` — signed i32 → f64 (exact; `|v| < 2^31 < 2^53`). Bit pattern.
+pub fn f64_convert_i32_s(a: Int) -> Int {
+  int_to_float(f64_fmt, signed(a, 32))
 }
 
-/// `f64.convert_i32_u` — unsigned i32 → f64.
-pub fn f64_convert_i32_u(_a: Int) -> Int {
-  todo
+/// `f64.convert_i32_u` — unsigned i32 → f64 (exact). Bit pattern.
+pub fn f64_convert_i32_u(a: Int) -> Int {
+  int_to_float(f64_fmt, a)
 }
 
-/// `f64.convert_i64_s` — signed i64 → f64.
-pub fn f64_convert_i64_s(_a: Int) -> Int {
-  todo
+/// `f64.convert_i64_s` — signed i64 → f64 (round to nearest ties-to-even). Bit pattern.
+pub fn f64_convert_i64_s(a: Int) -> Int {
+  int_to_float(f64_fmt, signed(a, 64))
 }
 
-/// `f64.convert_i64_u` — unsigned i64 → f64.
-pub fn f64_convert_i64_u(_a: Int) -> Int {
-  todo
+/// `f64.convert_i64_u` — unsigned i64 → f64 (round to nearest ties-to-even). Bit pattern.
+pub fn f64_convert_i64_u(a: Int) -> Int {
+  int_to_float(f64_fmt, a)
 }
 
 // ── float width changes → Int (raw bits) ─────────────────────────────────────
 
-/// `f32.demote_f64` — narrow an f64 to f32 (round to nearest, ties to even; overflow →
-/// ±Inf; NaN → canonical f32 NaN). Returns the f32 bit pattern.
-pub fn f32_demote_f64(_a: Int) -> Int {
-  todo
+/// `f32.demote_f64` — narrow an f64 to f32. NaN → canonical f32 NaN; `±Inf`/`±0` keep
+/// their kind+sign; a finite f64 is round-to-single (ties-to-even) and may OVERFLOW to
+/// `±Inf` (the 32-bit float construct saturates without raising). Returns the f32 bits.
+pub fn f32_demote_f64(a: Int) -> Int {
+  case classify(f64_fmt, a) {
+    CNan -> canonical_nan(f32_fmt)
+    CInf(s) -> float_inf(f32_fmt, s)
+    CZero(s) -> float_zero(f32_fmt, s)
+    CFinite(_) -> f32_round_to_bits(bits_to_f64(a))
+  }
 }
 
-/// `f64.promote_f32` — widen an f32 to f64 (exact; NaN → canonical f64 NaN). Returns the
-/// f64 bit pattern.
-pub fn f64_promote_f32(_a: Int) -> Int {
-  todo
+/// `f64.promote_f32` — widen an f32 to f64. NaN (incl. signaling) → quiet canonical f64
+/// NaN under the lock; `±Inf`/`±0` keep their kind+sign; every finite f32 is EXACTLY
+/// representable in f64 (no rounding). Returns the f64 bits.
+pub fn f64_promote_f32(a: Int) -> Int {
+  case classify(f32_fmt, a) {
+    CNan -> canonical_nan(f64_fmt)
+    CInf(s) -> float_inf(f64_fmt, s)
+    CZero(s) -> float_zero(f64_fmt, s)
+    CFinite(_) -> f64_to_bits(bits_to_f32(a))
+  }
 }
