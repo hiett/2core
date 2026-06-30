@@ -7,9 +7,16 @@
 //// from untrusted input (overview D4, D5). LEB128 numbers are validated against
 //// the spec's width bounds (no silent wraparound).
 ////
-//// Scope: preamble, the type(1), function(3), export(7) and code(10) sections.
-//// Custom(0) and every other section are SKIPPED safely via their declared size.
-//// Lowering/validation are Unit 10; this module only decodes.
+//// Scope (Phase 2 — `«WASM-AST2»`): the preamble plus the type(1), table(4),
+//// memory(5), global(6), function(3), export(7), start(8), element(9), code(10)
+//// and data(11) sections, and the full WASM 1.0 opcode set (the load/store
+//// matrix, `memory.size`/`memory.grow`, the `0xA7..0xBF` int+float conversion
+//// block, and the float arithmetic/comparison ops). The import(2) section (and
+//// custom(0)) are SKIPPED safely via their declared size — non-function imports
+//// are deferred to Phase 3. Reference-types / bulk-memory / multi-memory forms
+//// (`select_t`, externref, passive element/data, the memory64 limits/memarg
+//// encodings) are decode-rejected with a typed error. Lowering/validation are
+//// units 08/09; this module only decodes structure (no semantic checks).
 ////
 //// The decoder uses Gleam's (Erlang-target) bit syntax throughout, so this
 //// module is Erlang-target-only. Spec references are cited inline.
@@ -22,10 +29,12 @@
 
 import gleam/bit_array
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import twocore/frontend/wasm/ast.{
-  type BlockType, type Export, type Func, type FuncType, type Instr, type Module,
-  type ValType,
+  type BlockType, type DataSegment, type ElementSegment, type Export, type Func,
+  type FuncType, type Global, type Instr, type Limits, type MemArg, type MemType,
+  type Module, type TableType, type ValType,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,14 +168,31 @@ fn two_pow(n: Int) -> Int {
 type DecodeState {
   DecodeState(
     types: List(FuncType),
+    tables: List(TableType),
+    memories: List(MemType),
+    globals: List(Global),
     func_type_idxs: List(Int),
+    start: Option(Int),
+    elements: List(ElementSegment),
+    data: List(DataSegment),
     exports: List(Export),
     codes: List(#(List(ValType), List(Instr))),
   )
 }
 
 fn empty_state() -> DecodeState {
-  DecodeState(types: [], func_type_idxs: [], exports: [], codes: [])
+  DecodeState(
+    types: [],
+    tables: [],
+    memories: [],
+    globals: [],
+    func_type_idxs: [],
+    start: None,
+    elements: [],
+    data: [],
+    exports: [],
+    codes: [],
+  )
 }
 
 /// Decode a complete `.wasm` binary into the AST.
@@ -242,8 +268,8 @@ fn decode_sections(
 }
 
 /// Run the sub-decoder for a known in-scope section over its exact `contents`
-/// slice, asserting full consumption (`SectionSizeMismatch` on under-run). Known
-/// out-of-scope sections (import/table/memory/global/start/element/data) are
+/// slice, asserting full consumption (`SectionSizeMismatch` on under-run). The
+/// import section (2) stays out of scope (non-function imports → Phase 3) and is
 /// skipped by discarding `contents`.
 fn dispatch_section(
   id: Int,
@@ -251,11 +277,29 @@ fn dispatch_section(
   state: DecodeState,
 ) -> Result(DecodeState, ast.DecodeError) {
   case id {
-    // type section
+    // type section: vec(functype)
     1 -> {
       use #(types, rest) <- result.try(decode_vec(contents, decode_functype))
       use _ <- result.try(expect_empty(rest))
       Ok(DecodeState(..state, types: types))
+    }
+    // table section: vec(tabletype)
+    4 -> {
+      use #(tables, rest) <- result.try(decode_vec(contents, decode_tabletype))
+      use _ <- result.try(expect_empty(rest))
+      Ok(DecodeState(..state, tables: tables))
+    }
+    // memory section: vec(memtype)
+    5 -> {
+      use #(memories, rest) <- result.try(decode_vec(contents, decode_memtype))
+      use _ <- result.try(expect_empty(rest))
+      Ok(DecodeState(..state, memories: memories))
+    }
+    // global section: vec(global)
+    6 -> {
+      use #(globals, rest) <- result.try(decode_vec(contents, decode_global))
+      use _ <- result.try(expect_empty(rest))
+      Ok(DecodeState(..state, globals: globals))
     }
     // function section: vec(typeidx)
     3 -> {
@@ -265,20 +309,38 @@ fn dispatch_section(
       use _ <- result.try(expect_empty(rest))
       Ok(DecodeState(..state, func_type_idxs: idxs))
     }
-    // export section
+    // export section: vec(export)
     7 -> {
       use #(exports, rest) <- result.try(decode_vec(contents, decode_export))
       use _ <- result.try(expect_empty(rest))
       Ok(DecodeState(..state, exports: exports))
     }
-    // code section
+    // start section: a single funcidx
+    8 -> {
+      use #(idx, rest) <- result.try(decode_u_n(contents, 32))
+      use _ <- result.try(expect_empty(rest))
+      Ok(DecodeState(..state, start: Some(idx)))
+    }
+    // element section: vec(elem)
+    9 -> {
+      use #(elements, rest) <- result.try(decode_vec(contents, decode_elemseg))
+      use _ <- result.try(expect_empty(rest))
+      Ok(DecodeState(..state, elements: elements))
+    }
+    // code section: vec(code)
     10 -> {
       use #(codes, rest) <- result.try(decode_vec(contents, decode_code))
       use _ <- result.try(expect_empty(rest))
       Ok(DecodeState(..state, codes: codes))
     }
-    // import(2) table(4) memory(5) global(6) start(8) element(9) data(11):
-    // out of scope for Phase 1 — already sliced by the caller, so just drop.
+    // data section: vec(data)
+    11 -> {
+      use #(data, rest) <- result.try(decode_vec(contents, decode_dataseg))
+      use _ <- result.try(expect_empty(rest))
+      Ok(DecodeState(..state, data: data))
+    }
+    // import(2) (non-function imports → Phase 3) and any unknown id: already
+    // sliced by the caller, so just drop the contents.
     _ -> Ok(state)
   }
 }
@@ -300,7 +362,13 @@ fn assemble(state: DecodeState) -> Result(Module, ast.DecodeError) {
   Ok(ast.Module(
     imported_func_count: 0,
     types: state.types,
+    tables: state.tables,
+    memories: state.memories,
+    globals: state.globals,
     funcs: funcs,
+    start: state.start,
+    elements: state.elements,
+    data: state.data,
     exports: state.exports,
   ))
 }
@@ -420,6 +488,179 @@ fn decode_export(
       use #(index, rest) <- result.try(decode_u_n(after_kind, 32))
       Ok(#(ast.Export(name: name, kind: kind, index: index), rest))
     }
+    _ -> Error(ast.Truncated)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Section 4/5/6/9/11 leaf decoders (table / memory / global / element / data)
+// ---------------------------------------------------------------------------
+
+/// Decode a `limits` (spec binary/types.html): flag `0x00` → `Limits(min, None)`;
+/// flag `0x01` → `Limits(min, Some(max))`; `min`/`max` are `u32`. Any other flag
+/// (e.g. the memory64 `0x04`/`0x05` forms) is `Error(ast.BadLimitsFlag)`. The
+/// spec bound `min <= max` is NOT checked here — that is validate's job.
+fn decode_limits(
+  bytes: BitArray,
+) -> Result(#(Limits, BitArray), ast.DecodeError) {
+  case bytes {
+    <<flag:8, after_flag:bytes>> ->
+      case flag {
+        0x00 -> {
+          use #(min, rest) <- result.try(decode_u_n(after_flag, 32))
+          Ok(#(ast.Limits(min: min, max: None), rest))
+        }
+        0x01 -> {
+          use #(min, r1) <- result.try(decode_u_n(after_flag, 32))
+          use #(max, r2) <- result.try(decode_u_n(r1, 32))
+          Ok(#(ast.Limits(min: min, max: Some(max)), r2))
+        }
+        _ -> Error(ast.BadLimitsFlag)
+      }
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Decode one `tabletype` = `reftype limits`. The reftype byte must be `funcref`
+/// (`0x70`); `externref` (`0x6F`) and anything else are `Error(ast.BadRefType)`.
+fn decode_tabletype(
+  bytes: BitArray,
+) -> Result(#(TableType, BitArray), ast.DecodeError) {
+  case bytes {
+    <<reftype:8, after_ref:bytes>> ->
+      case reftype {
+        0x70 -> {
+          use #(limits, rest) <- result.try(decode_limits(after_ref))
+          Ok(#(ast.TableType(limits: limits), rest))
+        }
+        _ -> Error(ast.BadRefType)
+      }
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Decode one `memtype` = `limits` (in 64KiB pages).
+fn decode_memtype(
+  bytes: BitArray,
+) -> Result(#(MemType, BitArray), ast.DecodeError) {
+  use #(limits, rest) <- result.try(decode_limits(bytes))
+  Ok(#(ast.MemType(limits: limits), rest))
+}
+
+/// Decode one `global` = `valtype mut const-expr`. The `mut` byte is `0x00`
+/// (const → `False`) or `0x01` (var → `True`); anything else is
+/// `Error(ast.BadMutability)`. The const-expr is decoded structurally
+/// (`decode_const_expr`); its const-ness is validate's job.
+fn decode_global(
+  bytes: BitArray,
+) -> Result(#(Global, BitArray), ast.DecodeError) {
+  use #(ty, after_ty) <- result.try(decode_valtype(bytes))
+  case after_ty {
+    <<mut_byte:8, after_mut:bytes>> -> {
+      use mutable <- result.try(case mut_byte {
+        0x00 -> Ok(False)
+        0x01 -> Ok(True)
+        _ -> Error(ast.BadMutability)
+      })
+      use #(init, rest) <- result.try(decode_const_expr(after_mut))
+      Ok(#(ast.Global(ty: ty, mutable: mutable, init: init), rest))
+    }
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Decode a constant expression: an instruction sequence terminated by a depth-0
+/// `End` (`0x0B`), block-nesting tracked exactly like `decode_expr`. Returns the
+/// instructions BEFORE that terminating `End` (the `End` is consumed, not
+/// stored). PURELY STRUCTURAL — it does not reject non-const opcodes (the
+/// const-expr restriction is validate's, unit 08). Total over any bytes.
+fn decode_const_expr(
+  bytes: BitArray,
+) -> Result(#(List(Instr), BitArray), ast.DecodeError) {
+  decode_const_go(bytes, 0, [])
+}
+
+fn decode_const_go(
+  bytes: BitArray,
+  depth: Int,
+  acc: List(Instr),
+) -> Result(#(List(Instr), BitArray), ast.DecodeError) {
+  use #(instr, rest) <- result.try(decode_instr(bytes))
+  case instr {
+    ast.End ->
+      case depth {
+        0 -> Ok(#(list.reverse(acc), rest))
+        _ -> decode_const_go(rest, depth - 1, [ast.End, ..acc])
+      }
+    ast.Block(_) | ast.Loop(_) | ast.If(_) ->
+      decode_const_go(rest, depth + 1, [instr, ..acc])
+    _ -> decode_const_go(rest, depth, [instr, ..acc])
+  }
+}
+
+/// Decode one ACTIVE element segment. Only the legacy flag-`0` form is in scope:
+/// `0x00 offset-expr vec(funcidx)` → `ElementSegment(table: 0, …)`. Any other
+/// leading flag (passive/declarative/expr-list, 1–7) is `Error(ast.BadElemKind)`.
+fn decode_elemseg(
+  bytes: BitArray,
+) -> Result(#(ElementSegment, BitArray), ast.DecodeError) {
+  case bytes {
+    <<flag:8, after_flag:bytes>> ->
+      case flag {
+        0x00 -> {
+          use #(offset, r1) <- result.try(decode_const_expr(after_flag))
+          use #(funcs, r2) <- result.try(
+            decode_vec(r1, fn(b) { decode_u_n(b, 32) }),
+          )
+          Ok(#(ast.ElementSegment(table: 0, offset: offset, funcs: funcs), r2))
+        }
+        _ -> Error(ast.BadElemKind)
+      }
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Decode one ACTIVE data segment. Forms in scope: `0x00 offset-expr vec(byte)`
+/// (memory 0); `0x02 memidx offset-expr vec(byte)` where `memidx` MUST be `0`
+/// (else `Error(ast.BadMemoryIndex)`). The passive form `0x01` and anything else
+/// are `Error(ast.BadDataKind)`.
+fn decode_dataseg(
+  bytes: BitArray,
+) -> Result(#(DataSegment, BitArray), ast.DecodeError) {
+  case bytes {
+    <<form:8, after_form:bytes>> ->
+      case form {
+        0x00 -> {
+          use #(offset, r1) <- result.try(decode_const_expr(after_form))
+          use #(payload, r2) <- result.try(decode_vec_bytes(r1))
+          Ok(#(ast.DataSegment(mem: 0, offset: offset, bytes: payload), r2))
+        }
+        0x02 -> {
+          use #(memidx, r1) <- result.try(decode_u_n(after_form, 32))
+          case memidx == 0 {
+            False -> Error(ast.BadMemoryIndex)
+            True -> {
+              use #(offset, r2) <- result.try(decode_const_expr(r1))
+              use #(payload, r3) <- result.try(decode_vec_bytes(r2))
+              Ok(#(ast.DataSegment(mem: 0, offset: offset, bytes: payload), r3))
+            }
+          }
+        }
+        _ -> Error(ast.BadDataKind)
+      }
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Decode a `vec(byte)` = `[u32 count][count raw bytes]` into a `BitArray`. An
+/// oversized `count` (more than the remaining bytes) fails the slice match and is
+/// reported `Error(ast.Truncated)` (fail-closed; never over-reads).
+fn decode_vec_bytes(
+  bytes: BitArray,
+) -> Result(#(BitArray, BitArray), ast.DecodeError) {
+  use #(count, rest) <- result.try(decode_u_n(bytes, 32))
+  case rest {
+    <<payload:size(count)-bytes, tail:bytes>> -> Ok(#(payload, tail))
     _ -> Error(ast.Truncated)
   }
 }
@@ -572,12 +813,43 @@ fn decode_instr(
         // parametric
         0x1A -> Ok(#(ast.Drop, rest))
         0x1B -> Ok(#(ast.Select, rest))
+        // `select_t` (typed select) is a reference-types op, deferred to Phase 3;
+        // reject rather than half-decode its valtype-vector immediate.
+        0x1C -> Error(ast.UnknownOpcode(0x1C))
         // variable access
         0x20 -> idx_instr(rest, ast.LocalGet)
         0x21 -> idx_instr(rest, ast.LocalSet)
         0x22 -> idx_instr(rest, ast.LocalTee)
         0x23 -> idx_instr(rest, ast.GlobalGet)
         0x24 -> idx_instr(rest, ast.GlobalSet)
+        // memory load/store (0x28..0x3E): each followed by a `memarg`.
+        0x28 -> memarg_instr(rest, ast.I32Load)
+        0x29 -> memarg_instr(rest, ast.I64Load)
+        0x2A -> memarg_instr(rest, ast.F32Load)
+        0x2B -> memarg_instr(rest, ast.F64Load)
+        0x2C -> memarg_instr(rest, ast.I32Load8S)
+        0x2D -> memarg_instr(rest, ast.I32Load8U)
+        0x2E -> memarg_instr(rest, ast.I32Load16S)
+        0x2F -> memarg_instr(rest, ast.I32Load16U)
+        0x30 -> memarg_instr(rest, ast.I64Load8S)
+        0x31 -> memarg_instr(rest, ast.I64Load8U)
+        0x32 -> memarg_instr(rest, ast.I64Load16S)
+        0x33 -> memarg_instr(rest, ast.I64Load16U)
+        0x34 -> memarg_instr(rest, ast.I64Load32S)
+        0x35 -> memarg_instr(rest, ast.I64Load32U)
+        0x36 -> memarg_instr(rest, ast.I32Store)
+        0x37 -> memarg_instr(rest, ast.I64Store)
+        0x38 -> memarg_instr(rest, ast.F32Store)
+        0x39 -> memarg_instr(rest, ast.F64Store)
+        0x3A -> memarg_instr(rest, ast.I32Store8)
+        0x3B -> memarg_instr(rest, ast.I32Store16)
+        0x3C -> memarg_instr(rest, ast.I64Store8)
+        0x3D -> memarg_instr(rest, ast.I64Store16)
+        0x3E -> memarg_instr(rest, ast.I64Store32)
+        // memory.size/grow (0x3F/0x40): a single reserved `0x00` mem-index byte
+        // (NOT a memarg). A non-zero reserved byte is `BadMemoryIndex`.
+        0x3F -> mem_index_instr(rest, ast.MemorySize)
+        0x40 -> mem_index_instr(rest, ast.MemoryGrow)
         // constants
         0x41 -> {
           use #(v, r) <- result.try(decode_s_n(rest, 32))
@@ -629,6 +901,34 @@ fn idx_instr(
 ) -> Result(#(Instr, BitArray), ast.DecodeError) {
   use #(i, r) <- result.try(decode_u_n(bytes, 32))
   Ok(#(make(i), r))
+}
+
+/// Decode a `memarg = align:u32 offset:u32` and wrap it with `make` (every
+/// load/store opcode `0x28`..`0x3E`). BOTH `u32`s are read; `align` is kept for
+/// validate's `2^align <= N` check (non-semantic), `offset` is the static byte
+/// offset. `Error(ast.Truncated)`/LEB errors if either number is malformed.
+fn memarg_instr(
+  bytes: BitArray,
+  make: fn(MemArg) -> Instr,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  use #(align, r1) <- result.try(decode_u_n(bytes, 32))
+  use #(offset, r2) <- result.try(decode_u_n(r1, 32))
+  Ok(#(make(ast.MemArg(align: align, offset: offset)), r2))
+}
+
+/// Decode the single reserved memory-index byte of `memory.size`/`memory.grow`
+/// (NOT a memarg) and yield the bare `instr`. The byte MUST be `0x00` (MVP allows
+/// only memory 0); a non-zero byte is `Error(ast.BadMemoryIndex)` and an absent
+/// byte is `Error(ast.Truncated)`.
+fn mem_index_instr(
+  bytes: BitArray,
+  instr: Instr,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  case bytes {
+    <<0x00, rest:bytes>> -> Ok(#(instr, rest))
+    <<_:8, _:bytes>> -> Error(ast.BadMemoryIndex)
+    _ -> Error(ast.Truncated)
+  }
 }
 
 /// Map a leaf opcode byte (comparison / numeric / sign-extension, all with NO
@@ -698,6 +998,75 @@ fn leaf_instr(op: Int) -> Result(Instr, Nil) {
     0x88 -> Ok(ast.I64ShrU)
     0x89 -> Ok(ast.I64Rotl)
     0x8A -> Ok(ast.I64Rotr)
+    // float comparisons 0x5B..0x66 (yield i32)
+    0x5B -> Ok(ast.F32Eq)
+    0x5C -> Ok(ast.F32Ne)
+    0x5D -> Ok(ast.F32Lt)
+    0x5E -> Ok(ast.F32Gt)
+    0x5F -> Ok(ast.F32Le)
+    0x60 -> Ok(ast.F32Ge)
+    0x61 -> Ok(ast.F64Eq)
+    0x62 -> Ok(ast.F64Ne)
+    0x63 -> Ok(ast.F64Lt)
+    0x64 -> Ok(ast.F64Gt)
+    0x65 -> Ok(ast.F64Le)
+    0x66 -> Ok(ast.F64Ge)
+    // f32 numeric 0x8B..0x98
+    0x8B -> Ok(ast.F32Abs)
+    0x8C -> Ok(ast.F32Neg)
+    0x8D -> Ok(ast.F32Ceil)
+    0x8E -> Ok(ast.F32Floor)
+    0x8F -> Ok(ast.F32Trunc)
+    0x90 -> Ok(ast.F32Nearest)
+    0x91 -> Ok(ast.F32Sqrt)
+    0x92 -> Ok(ast.F32Add)
+    0x93 -> Ok(ast.F32Sub)
+    0x94 -> Ok(ast.F32Mul)
+    0x95 -> Ok(ast.F32Div)
+    0x96 -> Ok(ast.F32Min)
+    0x97 -> Ok(ast.F32Max)
+    0x98 -> Ok(ast.F32Copysign)
+    // f64 numeric 0x99..0xA6
+    0x99 -> Ok(ast.F64Abs)
+    0x9A -> Ok(ast.F64Neg)
+    0x9B -> Ok(ast.F64Ceil)
+    0x9C -> Ok(ast.F64Floor)
+    0x9D -> Ok(ast.F64Trunc)
+    0x9E -> Ok(ast.F64Nearest)
+    0x9F -> Ok(ast.F64Sqrt)
+    0xA0 -> Ok(ast.F64Add)
+    0xA1 -> Ok(ast.F64Sub)
+    0xA2 -> Ok(ast.F64Mul)
+    0xA3 -> Ok(ast.F64Div)
+    0xA4 -> Ok(ast.F64Min)
+    0xA5 -> Ok(ast.F64Max)
+    0xA6 -> Ok(ast.F64Copysign)
+    // conversion block 0xA7..0xBF (int + float interleaved)
+    0xA7 -> Ok(ast.I32WrapI64)
+    0xA8 -> Ok(ast.I32TruncF32S)
+    0xA9 -> Ok(ast.I32TruncF32U)
+    0xAA -> Ok(ast.I32TruncF64S)
+    0xAB -> Ok(ast.I32TruncF64U)
+    0xAC -> Ok(ast.I64ExtendI32S)
+    0xAD -> Ok(ast.I64ExtendI32U)
+    0xAE -> Ok(ast.I64TruncF32S)
+    0xAF -> Ok(ast.I64TruncF32U)
+    0xB0 -> Ok(ast.I64TruncF64S)
+    0xB1 -> Ok(ast.I64TruncF64U)
+    0xB2 -> Ok(ast.F32ConvertI32S)
+    0xB3 -> Ok(ast.F32ConvertI32U)
+    0xB4 -> Ok(ast.F32ConvertI64S)
+    0xB5 -> Ok(ast.F32ConvertI64U)
+    0xB6 -> Ok(ast.F32DemoteF64)
+    0xB7 -> Ok(ast.F64ConvertI32S)
+    0xB8 -> Ok(ast.F64ConvertI32U)
+    0xB9 -> Ok(ast.F64ConvertI64S)
+    0xBA -> Ok(ast.F64ConvertI64U)
+    0xBB -> Ok(ast.F64PromoteF32)
+    0xBC -> Ok(ast.I32ReinterpretF32)
+    0xBD -> Ok(ast.I64ReinterpretF64)
+    0xBE -> Ok(ast.F32ReinterpretI32)
+    0xBF -> Ok(ast.F64ReinterpretI64)
     // sign extension 0xC0..0xC4
     0xC0 -> Ok(ast.I32Extend8S)
     0xC1 -> Ok(ast.I32Extend16S)

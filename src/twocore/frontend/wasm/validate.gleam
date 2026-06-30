@@ -568,10 +568,19 @@ fn validate_br_table(
 
 /// Type-check a numeric / comparison / sign-extension / saturating-truncation
 /// instruction by its fixed operand→result signature (spec: the numeric typing rules;
-/// comparisons yield i32; `i*.eqz`/unary keep one operand). Any instruction reaching
-/// here that is not numeric is unreachable (the decoder only emits the Phase-1 set).
+/// comparisons yield i32; `i*.eqz`/unary keep one operand).
+///
+/// TRANSITIONAL (unit-07 reach): the Phase-2 memory / float / conversion opcodes are
+/// now DECODED (unit 07) but their typing rules belong to unit 08. They route here and
+/// fall through `numeric_sig` to its sentinel `#([], [])` (no Phase-1 numeric op has an
+/// empty signature). Until unit 08 types them, they are REJECTED fail-closed
+/// (`Unsupported`) rather than silently accepted as no-ops — so the security boundary
+/// never waves through an un-typed op. Unit 08 replaces this by adding real arms to
+/// `numeric_sig` (and dedicated `validate_instr` cases for memory/global ops).
 fn validate_numeric(st: VState, instr: Instr) -> Result(VState, ValidateError) {
   case numeric_sig(instr) {
+    #([], []) ->
+      Error(Unsupported("phase-2 op decoded but not yet typed (unit 08)"))
     #(ins, outs) -> {
       use st2 <- result.try(pop_vals(st, ins))
       Ok(push_vals(st2, outs))

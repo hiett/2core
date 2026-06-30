@@ -102,7 +102,7 @@ Unsafe profile are all **Phase 3** (deferred, not dropped).
 | `«IR2-FROZEN»` — `ir.gleam` tables/elem + MemSize/MemGrow + load result-width + float NumOp/ConvOp + 3 TrapReasons + grammar delta | P2-01 | **FROZEN ✓** | 02, 08, 09, 10 |
 | `«CELL-STATE-ABI-FROZEN»` — Binding (mem/table/state) + rt_state/rt_mem/rt_table stub sigs + the emit_core state-access seam + the instantiation contract | P2-01 | **FROZEN ✓** | 03, 04, 05, 10, 11 |
 | `«RTNUM2-SIG-FROZEN»` — new rt_num float/convert signatures (`todo`) | P2-01 | **FROZEN ✓** | 06, 10 |
-| `«WASM-AST2»` — extended `frontend/wasm/ast.gleam` types | P2-07 (day 1) | `unclaimed` | 08 (validate) |
+| `«WASM-AST2»` — extended `frontend/wasm/ast.gleam` types | P2-07 (day 1) | **published ✓** | 08 (validate) |
 
 ### Phase-2 units
 
@@ -114,7 +114,7 @@ Unsafe profile are all **Phase 3** (deferred, not dropped).
 | **P2-04** rt_mem (paged + oracle) | [`04`](phase-2/04-rt-mem.md) | **done** | `«CELL-STATE-ABI-FROZEN»` | Bounds-checked (no-wrap, trap-before-write) LE load/store/size/grow + data-init + Safe max-pages cap; rebuild-oracle differential + memory_trap/address/endianness `.wast`. |
 | **P2-05** rt_table + call_indirect | [`05`](phase-2/05-rt-table.md) | **done** | `«CELL-STATE-ABI-FROZEN»` | 3-fault fail-closed indirect dispatch (build-controlled, no ambient apply) + element-init. |
 | **P2-06** rt_num float ext | [`06`](phase-2/06-rt-num-floats.md) | **done** | `«RTNUM2-SIG-FROZEN»` | The remaining float bodies (unary, copysign, comparisons, trapping trunc, convert, demote/promote), spec-corner tested. |
-| **P2-07** decode ext (+ `«WASM-AST2»`) | [`07`](phase-2/07-decode.md) | `unclaimed` | — | Decode table/memory/global/element/data/start sections + the full opcode set (load/store matrix, size/grow, 0xA7–0xBF conversions, floats, select, global/table ops). |
+| **P2-07** decode ext (+ `«WASM-AST2»`) | [`07`](phase-2/07-decode.md) | **done** | — | Decode table/memory/global/element/data/start sections + the full opcode set (load/store matrix, size/grow, 0xA7–0xBF conversions, floats, select, global/table ops). |
 | **P2-08** validate ext | [`08`](phase-2/08-validate.md) | `unclaimed` | `«WASM-AST2»` | Typing for all new ops + memarg alignment + const-expr validation (AST-only security boundary). |
 | **P2-09** lower ext | [`09`](phase-2/09-lower.md) | `unclaimed` | `«WASM-AST2»`, `«IR2-FROZEN»` | WASM AST → IR2 for memory/table/global/float/select/conversions + active data/element/global-init. |
 | **P2-10** emit_core ext + instantiate entry | [`10`](phase-2/10-emit-core.md) | `unclaimed` | `«IR2-FROZEN»`,`«CELL-STATE-ABI-FROZEN»`,`«RTNUM2-SIG-FROZEN»` (∥ 03–06) | Lower the stateful ops via the seam + trapping converts + the generated `instantiate/N`; extended security-invariant test. |
