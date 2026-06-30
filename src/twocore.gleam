@@ -1,5 +1,5 @@
 import gleam/io
 
 pub fn main() -> Nil {
-  io.println("Hello from wasm2core!")
+  io.println("Hello from 2core!")
 }

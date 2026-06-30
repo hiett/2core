@@ -1,20 +1,20 @@
-# wasm2core
+# 2core
 
-[![Package Version](https://img.shields.io/hexpm/v/wasm2core)](https://hex.pm/packages/wasm2core)
-[![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/wasm2core/)
+[![Package Version](https://img.shields.io/hexpm/v/twocore)](https://hex.pm/packages/twocore)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/twocore/)
 
 ```sh
-gleam add wasm2core@1
+gleam add twocore@1
 ```
 ```gleam
-import wasm2core
+import twocore
 
 pub fn main() -> Nil {
   // TODO: An example of the project in use
 }
 ```
 
-Further documentation can be found at <https://hexdocs.pm/wasm2core>.
+Further documentation can be found at <https://hexdocs.pm/twocore>.
 
 ## Development
 

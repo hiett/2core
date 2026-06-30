@@ -148,7 +148,7 @@ This is the project's central piece of luck: WASM control flow is *already struc
 **Why partial boundary:** two sandbox invariants are *codegen invariants* — every memory/table op must route through the backend (never a raw term op), and no instruction may lower to an open `apply` of an attacker-chosen module/atom (no ambient authority). These must hold in every emitter implementation.
 
 ### [D] Driver — `wasm_build`
-**Contract:** `build(CoreErlangArtifact) -> Result(BeamModule, BuildError)`. Via Gleam `@external` FFI to a thin `wasm2core_ffi.erl` shim wrapping `compile:forms/2`/`compile:file/2` (with `from_core`) and `file`. Implementations: `forms` (in-process) or `file` (emit `.core`, shell `erlc`). Mechanism axis; not a boundary.
+**Contract:** `build(CoreErlangArtifact) -> Result(BeamModule, BuildError)`. Via Gleam `@external` FFI to a thin `twocore_ffi.erl` shim wrapping `compile:forms/2`/`compile:file/2` (with `from_core`) and `file`. Implementations: `forms` (in-process) or `file` (emit `.core`, shell `erlc`). Mechanism axis; not a boundary.
 
 ---
 
@@ -239,7 +239,7 @@ State proposal in/out decisions explicitly; "WASM" is not one fixed target.
 
 ## 10. Work breakdown (interface-first, for the swarm)
 
-**Wave 0 — define every interface (do first, unblocks everything).** Write the contracts: `wasm_frontend`, `wasm_validate`, `wasm_ssa`, `wasm_cfg_lower`, `wasm_emit` (+ its config sub-axes), `wasm_build`; and the Erlang behaviours `wasmrt_mem`, `wasmrt_table`, `wasmrt_state`, `wasmrt_num`, `wasmrt_trap`, `wasmrt_host`, `wasmrt_meter`, `wasmrt_instance`. Plus **W0-scaffold** — Gleam project, `wasm2core_ffi.erl`, the build driver. Once interfaces exist, implementations parallelize with no coordination.
+**Wave 0 — define every interface (do first, unblocks everything).** Write the contracts: `wasm_frontend`, `wasm_validate`, `wasm_ssa`, `wasm_cfg_lower`, `wasm_emit` (+ its config sub-axes), `wasm_build`; and the Erlang behaviours `wasmrt_mem`, `wasmrt_table`, `wasmrt_state`, `wasmrt_num`, `wasmrt_trap`, `wasmrt_host`, `wasmrt_meter`, `wasmrt_instance`. Plus **W0-scaffold** — Gleam project, `twocore_ffi.erl`, the build driver. Once interfaces exist, implementations parallelize with no coordination.
 
 **Then, each cell below is an independent work item** (interface conformance suite is the definition of done):
 
@@ -258,7 +258,7 @@ State proposal in/out decisions explicitly; "WASM" is not one fixed target.
 - **Metering:** `none`; `fuel`.
 - **Instantiation:** the linker + named trust profiles (`untrusted`, `trusted_fast`, …).
 - **Conformance harness:** spec `.wast` runner + differential engine; the per-interface suites. *Partitionable across many agents.*
-- **CLI/API:** `wasm2core source -> .core -> .beam`.
+- **CLI/API:** `twocore source -> .core -> .beam`.
 
 Critical path to a first end-to-end run: Wave-0 interfaces → `binary` front end → `full` validator → `baseline` SSA → `direct_letrec` lowering → emitter+printer → `forms` driver → `paged` memory + `threaded` state + `bif` numerics + `deny_all` imports. Everything else is breadth that lands in parallel.
 
