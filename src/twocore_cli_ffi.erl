@@ -28,33 +28,57 @@ catch_apply(Mod, Fun, Args) ->
             {error, unicode:characters_to_binary(io_lib:format("~0p", [Reason]))}
     end.
 
-%% ── one-instance-one-process run-ABI (unit 11, E1/E5) ───────────────────────
+%% ── one-instance-one-process run-ABI (unit 11 E1/E5; unit P4-08 threaded ABI) ─
 %%
-%% The instance's mutable state (memory page-map, mutable globals, table) lives in
-%% the process dictionary of ONE owned process (the `cell` strategy). So `run`'s
-%% `load → instantiate → invoke` must run instantiate/0 AND the invoke in that SAME
-%% process, or the export reads the caller's empty pdict. These three functions
-%% give `pipeline.gleam` that owned process (same shape as the conformance shim).
+%% One instance is ONE owned process. Two calling conventions, self-detected from
+%% `instantiate/0`'s RETURN value (unit P4-08 §C.2) — the run-ABI stays
+%% signature-stable, so `pipeline.gleam` never grows a `Binding` parameter:
+%%
+%%   * `Cell` (state_strategy: Cell — the Phase-2/3 default). The instance's mutable
+%%     state (memory page-map, mutable globals, table) lives in the process
+%%     DICTIONARY. `instantiate/0` seeds the cell and returns the atom `'ok'`; each
+%%     invoke applies `Module:Fun(Args)` in that same process (`instance_loop`), so
+%%     the export reads this instance's pdict cell and cross-invoke state persists.
+%%
+%%   * `Threaded` (state_strategy: Threaded — the tier-P runs-anywhere build). The
+%%     instance state travels as a PURELY-FUNCTIONAL `InstanceState` record (Gleam
+%%     tuple `{instance_state, Mem, Globals, Table}`), never in the pdict.
+%%     `instantiate/0` RETURNS that record; each export presents the uniform threaded
+%%     ABI `Module:Fun(St, Args…) -> {Package, St'}` (unit 02). `threaded_loop`
+%%     HOLDS the record as a loop variable, passes it LEADING to every invoke,
+%%     extracts the `{Package, St'}` pair, and threads `St'` into the next invoke —
+%%     so state persists across invokes as a value, not in a cell. The harness needs
+%%     NO per-export arity/classification knowledge: every export is uniform.
 %%
 %%   start_instance(Module) -> {ok, Pid} | {error, Reason}   %% spawn + instantiate IN it
 %%   call_instance(Pid, Fun, Args) -> {ok, V} | {error, Reason}   %% apply IN it
-%%   stop_instance(Pid) -> nil.                              %% exit → cell auto-GC'd
+%%   stop_instance(Pid) -> nil.                              %% exit → cell/record GC'd
 
 %% Spawn the instance process and run instantiate/0 in it; block until it reports
-%% success or an instantiation-time trap.
+%% success or an instantiation-time trap. Discriminate the state strategy from the
+%% return value: the atom `'ok'` → the `Cell` loop; the `{instance_state,_,_,_}`
+%% record → the `Threaded` loop carrying that record. Any other shape is a
+%% fail-closed error (never assumed Cell).
 start_instance(Module) ->
     Parent = self(),
     Pid = spawn(fun() ->
         Outcome =
             try Module:instantiate() of
-                _ -> ok
+                Ret -> {ok, Ret}
             catch
                 _Class:Reason:Stack -> {error, render_reason(Reason, Stack)}
             end,
         case Outcome of
-            ok ->
+            {ok, ok} ->
                 Parent ! {started, self(), ok},
                 instance_loop(Module);
+            {ok, {instance_state, _, _, _} = St} ->
+                Parent ! {started, self(), ok},
+                threaded_loop(Module, St);
+            {ok, Other} ->
+                Parent ! {started, self(),
+                    {error, unicode:characters_to_binary(io_lib:format(
+                        "unexpected instantiate/0 return: ~0p", [Other]))}};
             {error, _} = Err ->
                 Parent ! {started, self(), Err}
         end
@@ -131,6 +155,58 @@ bench_loop(_M, _F, _A, 0, Last) -> Last;
 bench_loop(M, F, A, N, _) ->
     R = erlang:apply(M, F, A),
     bench_loop(M, F, A, N - 1, R).
+
+%% The `Threaded` instance loop (unit P4-08 §C). Holds the `InstanceState` record
+%% `St` as a loop variable. Every export presents the uniform threaded ABI
+%% `Module:Fun(St, Args…) -> {Package, St'}`: apply with `St` LEADING, extract the
+%% `{Package, St'}` pair, reply with `Package` (the same value shape the Cell loop
+%% returns — bare value / `'ok'` / N-tuple), and RECURSE carrying `St'`, so the next
+%% invoke sees the updated state (cross-invoke persistence as a value). A trap /
+%% capability-denial replies `{error, Reason}` and recurses with the UNCHANGED `St`
+%% (trap-before-write — the failed op mutated nothing).
+threaded_loop(Module, St) ->
+    receive
+        {invoke, Fun, Args, From, Ref} ->
+            Outcome =
+                try erlang:apply(Module, Fun, [St | Args]) of
+                    {Pkg, St2} -> {ok, Pkg, St2}
+                catch
+                    _Class:Reason -> {error, render_reason(Reason)}
+                end,
+            case Outcome of
+                {ok, Result, NextSt} ->
+                    From ! {result, Ref, {ok, Result}},
+                    threaded_loop(Module, NextSt);
+                {error, _} = Err ->
+                    From ! {result, Ref, Err},
+                    threaded_loop(Module, St)
+            end;
+        {bench, Fun, Args, N, From, Ref} ->
+            Outcome =
+                try
+                    T0 = erlang:monotonic_time(microsecond),
+                    {Last, StN} = threaded_bench_loop(Module, Fun, Args, N, undefined, St),
+                    T1 = erlang:monotonic_time(microsecond),
+                    {ok, T1 - T0, Last, StN}
+                catch
+                    _Class:Reason -> {error, render_reason(Reason)}
+                end,
+            case Outcome of
+                {ok, Micros, LastResult, NextSt} ->
+                    From ! {result, Ref, {ok, {Micros, LastResult}}},
+                    threaded_loop(Module, NextSt);
+                {error, _} = Err ->
+                    From ! {result, Ref, Err},
+                    threaded_loop(Module, St)
+            end;
+        stop ->
+            ok
+    end.
+
+threaded_bench_loop(_M, _F, _A, 0, Last, St) -> {Last, St};
+threaded_bench_loop(M, F, A, N, _, St) ->
+    {R, St2} = erlang:apply(M, F, [St | A]),
+    threaded_bench_loop(M, F, A, N - 1, R, St2).
 
 render_reason(Reason) ->
     unicode:characters_to_binary(io_lib:format("~0p", [Reason])).

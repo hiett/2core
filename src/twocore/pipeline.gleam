@@ -29,6 +29,36 @@
 //// > integer-bit-pattern contract is unchanged.
 ////
 //// See `specs/phase-1/00-overview.md` D4 and `specs/phase-1/11-ir-lower-linker-cli.md`.
+////
+//// ## Phase-4 binding-threading LOCK (unit P4-08 §A.1 — no new stage, no new axis reach)
+////
+//// Phase 4 adds **no new pipeline stage, no new IR node, and no new `PipelineError`
+//// variant** (G7). The two Phase-4 axes — `state_strategy` (`Cell`/`Threaded`) and
+//// `mem_tier`/`table_tier` (`Paged`/`Atomics`/`Nif` · …) — are **build-time fields on the
+//// one `Binding`** that already threads through every stage. The pipeline runs the **same
+//// five stages in the same order** regardless of them:
+////   `source_to_ir → lower_ir → optimize_ir → ir_to_core (emit_core) → core_to_beam`.
+//// **No stage branches on a Phase-4 axis.** The axes are consumed at exactly two points, both
+//// downstream of the stage graph:
+////   - **codegen** — `emit_core` reads `binding.state_strategy` (the one codegen-shape switch:
+////     the `Cell` pdict seam vs the `Threaded` record-threading seam) and the linker-resolved
+////     `binding.mem_module`/`table_module`/`state_module` **module names** (never `mem_tier`/
+////     `table_tier` — the tier is a build-time module swap the emitter never sees, G5); and
+////   - **run time** — the linked `twocore@runtime@rt_*` module implements the chosen tier.
+//// A tier/strategy **mismatch** is a *linker* rejection (`profiles.validate_binding`/`link`),
+//// surfaced **before** the pipeline runs (at the CLI's `resolve_binding`, `twocore.gleam`) —
+//// **not** a pipeline-stage error. So adding a tier is a runtime-module + `Binding`-field job,
+//// **never a pipeline edit**; this module threads the chosen `Binding` unchanged.
+////
+//// ## The strategy-aware run-ABI (unit P4-08 §C — signature-stable, self-detecting)
+////
+//// `instantiate`/`invoke_instance`/`run_source` do **not** gain a `Binding` parameter. The
+//// owned process (`twocore_cli_ffi.erl`) discriminates the state strategy from
+//// `instantiate/0`'s **return value** (unambiguous by the keystone shapes): the atom `'ok'`
+//// → the `Cell` loop (apply `Fun(Args)`, state in the pdict cell); the `InstanceState` record
+//// `{instance_state,_,_,_}` → the `Threaded` loop (apply `Fun(St, Args…) -> {Package, St'}`,
+//// threading `St'` across invokes as a value). The `Cell` path is byte-identical to Phase 2/3;
+//// a `Threaded`/`atomics` build runs the SAME driver code end-to-end (G7).
 
 import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
@@ -131,21 +161,31 @@ pub fn invoke(
 }
 
 /// A live instance: the OWNING PROCESS that ran `instantiate/0` and holds this instance's
-/// per-instance cell (memory/globals/table) in its process dictionary
-/// (one-instance-one-process, E1). Every `invoke_instance` is routed into it, so each invoke
-/// reads this instance's state, and cross-invoke state persists.
+/// per-instance state (one-instance-one-process, E1). Every `invoke_instance` is routed into
+/// it, so each invoke reads this instance's state and cross-invoke state persists.
+///
+/// The process holds the state per the build's `state_strategy` (self-detected by the shim,
+/// unit P4-08 §C.2): under `Cell` in its **process-dictionary cell**; under `Threaded` as the
+/// **`InstanceState` record carried as a loop variable** (threaded across invokes as a value,
+/// never in the pdict). This handle is opaque to that choice — the run-ABI signature is the
+/// same for both.
 pub opaque type InstanceProc {
   InstanceProc(proc: Pid)
 }
 
 /// **Instantiate** a loaded module in its own OWNED PROCESS (the run-ABI's middle step,
 /// E5: `load → instantiate → invoke`). Loads `beam` ONCE into the build VM, then spawns a
-/// process and runs the generated `instantiate/0` IN it — seeding that process's fresh
-/// per-instance cell (memory/table/globals + active element/data segments + `start`).
+/// process and runs the generated `instantiate/0` IN it — building that process's fresh
+/// per-instance state (memory/table/globals + active element/data segments + `start`).
+///
+/// **Strategy-aware, signature-stable (unit P4-08 §C):** the shim discriminates the build's
+/// `state_strategy` from `instantiate/0`'s return — the atom `'ok'` (`Cell`, seeds the pdict
+/// cell) vs the `InstanceState` record (`Threaded`, held as the process's loop variable) — so
+/// this function needs **no** `Binding` parameter and both strategies share one code path.
 ///
 /// - `beam`: the compiled `.beam` binary (from `core_to_beam`).
 /// - `mod`: the module's atom NAME (must match the name baked into the `.core`).
-/// - Returns `Ok(InstanceProc)` once the cell is seeded and the process is ready for
+/// - Returns `Ok(InstanceProc)` once the state is seeded and the process is ready for
 ///   `invoke_instance`; `Error("load failed: …")` if the binary will not load; or
 ///   `Error(reason)` for an INSTANTIATION-TIME TRAP (an OOB active segment / trapping
 ///   `start`) — surfaced identically to a runtime trap. Total — never panics.
@@ -164,7 +204,14 @@ pub fn instantiate(
 }
 
 /// **Invoke** an export on a live instance (the run-ABI's last step). Routes the call INTO
-/// the instance's owned process via `call_instance`, so it reads that instance's cell.
+/// the instance's owned process via `call_instance`, so it reads that instance's state.
+///
+/// **Strategy-aware, signature-stable (unit P4-08 §C):** under `Cell` the process applies
+/// `Module:export(Args)` against its pdict cell; under `Threaded` it applies
+/// `Module:export(St, Args…)`, unpacks the returned `{Package, St'}`, and threads `St'` into
+/// the next invoke (so a mutation observed here persists into the following `invoke_instance`
+/// on the same handle). Either way this returns the unpacked result `Package`, so the caller
+/// sees one uniform shape.
 ///
 /// - `proc`: a live `InstanceProc` (from `instantiate`).
 /// - `export`: the exported function name to apply.
@@ -387,8 +434,18 @@ pub fn parse_ir(text: String) -> Result(ir.Module, ir_parser.ParseError) {
 /// This is the CLI `run` subcommand's engine and the shape the acceptance corpus proves
 /// green. The raw-bit-pattern argument/result ABI (D5) is unchanged.
 ///
+/// **Posture-agnostic (unit P4-08 §C.3):** `binding` carries the chosen `state_strategy` and
+/// tiers **unchanged** through every stage. `emit_core` links the tier via `binding.mem_module`
+/// and picks the state seam via `binding.state_strategy`; the run-ABI self-detects the strategy
+/// (§C.2). So a `Threaded`/`atomics` binding runs the SAME driver code as `Cell`/`paged` and
+/// returns **byte-identical** results (G7) — the difference is confined to the loaded `.beam`
+/// (calling convention) and the linked runtime module. The caller is expected to pass a binding
+/// already validated through `profiles.link/1` (the CLI does so via `resolve_binding`); a
+/// tier/strategy incoherence is a linker rejection surfaced there, not a `PipelineError` here.
+///
 /// - `wasm`: the `.wasm` bytes.
-/// - `binding`: the build-time runtime binding (use `profiles.safe()`).
+/// - `binding`: the build-time runtime binding (e.g. `profiles.safe()`/`portable()`, or a
+///   `resolve_binding`-validated composition).
 /// - `export`: the exported function name to invoke.
 /// - `args`: raw unsigned bit-pattern integer arguments.
 /// - Return: `Ok(Returned(_))` on a normal return; `Ok(Trapped(reason))` for an
