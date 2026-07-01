@@ -195,6 +195,93 @@ fn current_mem() -> Mem {
   dynamic_to_mem(rt_state.mem_get())
 }
 
+// ───────────────────────────── tier-P threaded wrappers (state_strategy: Threaded) ─────────────────────────────
+//
+// The purely-functional twin of the cell-backed API above (Phase-4 keystone §A.2, owner unit
+// 04). Under `state_strategy: Threaded` generated code threads the `rt_state.InstanceState`
+// record as a value — every state-reaching function takes it as a leading parameter and returns
+// the (possibly updated) record. These wrappers are THIN adapters: project `st.mem` (coerce the
+// opaque `Dynamic` → `Mem` via the field seam `rt_state.mem`), drive the SAME pure `mem_*` core
+// the cell path uses, and inject the result back via `rt_state.with_mem` — so the threaded and
+// cell strategies compute BYTE-IDENTICAL results (G7). Reads leave `st` untouched; mutators
+// return the rebound record (§10).
+
+/// Threaded load (read-only): projects `st.mem`, drives `mem_load`, leaves `st` UNCHANGED (the
+/// seam keeps threading the same record forward). Returns `Ok(bits)` or
+/// `Error(MemoryOutOfBounds)`. See `mem_load` for the codec/bounds contract.
+pub fn t_load(
+  st: rt_state.InstanceState,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Result(Int, TrapReason) {
+  mem_load(
+    from_dynamic(rt_state.mem(st)),
+    bytes,
+    signed,
+    result_width,
+    addr,
+    offset,
+  )
+}
+
+/// Threaded store. Bounds-checks first (trap-before-write), then rebuilds only the affected
+/// chunk(s) into a NEW `Mem` and rebinds `st.mem` to it — returning `Ok(st')` (the §10 rebound
+/// record; paged memory is immutable, so unlike `atomics` the returned `mem` differs), or
+/// `Error(MemoryOutOfBounds)` with `st` untouched (zero mutation). See `mem_store`.
+pub fn t_store(
+  st: rt_state.InstanceState,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> Result(rt_state.InstanceState, TrapReason) {
+  case mem_store(from_dynamic(rt_state.mem(st)), bytes, addr, value, offset) {
+    Ok(updated) -> Ok(rt_state.with_mem(st, mem_to_dynamic(updated)))
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `memory.size` (read-only): the page count of `st.mem`; `st` unchanged.
+pub fn t_size(st: rt_state.InstanceState) -> Int {
+  mem_size(from_dynamic(rt_state.mem(st)))
+}
+
+/// Threaded `memory.grow`. Returns `#(prev_pages, st')` where `st'` rebinds `st.mem` to the
+/// grown `Mem`, or `#(-1, st)` past the max / cap (unchanged, nothing allocated). Charges
+/// `delta * page_bytes` grow fuel on the SUCCESS path — parity with the cell `grow`, so
+/// metered+threaded is byte-identical to metered+cell (the G7 trap bar) and an untrusted portable
+/// module cannot allocate to the page cap with zero CPU accounting. See `mem_grow`.
+pub fn t_grow(
+  st: rt_state.InstanceState,
+  delta: Int,
+) -> #(Int, rt_state.InstanceState) {
+  let #(result, updated) = mem_grow(from_dynamic(rt_state.mem(st)), delta)
+  case result {
+    -1 -> #(-1, st)
+    old -> {
+      rt_meter.charge(delta * page_bytes)
+      #(old, rt_state.with_mem(st, mem_to_dynamic(updated)))
+    }
+  }
+}
+
+/// Threaded active-data-segment write at instantiation. Bounds-checks the whole range up front,
+/// then rebinds `st.mem` to the written `Mem` — returning `Ok(st')`, or `Error(MemoryOutOfBounds)`
+/// (nothing written, `st` untouched). See `mem_init_data`.
+pub fn t_init_data(
+  st: rt_state.InstanceState,
+  offset: Int,
+  bytes: BitArray,
+) -> Result(rt_state.InstanceState, TrapReason) {
+  case mem_init_data(from_dynamic(rt_state.mem(st)), offset, bytes) {
+    Ok(updated) -> Ok(rt_state.with_mem(st, mem_to_dynamic(updated)))
+    Error(reason) -> Error(reason)
+  }
+}
+
 // ───────────────────────────── the pure paged core (the testable algebra) ─────────────────────────────
 
 /// Build a fresh `Mem` of `min_pages` zero pages with a caller-chosen physical `chunk` size.
@@ -293,11 +380,27 @@ pub fn mem_init_data(
   }
 }
 
+/// The uniform differential hook (§B.2): the tier's whole in-bounds byte image, keyed on the
+/// opaque cell / record `Dynamic` so the seam (unit 09) and the oracle can call `<mem_module>:
+/// to_flat(MemDynamic)` identically across tiers. Coerces the `Dynamic` to a paged `Mem`, then
+/// canonicalises it to one flat `byte_len`-length binary (`mem_flat`). O(byte_len); tests only.
+pub fn to_flat(mem: Dynamic) -> BitArray {
+  mem_flat(dynamic_to_mem(mem))
+}
+
 /// Canonicalise a paged `Mem` to one flat `byte_len`-length binary (every in-bounds byte,
-/// absent chunks rendered as zero). Used by the differential test to compare the paged byte
-/// image against the oracle's. O(byte_len); for tests only.
-pub fn to_flat(m: Mem) -> BitArray {
+/// absent chunks rendered as zero) — the pure image the differential compares against the
+/// oracle's `o_flat`. O(byte_len); for tests only.
+pub fn mem_flat(m: Mem) -> BitArray {
   read_bytes(m, 0, byte_len(m))
+}
+
+/// Coerce the cell / threaded-record's opaque `Dynamic` back into a paged `Mem` — the PUBLIC
+/// `Dynamic → Mem` coercion the tier-P threaded wrappers and the §B.3 differential need to
+/// project `st.mem`. Identity at run time (`gleam_stdlib:identity/1`); sound because `rt_mem` is
+/// the sole producer of the term held in the `mem` slot. Tier-O, cannot fail.
+pub fn from_dynamic(value: Dynamic) -> Mem {
+  dynamic_to_mem(value)
 }
 
 // ───────────────────────────── the flat-binary rebuild oracle (E4) ─────────────────────────────

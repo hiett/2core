@@ -407,7 +407,7 @@ fn run_differential(chunk: Int, count: Int, seed: Int) -> Nil {
   let o = rt_mem.o_fresh(1, Some(4), big_cap)
   let #(m, o) = diff_loop(m, o, seed, count)
   // Final byte image must be identical (catches any silent LE/sparse-zero/boundary drift).
-  rt_mem.to_flat(m) |> should.equal(rt_mem.o_flat(o))
+  rt_mem.mem_flat(m) |> should.equal(rt_mem.o_flat(o))
 }
 
 fn diff_loop(
@@ -699,4 +699,117 @@ fn store_loop(m: rt_mem.Mem, i: Int, n: Int) -> rt_mem.Mem {
       store_loop(m, i + 1, n)
     }
   }
+}
+
+// ───────────────────────────── 14. Tier-P threaded wrappers (thread the InstanceState record) ─────────────────────────────
+
+// The paged threaded family (unit 04): project st.mem → drive the pure mem_* core → inject back
+// via rt_state.with_mem. Because paged memory is IMMUTABLE, a mutator returns a REBOUND record
+// (a new mem) — reading through the pre-store record must NOT see the write (the contrast with
+// the mutable atomics tier, whose t_store returns the same record with an in-place-mutated ref).
+
+/// Build a threaded InstanceState whose `mem` slot holds a fresh paged memory.
+fn paged_threaded_state() -> rt_state.InstanceState {
+  rt_state.fresh(StateDecl(
+    mem: rt_mem.fresh(1, Some(4), big_cap),
+    globals: [],
+    table: dynamic.nil(),
+  ))
+}
+
+// t_store returns a REBOUND st: reading through the returned record sees the store, but reading
+// through the ORIGINAL (pre-store) record does NOT — paged memory is a value, not mutated in place.
+pub fn threaded_store_rebinds_immutably_test() {
+  let st = paged_threaded_state()
+  let assert Ok(st2) = rt_mem.t_store(st, 4, 0, 0x04030201, 0)
+  rt_mem.t_load(st2, 4, False, 32, 0, 0) |> should.equal(Ok(0x04030201))
+  // The pre-store record is untouched (immutable): its byte 0 is still 0.
+  rt_mem.t_load(st, 4, False, 32, 0, 0) |> should.equal(Ok(0))
+}
+
+// t_load / t_size are read-only.
+pub fn threaded_read_only_test() {
+  let st = paged_threaded_state()
+  rt_mem.t_size(st) |> should.equal(1)
+  rt_mem.t_load(st, 4, False, 32, 0, 0) |> should.equal(Ok(0))
+  // An out-of-bounds threaded load traps.
+  rt_mem.t_load(st, 4, False, 32, page, 0)
+  |> should.equal(Error(MemoryOutOfBounds))
+}
+
+// t_grow returns OLD pages + a rebound record whose size reflects the grow; -1 past max unchanged.
+pub fn threaded_grow_rebinds_test() {
+  let st = paged_threaded_state()
+  let #(r1, st) = rt_mem.t_grow(st, 2)
+  r1 |> should.equal(1)
+  rt_mem.t_size(st) |> should.equal(3)
+  let #(r2, st) = rt_mem.t_grow(st, 1)
+  r2 |> should.equal(3)
+  rt_mem.t_size(st) |> should.equal(4)
+  let #(r3, st) = rt_mem.t_grow(st, 1)
+  r3 |> should.equal(-1)
+  rt_mem.t_size(st) |> should.equal(4)
+  // The grown page is zero and writable through the threaded record.
+  let assert Ok(st) = rt_mem.t_store(st, 4, 3 * page, 0xCAFEBABE, 0)
+  rt_mem.t_load(st, 4, False, 32, 3 * page, 0) |> should.equal(Ok(0xCAFEBABE))
+}
+
+// P2 metered parity: a metered paged THREADED grow and a metered paged CELL grow debit an
+// IDENTICAL fuel amount (delta * page_bytes) — so metered+threaded == metered+cell (E3/G7).
+pub fn threaded_grow_charges_same_fuel_as_cell_test() {
+  // Cell grow of 3 pages.
+  rt_meter.reset_fuel()
+  rt_state.seed(StateDecl(
+    mem: rt_mem.fresh(1, Some(8), big_cap),
+    globals: [],
+    table: dynamic.nil(),
+  ))
+  rt_mem.grow(3) |> should.equal(1)
+  let cell_fuel = rt_meter.fuel_consumed()
+
+  // Threaded grow of 3 pages.
+  rt_meter.reset_fuel()
+  let st =
+    rt_state.fresh(StateDecl(
+      mem: rt_mem.fresh(1, Some(8), big_cap),
+      globals: [],
+      table: dynamic.nil(),
+    ))
+  let #(r, _st) = rt_mem.t_grow(st, 3)
+  r |> should.equal(1)
+  let threaded_fuel = rt_meter.fuel_consumed()
+
+  cell_fuel |> should.equal(3 * page)
+  threaded_fuel |> should.equal(cell_fuel)
+}
+
+// A failed threaded grow (past max) charges nothing and returns the unchanged record.
+pub fn threaded_grow_failed_charges_nothing_test() {
+  rt_meter.reset_fuel()
+  let st = paged_threaded_state()
+  let #(r, st) = rt_mem.t_grow(st, 100)
+  r |> should.equal(-1)
+  rt_mem.t_size(st) |> should.equal(1)
+  rt_meter.fuel_consumed() |> should.equal(0)
+}
+
+pub fn threaded_init_data_test() {
+  let st = paged_threaded_state()
+  let assert Ok(st) = rt_mem.t_init_data(st, 8, <<0xDE, 0xAD, 0xBE, 0xEF>>)
+  rt_mem.t_load(st, 4, False, 32, 8, 0) |> should.equal(Ok(0xEFBEADDE))
+  rt_mem.t_init_data(st, page - 2, <<1, 2, 3, 4>>)
+  |> should.equal(Error(MemoryOutOfBounds))
+}
+
+// The uniform differential hook over a cell Dynamic (paged): to_flat(mem_get()) == oracle image.
+pub fn to_flat_dynamic_matches_oracle_test() {
+  rt_state.seed(StateDecl(
+    mem: rt_mem.fresh(1, Some(1), big_cap),
+    globals: [],
+    table: dynamic.nil(),
+  ))
+  let assert Ok(Nil) = rt_mem.store(4, 100, 0x04030201, 0)
+  let o = rt_mem.o_fresh(1, Some(1), big_cap)
+  let assert Ok(o) = rt_mem.o_store(o, 4, 100, 0x04030201, 0)
+  rt_mem.to_flat(rt_state.mem_get()) |> should.equal(rt_mem.o_flat(o))
 }
