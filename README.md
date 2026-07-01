@@ -23,9 +23,10 @@ model.
 
 ## Status — what works today
 
-**Phase 1 is complete: a real `.wasm` binary compiles all the way to a loaded, running
-`.beam` module**, through a fully modular pipeline, in the sandboxed "Safe" mode, driven
-by a CLI.
+**Phases 1 & 2 are complete: essentially all of WebAssembly 1.0 compiles all the way to a
+loaded, running `.beam` module** — a real `.wasm` binary goes through a fully modular
+`decode → validate → lower → IR → Core Erlang → .beam → instantiate → run` pipeline, in
+the sandboxed "Safe" mode, driven by a CLI.
 
 ```sh
 $ gleam run -- run add.wasm add 2 3     # decode → validate → lower → IR → Core Erlang → .beam → run
@@ -38,22 +39,26 @@ module @twocore@wasm@add { … }
 
 Every stage is independently invokable (`decode`, `validate`, `lower`, `ir`, `ir-lower`,
 `emit`, `to-core`, `build`, `run`), and the whole project builds with **zero warnings**
-and **313 passing tests**. What's proven end-to-end:
+and **509 passing tests**. What's proven end-to-end:
 
-- the full WASM 1.0 integer + control-flow slice (locals, `block`/`loop`/`if`, `br`/
-  `br_table`, direct `call`, the `i32`/`i64` op set, sign-extension, non-trapping
-  float→int);
+- **the WASM 1.0 MVP** — integer + control flow (`block`/`loop`/`if`, `br`/`br_table`,
+  `call`), **linear memory** (the full load/store matrix, `memory.size`/`grow`,
+  bounds-checked → trap), **tables + `call_indirect`** (runtime type-check → trap),
+  **globals**, the **full float + conversion** surface, and active data/element/start
+  **instantiation**;
 - **spec-faithful numerics** *through codegen* — two's-complement wrap, signed/unsigned
-  `div`/`rem`, the `INT_MIN / -1` and divide-by-zero **traps**, shift-count masking;
+  `div`/`rem` + trapping conversions, IEEE floats (round-to-nearest-ties-to-even, canonical
+  NaN, the `INT_MIN / -1` / divide-by-zero / out-of-bounds / type-mismatch **traps**);
 - **constant-space, preemptible loops** — `sum_to(100000)` runs as a tail-recursive BEAM
-  loop without stack growth (even with metering on);
-- the **capability boundary** — an un-allowlisted host call is rejected fail-closed at
-  build time; a host import is rejected at runtime under deny-all; a vetted stdlib call
-  runs.
+  loop without stack growth (even with metering + memory writes in the loop);
+- **the sandbox seams** — the `call_host` capability boundary (fail-closed), bounds-checked
+  memory with a **grow resource cap**, and `call_indirect` with no ambient authority;
+  mutable state is per-instance (one-instance-one-process) and reset on instantiation.
 
-What's deliberately **not** here yet (Phase 2+): linear memory and tables, the WAT text
-parser, the optimizer, the "Unsafe" performance profile, and the JS/Rust/Gleam frontends.
-The full roadmap and per-component status live in [`specs/state.md`](specs/state.md).
+What's deliberately **not** here yet (Phase 3+): reference types, bulk memory, multi-memory,
+SIMD, non-function imports; the tier-P "runs-anywhere" build; the WAT text parser; the
+optimizer; the "Unsafe" performance profile; and the JS/Rust/Gleam frontends. The full
+roadmap and per-component status live in [`specs/state.md`](specs/state.md).
 
 ## How it works
 
@@ -70,7 +75,7 @@ The full roadmap and per-component status live in [`specs/state.md`](specs/state
   languages keep exact WASM semantics.
 - **Safe / Unsafe modes.** Two global modes: **Safe** sandboxes untrusted code (vetted
   in-house stdlib, a tiny allowlist of BEAM functions, deny-all host access, metering on,
-  no node-crashing native code); **Unsafe** (Phase 2) emits the fastest possible code.
+  no node-crashing native code); **Unsafe** (later) emits the fastest possible code.
   The two are designed to coexist on one node.
 - **Everything modular.** Each stage and runtime layer is a narrow, independently-callable
   interface with interchangeable implementations — the design treats that modularity as
@@ -79,13 +84,14 @@ The full roadmap and per-component status live in [`specs/state.md`](specs/state
   BEAM; whether any native code runs underneath is a per-deployment choice.
 
 The canonical architecture spec is [`specs/00-high-level.md`](specs/00-high-level.md), and
-the Phase-1 work was planned as independent units under [`specs/phase-1/`](specs/phase-1/).
+the work is planned as independent units under [`specs/phase-1/`](specs/phase-1/) and
+[`specs/phase-2/`](specs/phase-2/).
 
 ## Planned frontend roadmap
 
 In intended order (only the first is implemented):
 
-1. **WASM** — *implemented (Phase 1).* Also the path to **Rust → BEAM** (via Rust→WASM).
+1. **WASM** — *implemented (WASM 1.0).* Also the path to **Rust → BEAM** (via Rust→WASM).
 2. **JavaScript via [Porffor](https://github.com/CanadaHonk/porffor)** — a JS→WASM AOT
    compiler feeding the WASM frontend, as an early proof-of-concept.
 3. **Arc as a native JavaScript frontend** — emitting the IR directly (term value model)
@@ -98,12 +104,13 @@ In intended order (only the first is implemented):
 The WASM frontend is differential-tested against the official
 [WebAssembly spec test suite](https://github.com/WebAssembly/testsuite) (pinned), run
 through the real compile-and-execute pipeline. Of the assertions we attempt, **100% pass
-and 0 fail**; the large "out of scope" share is spec coverage for constructs the current
-slice doesn't implement yet (linear memory, tables, `call_indirect`, most float ops).
+and 0 fail** (15,747 passing), and in-scope coverage of the MVP suite is now **~97%**; the
+remaining "out of scope" share is spec coverage for post-MVP proposals the platform doesn't
+target yet (reference types, bulk/multi-memory, SIMD).
 
 <p align="center">
   <img src="docs/wasm-conformance.svg" width="640"
-       alt="WebAssembly spec-suite conformance: 1,740 passing, 1,359 out of scope, 0 failing">
+       alt="WebAssembly spec-suite conformance: 15,747 passing, 411 out of scope, 0 failing">
 </p>
 
 > Regenerate with `scripts/gen-conformance-svg.sh` (run `RUN_VENDOR=1 …` to fetch the full
