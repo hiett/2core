@@ -33,7 +33,7 @@ import twocore/ir.{
   type FuncType, FuncType, IndirectCallTypeMismatch, TI32, TI64,
   TableOutOfBounds, UndefinedElement, UninitializedElement,
 }
-import twocore/runtime/rt_state.{StateDecl}
+import twocore/runtime/rt_state.{type InstanceState, StateDecl}
 import twocore/runtime/rt_table
 import twocore/runtime/rt_trap
 
@@ -343,4 +343,106 @@ pub fn spec_trap_messages_test() {
   // The instantiation-time element-segment OOB reason.
   rt_trap.spec_trap_message(TableOutOfBounds)
   |> should.equal("out of bounds table access")
+}
+
+// ── 9. Paged THREADED family (state_strategy: Threaded; owner: unit P4-06) ────────
+//
+// The threaded heads `t_init_elem`/`t_call_indirect` over the SAME immutable `Dict` core: the
+// handle travels in `st.table` (no pdict) and a mutating op RETURNS the (possibly rebuilt)
+// record. Same three guards, same TrapReasons as the cell surface (§F).
+
+/// A threaded add-closure adding its two i32 args and threading `st` unchanged.
+fn t_add() -> fn(InstanceState, List(Int)) -> #(List(Int), InstanceState) {
+  fn(st, args) {
+    case args {
+      [a, b] -> #([a + b], st)
+      _ -> panic as "t_add: expected two args"
+    }
+  }
+}
+
+/// A threaded InstanceState whose table has `size` null slots.
+fn threaded_table(size: Int) -> InstanceState {
+  rt_state.fresh(StateDecl(
+    mem: dynamic.nil(),
+    globals: [],
+    table: rt_table.new(size, option.None),
+  ))
+}
+
+/// A matching threaded call runs and returns the results plus the callee's `st`.
+pub fn threaded_matching_type_runs_test() {
+  let st = threaded_table(4)
+  let assert Ok(st) = rt_table.t_init_elem(st, 0, [#(ii_i(), t_add())])
+  rt_table.t_call_indirect(st, 0, ii_i(), [3, 4])
+  |> should.equal(Ok(#([7], st)))
+}
+
+/// §10 rule for the IMMUTABLE paged backend: `t_init_elem` returns a REBUILT `st` whose table now
+/// holds the entry (the handle value changed — unlike a mutable-in-place backend). A call through
+/// the returned `st` sees the fill; a call through the PRE-init `st` still traps null (the old
+/// immutable handle is unchanged).
+pub fn threaded_init_elem_rebuilds_handle_test() {
+  let st0 = threaded_table(2)
+  let assert Ok(st1) = rt_table.t_init_elem(st0, 0, [#(ii_i(), t_add())])
+  rt_table.t_call_indirect(st1, 0, ii_i(), [6, 1])
+  |> should.equal(Ok(#([7], st1)))
+  // The pre-init immutable handle is unaffected (structural-sharing snapshot).
+  rt_table.t_call_indirect(st0, 0, ii_i(), [6, 1])
+  |> should.equal(Error(UninitializedElement))
+}
+
+/// The three faults, right reason & ORDER, through the threaded heads.
+pub fn threaded_three_faults_test() {
+  let st = threaded_table(3)
+  let assert Ok(st) = rt_table.t_init_elem(st, 0, [#(ii_i(), t_add())])
+  // Bounds (before null/type).
+  rt_table.t_call_indirect(st, 3, ii_i(), [1, 2])
+  |> should.equal(Error(UndefinedElement))
+  rt_table.t_call_indirect(st, -1, ii_i(), [1, 2])
+  |> should.equal(Error(UndefinedElement))
+  // Null (before type).
+  rt_table.t_call_indirect(st, 1, FuncType([TI64], [TI64]), [1, 2])
+  |> should.equal(Error(UninitializedElement))
+  // Type.
+  rt_table.t_call_indirect(st, 0, FuncType([TI32], [TI32]), [1])
+  |> should.equal(Error(IndirectCallTypeMismatch))
+}
+
+/// `t_init_elem` whole-range bounds: an overflowing segment writes nothing (no partial write).
+pub fn threaded_init_elem_out_of_bounds_writes_nothing_test() {
+  let st = threaded_table(2)
+  rt_table.t_init_elem(st, 2, [#(ii_i(), t_add())])
+  |> should.equal(Error(TableOutOfBounds))
+  rt_table.t_call_indirect(st, 0, ii_i(), [1, 2])
+  |> should.equal(Error(UninitializedElement))
+}
+
+/// A threaded target that MUTATES a global proves `t_call_indirect` returns the callee's `st'`.
+pub fn threaded_call_returns_callee_state_test() {
+  let st =
+    rt_state.fresh(StateDecl(
+      mem: dynamic.nil(),
+      globals: [#("g", 0)],
+      table: rt_table.new(1, option.None),
+    ))
+  let bump = fn(st: InstanceState, args: List(Int)) {
+    case args {
+      [x] -> #([x], rt_state.t_global_set(st, "g", x))
+      _ -> panic as "one arg"
+    }
+  }
+  let assert Ok(st) =
+    rt_table.t_init_elem(st, 0, [#(FuncType([TI32], [TI32]), bump)])
+  let assert Ok(#([9], st2)) =
+    rt_table.t_call_indirect(st, 0, FuncType([TI32], [TI32]), [9])
+  rt_state.t_global_get(st2, "g") |> should.equal(9)
+}
+
+/// `to_canon` on the paged ORACLE reports null vs filled slots with the filled slot's type.
+pub fn paged_to_canon_reports_slot_image_test() {
+  let st = threaded_table(3)
+  let assert Ok(st) = rt_table.t_init_elem(st, 1, [#(ii_i(), t_add())])
+  rt_table.to_canon(rt_state.table(st))
+  |> should.equal([option.None, option.Some(ii_i()), option.None])
 }
