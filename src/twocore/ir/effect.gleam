@@ -5,23 +5,51 @@
 //// past a store, no reorder past a `MemGrow`/`GlobalSet`/`CallIndirect`/`CallHost`/`Charge`/
 //// `Trap`, no DCE of an effect.
 ////
-//// ## Freeze posture (this unit) — sound by construction
+//// ## The one-directional error budget (F3)
 ////
-//// This unit freezes only the classifier's **signature**, with **maximally conservative**
-//// bodies: `classify → Effectful`, `is_pure → False`, `is_effectful_node → True`,
-//// `function_is_pure → False`. Under these bodies the freeze optimizer legally rewrites
-//// *nothing* — it is a strict, provably-sound identity. Unit 02 replaces the bodies with the
-//// real purity analysis, which may only ever **narrow** `Effectful → Pure` *with proof*;
-//// misclassifying an effectful node as pure is a memory-corruption bug, so the never-narrow
-//// direction (e.g. `MemStore` is effectful forever) is pinned by test.
+//// `classify` answers exactly one question: **may the optimizer treat this expression as if
+//// it had no observable effect?** "Observable" is fixed by F2 — the returned bit patterns
+//// (D5/D7: NaN payload / `-0.0` / wrap exact), the trap (its `TrapReason` and whether one
+//// occurs at all), the final memory/global state, and — under Safe — the fuel consumed.
+////
+//// The analysis is deliberately asymmetric:
+//// - a false `Effectful` (an inert node called effectful) costs only a missed optimization;
+//// - a false `Pure` (a side-effecting/trapping node called inert) lets a downstream pass
+////   delete a store, CSE a load across a write, hoist a trap above its guard, or drop a
+////   charge — **silent memory corruption or a wrong answer.**
+////
+//// So every judgement defaults to `Effectful` and is narrowed to `Pure` only with a
+//// structural proof: the node is not a barrier *and* every sub-expression is provably `Pure`.
+//// The analysis is purely structural on `Expr` (no `Module`, no runtime binding — matching the
+//// frozen `classify(Expr)` signature) and total: every variant is covered, nothing panics.
+//// If a new `Expr` variant is added, the exhaustive `case`s here fail to compile until it is
+//// classified (fail-closed, D4) — an unclassified node can never be silently optimized.
+////
+//// ## Trapping-op refinement of the keystone (§B.1)
+////
+//// The keystone's `is_effectful_node` doc enumerated `Num`/`Convert` broadly as non-barriers.
+//// This unit refines that: the trapping subsets — `Num` with `IDivS/IDivU/IRemS/IRemU` and
+//// `Convert` with `TruncS/TruncU` — are barriers, because deleting one or hoisting it onto a
+//// path where it did not originally evaluate *adds or removes a trap* (an F2 observable). The
+//// set is not invented here: it is exactly the partition `emit_core` routes through `rt_num`'s
+//// `Result(Int, TrapReason)` (`is_trapping/1`, `is_trapping_conv/1`). This is *strictly more
+//// conservative* than the keystone (it never narrows anything the keystone called effectful),
+//// so it needs no signature change.
 ////
 //// ## Spec anchor
 ////
 //// WASM has a defined store/evaluation model (WebAssembly spec §4.2 Runtime Structure and
 //// §4.4 Instructions): memory and global operations read/write the store in program order.
-//// E6/F3 make that order the optimizer's hard barrier.
+//// Trapping arithmetic/conversion is WASM §4.3.2/§4.3.3. E6/F3 make that order the optimizer's
+//// hard barrier.
 
-import twocore/ir.{type Expr, type Function}
+import gleam/list
+import twocore/ir.{
+  type ConvOp, type Expr, type Function, type NumOp, Block, Break, CallDirect,
+  CallHost, CallIndirect, Charge, Continue, Convert, GlobalGet, GlobalSet, IDivS,
+  IDivU, IRemS, IRemU, If, Let, Loop, MemGrow, MemLoad, MemSize, MemStore, Num,
+  Return, Switch, TermOp, Trap, TruncS, TruncU, Values,
+}
 
 /// Whether an expression is observably pure or side-effecting (F3).
 ///
@@ -34,46 +62,184 @@ pub type Effect {
   Effectful
 }
 
-/// DEEP classification: `Pure` iff `e` AND every sub-expression are pure. The optimizer uses
-/// this to decide whether a whole subtree may be folded / CSE'd / eliminated.
+/// SHALLOW barrier test (F3): does THIS node — ignoring its sub-expressions — read or write
+/// mutable instance state, call out, meter, trap, transfer control, or possibly diverge? The
+/// primitive `classify` is built on, and the fast test a pass uses to find the nearest barrier
+/// in a straight-line sequence.
 ///
-/// - `_e`: the expression to classify (its whole subtree). Ignored at the freeze.
-/// - Return: the `Effect` of the subtree. FREEZE body: `Effectful` (the sound conservative
-///   default — treat everything as effectful so nothing is rewritten). Total. Unit 02 refines.
-pub fn classify(_e: Expr) -> Effect {
-  Effectful
+/// Barriers (`True`): the E6/F3 state ops (`MemSize`/`MemGrow`/`MemLoad`/`MemStore`/
+/// `GlobalGet`/`GlobalSet`) + the three call kinds (`CallDirect`/`CallIndirect`/`CallHost`) +
+/// `Charge` + `Trap` + the non-returning transfers (`Break`/`Continue`/`Return`) + `Loop` (may
+/// not terminate) + the TRAPPING `Num`/`Convert` subsets (§B.1). Non-barriers (`False`):
+/// `Values`, non-trapping `Num`/`Convert`, `TermOp`, and the `Let`/`Block`/`If`/`Switch`
+/// shells — their DEEP verdict is decided by their sub-expressions in `classify`, not here.
+///
+/// Total; never panics. A `True` here does NOT imply the whole subtree is effectful (only this
+/// node); a `False` here does NOT imply the subtree is pure (a shell may hide a barrier) — use
+/// the DEEP `is_pure`/`classify` for that.
+pub fn is_effectful_node(e: Expr) -> Bool {
+  case e {
+    MemSize
+    | MemGrow(_)
+    | MemLoad(_, _, _, _)
+    | MemStore(_, _, _, _)
+    | GlobalGet(_)
+    | GlobalSet(_, _)
+    | CallDirect(_, _)
+    | CallIndirect(_, _, _, _)
+    | CallHost(_, _, _)
+    | Charge(_, _)
+    | Trap(_)
+    | Break(_, _)
+    | Continue(_, _)
+    | Return(_)
+    | Loop(_, _, _, _) -> True
+    Num(op, _) -> trapping_numop(op)
+    Convert(op, _) -> trapping_convop(op)
+    Values(_)
+    | TermOp(_, _)
+    | Let(_, _, _)
+    | Block(_, _, _)
+    | If(_, _, _, _)
+    | Switch(_, _, _, _) -> False
+  }
 }
 
-/// `True` iff `classify(e) == Pure` — the guard a pass consults before folding/CSE-ing/
-/// eliminating a whole subtree.
+/// The four TRAPPING integer ops — `div`/`rem`, signed & unsigned — trap on a zero divisor,
+/// and `div_s` additionally on `INT_MIN / -1` (WASM spec §4.3.2). Mirrors `emit_core`'s
+/// authoritative `is_trapping/1` (`emit_core.gleam:1530`). Every other `NumOp` (arithmetic,
+/// bitwise, shifts, comparisons, and ALL float ops — IEEE never traps) is total.
 ///
-/// - `_e`: the expression to test. Ignored at the freeze.
-/// - Return: FREEZE body: always `False` (safe — no subtree is treated as pure, so no rewrite
-///   is licensed). Total. Unit 02 refines. Never a lock-in of the stub's output: the SOUND
-///   direction (an effectful node is never `True`) holds at the freeze and forever.
-pub fn is_pure(_e: Expr) -> Bool {
-  False
+/// Returns `True` for exactly `IDivS`/`IDivU`/`IRemS`/`IRemU` (any width), `False` otherwise.
+fn trapping_numop(op: NumOp) -> Bool {
+  case op {
+    IDivS(_) | IDivU(_) | IRemS(_) | IRemU(_) -> True
+    _ -> False
+  }
 }
 
-/// SHALLOW barrier test: is THIS node an effect barrier, ignoring its children? Used to test
-/// whether two effectful nodes may swap. `MemLoad`/`MemStore`/`MemGrow`/`MemSize`/`GlobalGet`/
-/// `GlobalSet`/`CallDirect`/`CallIndirect`/`CallHost`/`Charge`/`Trap` are barriers;
-/// `Num`/`Convert`/`Values` and the structured-control *shells* are not (their children may
-/// still be effectful).
+/// The two TRAPPING float→int conversions — `trunc_s`/`trunc_u` trap on NaN, ±∞, or an
+/// out-of-range magnitude (WASM spec §4.3.3). Mirrors `emit_core`'s authoritative
+/// `is_trapping_conv/1` (`emit_core.gleam:1577`). The saturating `trunc_sat_*`, width/sign
+/// extends, reinterpret, `convert_*`, demote/promote, and the term↔numeric boxing bridge are
+/// all total value transforms.
 ///
-/// - `_e`: the node to test (its own effect, not its children's). Ignored at the freeze.
-/// - Return: FREEZE body: always `True` (treat every node as a barrier → the freeze optimizer
-///   moves nothing). Total. Unit 02 refines.
-pub fn is_effectful_node(_e: Expr) -> Bool {
-  True
+/// Returns `True` for exactly `TruncS`/`TruncU` (any width pair), `False` otherwise.
+fn trapping_convop(op: ConvOp) -> Bool {
+  case op {
+    TruncS(_, _) | TruncU(_, _) -> True
+    _ -> False
+  }
 }
 
-/// `True` iff `f`'s whole body is pure — enables pure-callee reasoning for inlining (unit 04)
-/// and pure-call CSE.
+/// DEEP classification (F3): `Pure` iff `e` is a non-barrier node AND every sub-expression is
+/// `Pure`. The optimizer uses this to decide whether a whole subtree may be folded / CSE'd /
+/// eliminated.
 ///
-/// - `_f`: the function to test. Ignored at the freeze.
-/// - Return: FREEZE body: always `False` (sound — no callee is treated as pure). Total.
-///   Unit 02 refines.
-pub fn function_is_pure(_f: Function) -> Bool {
-  False
+/// - `e`: the expression to classify (its whole subtree).
+/// - Return: `Pure` when the subtree is observationally inert modulo its result value
+///   (reads/writes no state, cannot trap or diverge, performs no control transfer);
+///   `Effectful` otherwise. Conservative — see the module docs: anything not *proven* pure is
+///   `Effectful`. Total; never panics.
+pub fn classify(e: Expr) -> Effect {
+  case is_effectful_node(e) {
+    True -> Effectful
+    False ->
+      case children_all_pure(e) {
+        True -> Pure
+        False -> Effectful
+      }
+  }
+}
+
+/// Are all of `e`'s SUB-EXPRESSIONS pure? Only the non-barrier recursive shells
+/// (`Let`/`Block`/`If`/`Switch`) have sub-expressions; every other non-barrier node
+/// (`Values`/non-trapping `Num`/non-trapping `Convert`/`TermOp`) is atomic over `Value`s and so
+/// has none (vacuously `True`). Barriers never reach here — `classify` short-circuits — so
+/// `Loop`/`Charge`/etc. need no arm and fall into the `_` catch-all.
+fn children_all_pure(e: Expr) -> Bool {
+  case e {
+    Let(_, rhs, body) -> is_pure(rhs) && is_pure(body)
+    Block(_, _, body) -> is_pure(body)
+    If(_, _, then_branch, else_branch) ->
+      is_pure(then_branch) && is_pure(else_branch)
+    Switch(_, _, arms, default) ->
+      is_pure(default) && list.all(arms, fn(a) { is_pure(a.body) })
+    _ -> True
+  }
+}
+
+/// `True` iff `classify(e) == Pure` — the master safety oracle the derived predicates below
+/// are built on, and the guard a pass consults before folding/CSE-ing/eliminating a subtree.
+///
+/// - `e`: the expression to test (its whole subtree).
+/// - Return: `True` only when `e` is observationally inert modulo its result value (safe to
+///   duplicate, delete, reorder, hoist, or sink). `False` for any node that reads/writes state,
+///   calls out, meters, traps, diverges, or transfers control — or any shell containing one.
+///   Total; never panics.
+pub fn is_pure(e: Expr) -> Bool {
+  classify(e) == Pure
+}
+
+// ───────────────────── optimizer-facing predicates (what 03/04 call) ─────────────────────
+// `classify`/`is_pure`/`is_effectful_node` are the *analysis*. Passes gate their rewrites on
+// the NAMED predicates below, whose names ARE their soundness contract, so a call site reads as
+// its intent and a future refinement changes one body, not every caller (§D).
+
+/// May a `let names = e in body` whose bound `names` are ALL dead in `body` drop the binding
+/// (and `e`)?
+///
+/// - `e`: the bound right-hand side whose result is unused.
+/// - Return: `True` licenses dropping `e` entirely — sound only when `e` has nothing to
+///   preserve (no state write, host call, fuel charge, trap, divergence, or control transfer),
+///   i.e. exactly `is_pure(e)`. `False` FORBIDS the drop: an effectful `e` (a `MemStore`, a
+///   `Charge`, a trapping `div`, a `CallHost`) is KEPT even though its result is unused —
+///   E1's ordered `let _ = effect in …` sequencing is load-bearing (F3, "no DCE of an effect").
+///   Total; never panics.
+pub fn can_eliminate_if_unused(e: Expr) -> Bool {
+  is_pure(e)
+}
+
+/// May occurrences of `e` be shared / hoisted to a common dominator (CSE / value numbering)?
+///
+/// - `e`: the candidate expression to share.
+/// - Return: `True` licenses sharing — sound only for a `Pure` `e`: it computes the same value
+///   in any position and introduces no trap or divergence at the hoist point. A
+///   `MemLoad`/`GlobalGet` is NOT pure (it reads mutable state), so this is `False` — the
+///   classifier FORBIDS ALL load/global CSE in Phase 3. That is a conscious, sound
+///   under-approximation (F8): precise load-CSE ("no aliasing store between the two
+///   occurrences") needs an alias + reordering analysis scoped as later work. It makes "a load
+///   is never CSE'd across a store" hold the strongest way — a load is never CSE'd *at all*.
+///   Total; never panics.
+pub fn can_cse(e: Expr) -> Bool {
+  is_pure(e)
+}
+
+/// May two ADJACENT, data-INDEPENDENT expressions `a` then `b` swap without changing observable
+/// behavior?
+///
+/// - `a`, `b`: the two adjacent expressions, in current program order.
+/// - Return: `True` iff at least one is DEEP-pure: a pure expression commutes with everything
+///   (reads/writes no state, cannot trap or diverge). `False` keeps the order: two barriers —
+///   two stores, a load and a store, a grow and a load, a `Charge` and anything, a `Trap` and
+///   anything — do not swap.
+///
+/// CONTRACT: the caller MUST separately ensure `b` uses no name `a` binds (no data dependency).
+/// This predicate answers the EFFECT-ORDERING question only. It uses the DEEP `is_pure`, NEVER
+/// the shallow `is_effectful_node`: a `Block` whose body hides a `MemStore` is a non-barrier
+/// NODE yet is not reorderable. Total; never panics.
+pub fn can_reorder(a: Expr, b: Expr) -> Bool {
+  is_pure(a) || is_pure(b)
+}
+
+/// `True` iff `f`'s whole body is pure — the interprocedural escape hatch (pure-callee
+/// reasoning for inlining, unit 04, and pure-call CSE).
+///
+/// - `f`: the function whose body is examined.
+/// - Return: `True` only when `is_pure(f.body)` holds. CONSERVATIVE: it does NOT chase callees,
+///   so a body containing any `CallDirect`, `Loop`, state op, or trapping op is `False` even if
+///   that callee is itself pure. A call-graph fixpoint on top is unit 04's choice, not this
+///   unit's obligation. Total; never panics.
+pub fn function_is_pure(f: Function) -> Bool {
+  is_pure(f.body)
 }
