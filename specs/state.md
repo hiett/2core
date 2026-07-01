@@ -203,8 +203,85 @@ range-based bounds-check elimination, SIMD vectorization, pure-call CSE.)*
 
 ---
 
+## Phase 4 — "Free-standing": the trust-tier ladder (tier-P threaded state + tier-O/N memory)
+
+Goal & honest scope: see [`specs/phase-4/00-overview.md`](phase-4/00-overview.md) (decisions
+**G1–G8**). Phase 3's honest benchmark measured tier-O paged memory as **~76× slower than
+hand-written Erlang**, and the platform's "no OTP, no NIF, runs-anywhere" headline was still
+unbuilt. Phase 4 makes the **trust-tier axis** (high-level §10) real: the tier-P **`threaded`**
+state strategy (a purely-functional instance-state record threaded through generated code — the
+runs-anywhere build) and the tier-O/N **memory & table backends** (`atomics` O(1) process-local;
+`nif` the raw ceiling). The keystone is the **`state_strategy` axis** — the `emit_core` seam
+*expansion* Phase-2 E1 promised (the IR is tier-agnostic, so the retrofit is confined to
+`emit_core` + the runtime). **No new frontend surface, no new IR node types.** `state_strategy` &
+`mem_tier` are compile-time (**B3** — a threaded build and a cell build are different `.beam`s).
+
+### Phase-4 freeze milestones (planned)
+
+| Milestone | Produced by | Status | Unblocks |
+|---|---|---|---|
+| `«STATE-STRATEGY-FROZEN»` — `Binding.state_strategy: {Cell,Threaded}` + the threaded `InstanceState` record (reuses the Phase-2 box) + tier-P `rt_state` threaded sigs + the `emit_core` seam-expansion contract (uniform-threading rule; St as leading LoopParam; record-returning `instantiate`) + `coexist_name` keyed on `(mode,state_strategy,mem_tier)` | P4-01 | planned | 02, 03, 08, 09, 11 |
+| `«MEM-TIER-FROZEN»` — `Binding.mem_tier: {Paged,Atomics,Nif}` + `table_tier` + the uniform `rt_mem`/`rt_table` backend interface + the tier→module link map + `link/1` (validate+resolve_tiers+instantiate) as the SOLE seam + Safe-forbids-nif fail-closed | P4-01 | planned | 04, 05, 06, 07, 08 |
+
+### Phase-4 units (specs authored + critiqued + reconciled; implementation `unclaimed`)
+
+| Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
+|---|---|---|---|---|
+| **P4-01** Interface freeze (keystone) | [`01`](phase-4/01-interface-freeze.md) | unclaimed | — | `StateStrategy`/`MemTier`/`TableTier` on `Binding` (safe_default = Cell/Paged/TablePaged); the threaded-seam + tier-module contracts; `link/1` sole seam + `validate_binding` (Safe+Nif → Error, `mem_module`≠`mem_module_for(mem_tier)` → Error); `coexist_name` keyed on full build identity. Only `safe_default()` breaks (all else record-spreads); no IR change. 674 tests stay green. |
+| **P4-02** emit_core threaded seam | [`02`](phase-4/02-emit-threaded-seam.md) | unclaimed | `«STATE-STRATEGY»` | Seam expansion: state-reaching fns thread `St` (`f(St,args)→{Pkg,St'}`); St a leading LoopParam (constant-space back-edge, G4); record-returning `instantiate`; **export_name==fn_name exports the internal def directly (no colliding wrapper)**; Cell byte-identical; D3a test extended. |
+| **P4-03** rt_state threaded (tier-P) | [`03`](phase-4/03-rt-state-threaded.md) | unclaimed | `«STATE-STRATEGY»` | The purely-functional instance-state record (`fresh`/`t_global_get`/`t_global_set` + mem/table field seam); NO pdict, NO rt_mem/rt_table import (opacity). Owns `rt_state.gleam` only. |
+| **P4-04** rt_mem_atomics (tier-O) + paged t_* | [`04`](phase-4/04-rt-mem-atomics.md) | unclaimed | `«MEM-TIER»` | NEW `rt_mem_atomics.gleam` (O(1) LE, engages only when eff max ≤ reserve cap else fail-closed) + (additive to `rt_mem.gleam`) the paged threaded wrappers `t_load/t_store/t_size/t_grow/t_init_data` (**`t_grow` charges `rt_meter` fuel like Cell**) + `to_flat(Dynamic)` + a public `Dynamic→Mem` coercion. Differential vs the oracle. |
+| **P4-05** rt_mem_nif (tier-N) | [`05`](phase-4/05-rt-mem-nif.md) | unclaimed | `«MEM-TIER»` | NEW `rt_mem_nif.gleam` (uniform interface, **Safe-forbidden**) + reference skeleton (production C NIF documented-deferred — no native toolchain; honest, not the ceiling). |
+| **P4-06** rt_table tiers (tier-O) + paged t_* | [`06`](phase-4/06-rt-table-tiers.md) | unclaimed | `«MEM-TIER»` | NEW `rt_table_ets.gleam`/`rt_table_atomics.gleam` (3-fault fail-closed dispatch, no ambient authority) + (additive to `rt_table.gleam`) the paged threaded `t_init_elem`/`t_call_indirect`. |
+| **P4-07** linker + profiles compose | [`07`](phase-4/07-linker-profiles-compose.md) | unclaimed | `«MEM-TIER»` | `resolve_tiers` (single source: sets `mem_module`/`table_module` from tier) + `validate_binding` fail-closed + `link/1` sole seam; `portable()` (tier-P instance state; fuel/host are node-safe tier-O overlays) + `ceiling()` (Unsafe+Atomics, requires a cap). Owns `profiles.gleam` only. |
+| **P4-08** pipeline + CLI tier select | [`08`](phase-4/08-pipeline-cli-tier-select.md) | unclaimed | `«STATE»`,`«MEM-TIER»` | Run-ABI/CLI route EVERY binding→Instance through `link/1`; CLI flags (`--portable`/`--tier`/`--threaded`, default Safe/Cell/Paged fail-closed) run `resolve_tiers` so `--tier atomics` actually links atomics; threaded run-ABI threads the record across invokes. |
+| **P4-09** tier differential | [`09`](phase-4/09-tier-differential.md) | unclaimed | 02–08 | Every shipped `(state_strategy × mem_tier)` gives byte-identical corpus results + spec-expected; **constant-space-under-threaded** proof; **memory.grow trap-parity** across strategies (proves `t_grow` fuel); the runs-anywhere grep (0 native + 0 rt_state cell seam; fuel/host pdict exempt). |
+| **P4-10** benchmark revisit | [`10`](phase-4/10-benchmark-revisit.md) | unclaimed | 04, 08 | Honest re-measure of CRC-32/SHA-256/DEFLATE with tier-O `atomics` (capped so it engages) vs paged/hand-written/native; real numbers + methodology; `docs/phase-4-benchmark.md`. |
+| **P4-11** capstone | [`11`](phase-4/11-capstone.md) | unclaimed | all above | Full-matrix conformance `fail=0` for every shipped combination; the **runs-anywhere headline** (tier-P portable runs the suite on a bare BEAM, grep-verified + executed); refreshed image; honest statement of what shipped (atomics; the C NIF deferred). |
+
+### High-level spec coverage this phase takes
+
+| High-level item | Taken by | Notes |
+|---|---|---|
+| §10 trust tiers P/O/N (state) | P4-01/02/03 | tier-P `threaded` state (runs-anywhere) alongside the Phase-2 tier-O `cell`. |
+| §10 `rt_mem` tier ladder | P4-04/05 | `atomics` (O, O(1), shipped) + `nif` (N, interface + skeleton, Safe-forbidden; C deferred). |
+| §10 `rt_table` tiers | P4-06 | `ets`/`atomics` (tier-O). |
+| §10 binding models | P4-07/08 | Phase-4 realizes **B3** monomorphization (per-tier builds) + `link/1` sole validated seam; single-`.beam` B1 still deferred. |
+| §6 Safe forbids tier N | P4-01/07 | fail-closed: `Safe + nif` unconstructible + `validate_binding` gate on the sole seam. |
+| §11 tiered interface-conformance + differential oracle | P4-09 | every tier held to the `rebuild` oracle; every `(strategy×tier)` byte-identical. |
+
+### Deferred to Phase 5+ (explicit)
+
+**Phase 5** (complete WASM engine): reference types; bulk memory; multi-memory; `memory64`; the
+WAT text parser; non-function imports + `spectest`; SIMD. **Phase 6**: the Porffor JS→WASM bridge.
+**Later**: Arc/Gleam frontends; exception-handling / GC / stack-switching / component model; the
+single-`.beam` runtime-dispatch **B1**; tier-N numerics; a production C NIF for tier-N memory.
+
+---
+
 ## Change log
 
+- **Phase-4 plan authored + adversarially critiqued + reconciled.** Scope decision (EM):
+  **Phase 4 = "Free-standing" — the trust-tier ladder** (tier-P `threaded` runs-anywhere state +
+  tier-O/N memory & table backends), motivated by Phase 3's benchmark (tier-O paged memory ~76×
+  slower than hand-written Erlang). Overview (**G1–G8**) + 11 units via an 11-agent scoping fan-out,
+  then a 3-lens critique. The critique **cleared** several worries (atomics endianness/unaligned
+  mapping correct + differentially tested; grow-under-atomics sound; tier-N NIF honesty well-hedged)
+  and caught **2 blockers + several certain majors**, folded via a 6-agent reconciliation (P1–P7):
+  - **The paged threaded `t_*` wrappers had no owner and didn't exist** → `portable()` wouldn't link.
+    Pinned: unit 04 owns `rt_mem.gleam` paged `t_*` (additive) + `rt_mem_atomics`; unit 06 owns
+    `rt_table.gleam` paged `t_*` + the tiers; tiers are **separate modules** (D1 + distinct atoms).
+  - **Threaded `memory.grow` dropped the dynamic fuel charge** → resource-bound hole + trap
+    divergence. Fixed: `t_grow` charges like Cell; unit 09 adds a grow trap-parity differential.
+  - **The uniform export wrapper collided when `export_name == fn_name`** → duplicate `FunDef` /
+    infinite recursion. Fixed: export the internal def directly when names match.
+  - **The runs-anywhere/tier-P claim was literally false** (Safe `portable` mandatorily carries the
+    `rt_meter` pdict fuel counter). Resolved (honest): runs-anywhere = zero native + zero `rt_state`
+    pdict **instance** cell, **exempting** the node-safe tier-O `rt_meter`/`rt_host` policy overlays.
+  - **Tier coherence was unenforced** → `link/1` is the SOLE validated seam, `instantiate/1`
+    self-validates, `resolve_tiers` couples `mem_module := mem_module_for(mem_tier)`.
+  - **Atomics-grow contract conflict** → one contract: fail-closed on an uncapped no-max module (no
+    silent fallback); `coexist_name` keys on `(mode, state_strategy, mem_tier)`. Implementation next.
 - **P3-11 landed (capstone) — PHASE 3 PROVEN.** The five differentials + benchmark all green.
   **Headline finding: the optimizer changes nothing observable** — `OptNone`≡`Baseline`≡
   `Aggressive` produce byte-identical results/traps AND each equals the spec-sourced `.expected`
