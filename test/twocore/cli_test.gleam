@@ -9,6 +9,7 @@
 import gleam/string
 import simplifile
 import twocore
+import twocore/pipeline
 
 const corpus = "test/twocore/conformance/corpus"
 
@@ -90,6 +91,75 @@ pub fn cli_to_beam_writes_beam_test() {
   assert beam != <<>>
   let _ = simplifile.delete(tmp_core)
   let _ = simplifile.delete(tmp_beam)
+}
+
+// ─────────────────────────────── the `opt` stage + `--unsafe` profile flag ───────────────────────────────
+
+/// `opt <in.ir>` round-trips (decision #5): its printed `.ir` re-parses to a well-formed
+/// module (F2 — the optimizer emits valid IR), and at the freeze/`OptNone` level equals the
+/// input module (compared by structural equality — floats are stored as bit patterns, so this
+/// is bit-exact per D7). When real passes land the equality relaxes to semantics-preserving
+/// (03/04/11); the round-trip-VALIDITY assertion stays.
+pub fn cli_opt_roundtrips_test() {
+  let assert Ok(text) = twocore.run(["opt", golden <> "/add.ir"])
+  let assert Ok(reparsed) = pipeline.parse_ir(text)
+  let assert Ok(original_text) = simplifile.read(golden <> "/add.ir")
+  let assert Ok(original) = pipeline.parse_ir(original_text)
+  assert reparsed == original
+}
+
+/// `opt --unsafe <in.ir>` succeeds and re-parses (the `Aggressive` level is also identity at
+/// the freeze). Drives the optimizer stage at the Unsafe profile's level.
+pub fn cli_opt_unsafe_succeeds_test() {
+  let assert Ok(text) = twocore.run(["opt", "--unsafe", golden <> "/sum_to.ir"])
+  let assert Ok(_) = pipeline.parse_ir(text)
+}
+
+/// `run --unsafe add.wasm add 2 3` prints `5` — the whole pipeline (decode → … → ir_lower →
+/// optimize(Aggressive) → emit(unsafe) → instantiate(seeds) → invoke) runs correctly under the
+/// Unsafe profile, returning the SAME spec-correct result as Safe (F2 — Unsafe never changes an
+/// observable answer).
+pub fn cli_run_unsafe_add_test() {
+  assert twocore.run(["run", "--unsafe", corpus <> "/add.wasm", "add", "2", "3"])
+    == Ok("5")
+}
+
+/// `emit` and `emit --unsafe` produce `.core` IDENTICAL in every function body for the same
+/// `.ir` (A.1 — `emit` runs `emit_core` alone, which is posture-blind for bodies), differing
+/// ONLY in `instantiate/0`'s seed lines (§A.4): the `seed_policy` literal `host_deny_all` (Safe)
+/// vs `host_open` (Unsafe). Splits at the synthesized `instantiate/0` def header (the export
+/// list writes `'instantiate'/0]`, never `'instantiate'/0 =`, so the split is unambiguous).
+pub fn cli_emit_unsafe_bodies_are_posture_agnostic_test() {
+  let assert Ok(safe) = twocore.run(["emit", golden <> "/add.ir"])
+  let assert Ok(unsafe) = twocore.run(["emit", "--unsafe", golden <> "/add.ir"])
+  // Every real function body (everything before the synthesized instantiate/0) is identical.
+  assert bodies_before_instantiate(safe) == bodies_before_instantiate(unsafe)
+  // The one documented exception — instantiate/0's baked host-posture literal.
+  assert string.contains(safe, "'seed_policy'('host_deny_all')")
+  assert string.contains(unsafe, "'seed_policy'('host_open')")
+}
+
+/// `to-core` vs `to-core --unsafe` demonstrates the F5 charge differential at the CLI: the
+/// Safe `.core` carries `charge` instrumentation and the `seed_fuel` seed; the Unsafe `.core`
+/// carries NEITHER (zero-overhead) — differing by exactly the metering.
+pub fn cli_to_core_unsafe_charge_differential_test() {
+  let assert Ok(safe) = twocore.run(["to-core", golden <> "/sum_to.ir"])
+  let assert Ok(unsafe) =
+    twocore.run(["to-core", "--unsafe", golden <> "/sum_to.ir"])
+  assert string.contains(safe, "'charge'")
+  assert !string.contains(unsafe, "'charge'")
+  assert string.contains(safe, "'seed_fuel'")
+  assert !string.contains(unsafe, "'seed_fuel'")
+}
+
+/// The `.core` text preceding the synthesized `instantiate/0` def — every real function body.
+/// `'instantiate'/0 =` is the def header (the module's export list writes `'instantiate'/0]`,
+/// so the split matches only the def, never the header).
+fn bodies_before_instantiate(core: String) -> String {
+  case string.split_once(core, "'instantiate'/0 =") {
+    Ok(#(before, _)) -> before
+    Error(_) -> core
+  }
 }
 
 // ─────────────────────────────── fail-closed dispatch (never panics) ───────────────────────────────

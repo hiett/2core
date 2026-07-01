@@ -928,10 +928,13 @@ fn contains_call(e: CExpr, module: String, fun: String) -> Bool {
   }
 }
 
-/// THE `instantiate/0` golden: it is exported, and its body sequences (in order)
+/// THE `instantiate/0` golden: it is exported, and its body sequences (in order) the
+/// per-instance seeds `seed_fuel` (Safe/MeterFuel, FIRST) → `seed_policy` (always) then
 /// `seed` → `init_elem` → `init_data` → `apply 'init'/0` → `'ok'`, each init step a
 /// trap-at-instantiation `case`, with the element entry a `CFun`-wrapped STATIC `apply` of
-/// `elemfn` (no dynamic apply).
+/// `elemfn` (no dynamic apply). The two seed lines are the one documented policy-field read
+/// (§A.4): `seed_fuel(fuel_budget)` arms the fail-closed CPU bound before any `charge`, and
+/// `seed_policy(host_deny_all)` bakes the Safe host posture as a Core literal.
 pub fn instantiate_entry_golden_test() {
   let b = binding()
   let assert Ok(cm) = emit_core.emit_module(full_module(), b)
@@ -942,8 +945,19 @@ pub fn instantiate_entry_golden_test() {
       let FunDef(FName(n, _), _) = d
       n == "instantiate"
     })
+  // Step 0a: `seed_fuel` FIRST under MeterFuel — the CPU bound is armed before any charge
+  // (§A.4/F5); the baked budget is `binding.fuel_budget`.
+  let assert CLet([_], fuel_rhs, after_fuel) = body
+  let assert CCall(CAtom(meter), CAtom("seed_fuel"), [CInt(budget)]) = fuel_rhs
+  assert meter == b.meter_module
+  assert budget == b.fuel_budget
+  // Step 0b: `seed_policy` ALWAYS — Safe bakes the `host_deny_all` atom literal (§A.4/F4).
+  let assert CLet([_], policy_rhs, after_policy) = after_fuel
+  let assert CCall(CAtom(host), CAtom("seed_policy"), [CAtom("host_deny_all")]) =
+    policy_rhs
+  assert host == b.host_module
   // Step 1: seed — `{state_decl, fresh(...), [{<<"g0">>,42}], new(...)}`.
-  let assert CLet([_], seed_rhs, rest1) = body
+  let assert CLet([_], seed_rhs, rest1) = after_policy
   let assert CCall(
     CAtom(state),
     CAtom("seed"),

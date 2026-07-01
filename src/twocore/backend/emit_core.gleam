@@ -57,6 +57,21 @@
 //// generated `instantiate/0` entry (E5) that seeds the per-instance cell and runs the active
 //// element/data segments + start. Out (returns a typed `EmitError`, never a panic): `TermOp`
 //// and the four term↔numeric boxing `Convert`s (still Phase-3 deferrals).
+////
+//// ## Phase 3 — posture-agnostic BODIES, seeded `instantiate/0` (F4/F6/F7)
+////
+//// For every NON-instantiate function body, `emit_module` reads ONLY the `binding.*_module`
+//// names (+ `safe_max_pages`); it reads NONE of the policy fields
+//// (`opt_level`/`meter`/`bif_gate`/`stdlib`/`host_policy`/`fuel_budget`). Because
+//// `profiles.unsafe()` keeps the SAME `*_module` names as `safe()`, those bodies are
+//// structurally identical under both profiles for the same IR (Safe and Unsafe are distinct
+//// B3 builds; the instance is the unit of policy). The optimizer runs BEFORE emit (F1) and the
+//// `Charge`-skip lives in `ir_lower` (F5) — so a metered body's Safe/Unsafe `.core` differs
+//// only by charge, never by anything emit_core decides. The ONE documented exception is the
+//// synthesized `instantiate/0`, which bakes the per-instance seeds:
+//// `rt_meter:seed_fuel(binding.fuel_budget)` FIRST when `meter == MeterFuel`, and ALWAYS
+//// `rt_host:seed_policy(binding.host_policy)`. Do NOT branch any non-instantiate body on a
+//// policy field: that would break the F5 zero-overhead differential.
 
 import gleam/bit_array
 import gleam/dict.{type Dict}
@@ -91,7 +106,10 @@ import twocore/ir.{
   TruncS, TruncSatS, TruncSatU, TruncU, UnboxFloat, UnboxInt, UndefinedElement,
   UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
-import twocore/runtime/instance.{type Binding}
+import twocore/runtime/instance.{
+  type Binding, type HostPolicy, HostDenyAll, HostOpen, HostWhitelist, MeterFuel,
+  MeterOff,
+}
 
 // ─────────────────────────────── error type (D4) ───────────────────────────────
 
@@ -1191,15 +1209,31 @@ fn byte_seg(b: Int) -> CBitSeg {
 
 /// Emit the generated `'instantiate'/0` entry (the frozen instantiation contract, §C).
 ///
-/// Its body runs, in WASM spec order, inside the instance's owned process: (1) seed the
-/// FRESH per-instance cell (`rt_state:seed` with a build-controlled `StateDecl` term whose
-/// `mem = rt_mem:fresh(min, max, safe_cap)`, `table = rt_table:new(min, max)`, and globals
-/// from their constant-folded inits); (2) write each active ELEMENT segment
-/// (`rt_table:init_elem`); (3) write each active DATA segment (`rt_mem:init_data`); (4) run
-/// the `start` function. Element BEFORE data (spec instantiation order). Steps 2–4 are
-/// trap-at-instantiation: each is reduced to one discardable value (`{ok,_}` → `'ok'`,
-/// `{error,E}` → `raise`) and `let`-sequenced, so a segment-OOB / trapping-start raises and
-/// fails instantiation. The body returns `'ok'` on success.
+/// This is the ONE documented exception to `emit_core`'s posture-agnosticism (module doc,
+/// F4/F6/F7): it is the sole owner of the per-instance runtime SEEDS, so it — and only it —
+/// reads policy fields (`meter`/`fuel_budget`/`host_policy`). Its body runs, in order, inside
+/// the instance's owned process:
+///
+/// - (0a) **when `binding.meter == MeterFuel`** — `rt_meter:seed_fuel(binding.fuel_budget)` as
+///   the FIRST effect, arming the fail-closed CPU bound BEFORE any `charge` can fire (F5/D4).
+///   Under `MeterOff` no `seed_fuel` line is emitted (there are no `Charge` sites to bound).
+/// - (0b) **always** — `rt_host:seed_policy(binding.host_policy)` with `host_policy` baked as a
+///   Core Erlang literal (F4/F7). Safe seeds `host_deny_all`, Unsafe seeds `host_open`;
+///   seeding always keeps the boundary explicit (an unseeded policy already defaults deny-all).
+/// - (1) seed the FRESH per-instance cell (`rt_state:seed` with a build-controlled `StateDecl`
+///   term whose `mem = rt_mem:fresh(min, max, safe_cap)`, `table = rt_table:new(min, max)`, and
+///   globals from their constant-folded inits); (2) write each active ELEMENT segment
+///   (`rt_table:init_elem`); (3) write each active DATA segment (`rt_mem:init_data`); (4) run
+///   the `start` function. Element BEFORE data (spec instantiation order). Steps 2–4 are
+///   trap-at-instantiation: each is reduced to one discardable value (`{ok,_}` → `'ok'`,
+///   `{error,E}` → `raise`) and `let`-sequenced, so a segment-OOB / trapping-start raises and
+///   fails instantiation. The body returns `'ok'` on success.
+///
+/// The two seed lines are the ONLY difference between `emit_module(m, safe())` and
+/// `emit_module(m, unsafe())` beyond the `Charge` nodes already differing in the incoming IR
+/// (§A.4). Both target fixed `Binding` runtime atoms (`meter_module`/`host_module`), so they
+/// pass the no-ambient-authority walk unchanged (D3a). They run once per instance, never on a
+/// hot path — so F5 zero-overhead on metered functions is untouched.
 ///
 /// Returns `Error(NonConstInit)` if a global init / segment offset is not a constant
 /// literal, or `Error(UnknownFunction)` if an element/`start` function is undefined.
@@ -1224,9 +1258,65 @@ fn emit_instantiate(module: Module, ctx: Ctx) -> Result(FunDef, EmitError) {
     state2,
   ))
   use start_fx <- result.try(start_effects(module, ctx))
-  let effects = list.flatten([[seed_effect], elem_fx, data_fx, start_fx])
+  let effects =
+    list.flatten([
+      seed_fuel_effect(ctx),
+      seed_policy_effect(ctx),
+      [seed_effect],
+      elem_fx,
+      data_fx,
+      start_fx,
+    ])
   let #(body, _state4) = chain_effects(effects, state3)
   Ok(FunDef(FName("instantiate", 0), CFun([], body)))
+}
+
+/// The `rt_meter:seed_fuel(binding.fuel_budget)` per-instance seed — `[seam_call…]` under
+/// `MeterFuel` (arming the fail-closed CPU bound, F5), or `[]` under `MeterOff` (no `Charge`
+/// sites to bound, so no seed — the F5 zero-overhead posture). `fuel_budget` is baked as a
+/// Core integer literal. Emitted as `instantiate/0`'s first effect.
+fn seed_fuel_effect(ctx: Ctx) -> List(CExpr) {
+  case ctx.binding.meter {
+    MeterFuel -> [
+      seam_call(ctx.binding.meter_module, "seed_fuel", [
+        CInt(ctx.binding.fuel_budget),
+      ]),
+    ]
+    MeterOff -> []
+  }
+}
+
+/// The `rt_host:seed_policy(binding.host_policy)` per-instance seed — ALWAYS emitted (F4).
+/// The `host_policy` is baked as a Core Erlang literal via `host_policy_term`. A fixed
+/// `host_module` call, so it adds no ambient authority (D3a).
+fn seed_policy_effect(ctx: Ctx) -> List(CExpr) {
+  [
+    seam_call(ctx.binding.host_module, "seed_policy", [
+      host_policy_term(ctx.binding.host_policy),
+    ]),
+  ]
+}
+
+/// Render a `HostPolicy` as the Core Erlang literal Gleam compiles it to — the term
+/// `rt_host:seed_policy`/`current_policy` round-trips (rt_host §): `HostDenyAll` → the atom
+/// `'host_deny_all'`, `HostOpen` → `'host_open'`, `HostWhitelist(allow)` →
+/// `{'host_whitelist', [{<<Cap>>, <<Name>>}…]}` (each string a BEAM binary). Build-controlled
+/// (from `binding.host_policy`) — NEVER derived from program data (D3a). Total.
+fn host_policy_term(policy: HostPolicy) -> CExpr {
+  case policy {
+    HostDenyAll -> CAtom("host_deny_all")
+    HostOpen -> CAtom("host_open")
+    HostWhitelist(allow) ->
+      CTuple([
+        CAtom("host_whitelist"),
+        core_list(
+          list.map(allow, fn(pair) {
+            let #(cap, name) = pair
+            CTuple([core_binary_string(cap), core_binary_string(name)])
+          }),
+        ),
+      ])
+  }
 }
 
 /// Sequence a list of zero-result ordered effects into nested `let <g> = <effect> in …`,

@@ -44,6 +44,7 @@ import twocore/frontend/wasm/validate
 import twocore/ir
 import twocore/ir/parser as ir_parser
 import twocore/middle/ir_lower
+import twocore/middle/ir_opt
 import twocore/runtime/instance.{type Binding}
 
 // ─────────────────────────────── composed error type (D4) ───────────────────────────────
@@ -307,11 +308,32 @@ pub fn lower_ir(
   }
 }
 
-/// IR → `.core` text: the Safe policy pass (`ir_lower`) then `emit_core`, printed by unit
-/// 02's `core_printer`. This is the canonical "IR → backend" path the CLI's `to-core` uses.
+/// Run the shared IR→IR optimizer over `m` at the level carried by the profile (F1/F7).
+///
+/// The optimizer sits BETWEEN `ir_lower` and `emit_core`: `source_to_ir → ir_lower →
+/// optimize_ir → emit_core`. The level is read from `binding.opt_level` (F7 — the profile is
+/// the single source of truth), so `profiles.safe()` optimizes at `Baseline` (trust-neutral
+/// passes) and `profiles.unsafe()` at `Aggressive` (baseline + Unsafe-only passes).
+///
+/// - `m`: the IR module (post-`ir_lower`, so `Charge` metering nodes are already present under
+///   `MeterFuel` and absent under `MeterOff` — the optimizer must PRESERVE the charges it sees,
+///   F3, and only the `Aggressive` charge-elision pass may remove them, unit 04).
+/// - `binding`: the build-time profile; only `binding.opt_level` is read here.
+/// - Return: a semantics-preserving rewrite of `m` (F2). `OptNone` is the identity, so a
+///   profile with `opt_level: OptNone` BYPASSES the optimizer (the Phase-1/2 build path / F2
+///   differential baseline). TOTAL — `ir_opt.optimize` never fails, so this returns a bare
+///   `ir.Module`, not a `Result` (no new `PipelineError` variant, F7).
+pub fn optimize_ir(m: ir.Module, binding: Binding) -> ir.Module {
+  ir_opt.optimize(m, binding.opt_level)
+}
+
+/// IR → `.core` text: `ir_lower` (Safe policy pass / metering) → `ir_opt` (level from
+/// `binding.opt_level`, F1) → `emit_core`, printed by `core_printer`. The canonical
+/// "IR → backend" path the CLI's `to-core`/`run` use, now with the optimizer in-chain.
 ///
 /// - `m`: the IR module to compile.
-/// - `binding`: the build-time runtime binding (chokepoint module names + policy mode).
+/// - `binding`: the build-time runtime binding (chokepoint module names + policy mode + the
+///   optimizer level).
 /// - Return: `Ok(core_text)`, or `Error(IrLowerFailed/EmitFailed)`. Total — never panics.
 pub fn ir_to_core(
   m: ir.Module,
@@ -319,11 +341,13 @@ pub fn ir_to_core(
 ) -> Result(String, PipelineError) {
   case lower_ir(m, binding) {
     Error(e) -> Error(e)
-    Ok(lowered) ->
-      case emit_core.emit_module(lowered, binding) {
+    Ok(lowered) -> {
+      let optimized = optimize_ir(lowered, binding)
+      case emit_core.emit_module(optimized, binding) {
         Error(e) -> Error(EmitFailed(e))
         Ok(cmod) -> Ok(core_printer.print_module(cmod))
       }
+    }
   }
 }
 

@@ -27,6 +27,7 @@ import twocore/backend/core_erlang.{
 import twocore/backend/emit_core
 import twocore/ir
 import twocore/runtime/instance
+import twocore/runtime/profiles
 
 /// The set of fixed runtime module names the `Binding` permits a `call` to target. Extended
 /// in Phase 2 with the memory/table/state modules — the new stateful-op authority (D3a).
@@ -271,6 +272,42 @@ pub fn call_indirect_dispatch_is_ambient_safe_test() {
   // `{error,E}` arm raises via `rt_trap` — emit_core emits no per-fault branching itself.
   assert has_call(m, binding.table_module, "call_indirect")
   assert has_call(m, binding.table_module, "init_elem")
+  assert has_call(m, binding.trap_module, "raise")
+}
+
+/// D3a holds under the UNSAFE posture (F6): with `open` BIF gate + `open` host + passthrough
+/// stdlib, the emitted module STILL targets only fixed `Binding` runtime atoms with literal
+/// function atoms, and every `apply` is a compile-time-local `FName`. "Open" is a RUNTIME gate
+/// posture (rt_host/rt_bif bodies), NOT an emit-time capability — emit_core is posture-agnostic
+/// (A.1), so the identical no-ambient-authority walk that guards Safe must pass here. Uses the
+/// SAME `stateful_module()` fixture (call_indirect + every mem/global/table op + the
+/// `instantiate/0` seed lines) as the Safe walk. Because `runtime_modules(profiles.unsafe())`
+/// is the same fixed set as under Safe (identical `*_module` names), passing the walk IS the
+/// proof: an Unsafe caller cannot coax emit_core into a program-driven module dispatch.
+pub fn no_ambient_authority_under_unsafe_test() {
+  let binding = profiles.unsafe()
+  let allowed = runtime_modules(binding)
+  let assert Ok(m) = emit_core.emit_module(stateful_module(), binding)
+  // (a) Every `call` — INCLUDING the `instantiate/0` `seed_policy` line, a fixed
+  // `host_module` call baking the `host_open` atom under the open posture — targets a fixed
+  // runtime module atom with a literal function atom.
+  assert_calls_are_runtime(m, binding)
+  // The open-host seed is proven to be a fixed-atom call, not an ambient capability.
+  assert has_call(m, binding.host_module, "seed_policy")
+  // (b) No data-driven `apply`: every `CApply` is a static local `FName`, never a runtime
+  // module atom — the same closed-set dispatch as Safe.
+  let applies =
+    list.flat_map(m.defs, fn(d) {
+      let core_erlang.FunDef(_, v) = d
+      applies_in(v)
+    })
+  list.each(applies, fn(name) {
+    let core_erlang.FName(n, _arity) = name
+    assert set.contains(allowed, n) == False
+  })
+  // (c) The three call_indirect faults still delegate to `rt_table`/`rt_trap` (no emit-time
+  // per-fault branching) — the open posture widens no emit-site authority.
+  assert has_call(m, binding.table_module, "call_indirect")
   assert has_call(m, binding.trap_module, "raise")
 }
 
