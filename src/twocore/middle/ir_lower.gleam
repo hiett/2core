@@ -32,16 +32,38 @@
 ////      results nor moves a loop back-edge out of tail position — so the constant-space
 ////      loop property is preserved with metering on.
 ////
-//// This module reads `ir.gleam`, the `Binding` type, and the build-time `rt_bif` gate
-//// ONLY. It does **not** import the runtime IMPL modules (`rt_trap`/`rt_host`/`rt_meter`/
-//// `rt_stdlib`) — they are called by *generated* code at run time, never by this pass
-//// (D3a). `rt_bif` is build-time policy data, designed to be consulted here.
+//// ## Phase-3 policy application (F5/F6/F7)
+////
+//// The pass is now **posture-aware**: it reads the `Binding`'s explicit policy fields
+//// (`binding.meter`/`binding.stdlib`/`binding.bif_gate`, F7) — NOT the coarse `binding.mode`
+//// — and realises Safe vs Unsafe from one code path:
+////   - **metering (F5):** `MeterFuel` inserts `Charge` (the Phase-2 cost model); `MeterOff`
+////     inserts NONE (zero-overhead — the emitted `.core` has no charge calls).
+////   - **stdlib (F6):** shared-stdlib resolution is delegated to `rt_stdlib.resolve/4`
+////     (posture-aware) — `StdlibOwn` → the vetted `own` target, `StdlibPassthrough` → the vetted
+////     in-`rt_stdlib` shim (identical to `own` for the Phase-3 `gcd` corpus). The emitted module
+////     atom is invariably `binding.stdlib_module`, never a raw BEAM module (F6/D3a).
+////   - **BIF gate (F6):** the resolved target is gated through `rt_bif.check_gated/2` —
+////     `BifAllowlist` keeps the fail-closed allowlist rejection; `BifOpen` admits any
+////     build-controlled resolved target.
+//// The Safe posture (`MeterFuel`/`StdlibOwn`/`BifAllowlist`) reproduces the Phase-2 output
+//// exactly (byte-identical); the `ForbiddenHost` provenance gate stays fail-closed under EVERY
+//// posture (undeclared non-stdlib capabilities are rejected regardless of `host_policy`).
+////
+//// This module reads `ir.gleam`, the `Binding` type, the build-time `rt_bif` gate, and
+//// `rt_stdlib`'s **build-time** routing functions (`shared_surface`/`resolve` — the single
+//// source of truth for the shared-stdlib surface; unit 08 retired its local copy). It does
+//// **not** import the runtime IMPL modules `rt_trap`/`rt_host`/`rt_meter`, nor does it call
+//// `rt_stdlib`'s runtime BODIES — those are invoked by *generated* code at run time, never by
+//// this pass (D3a). `rt_bif` and `rt_stdlib`'s routing table are build-time policy data,
+//// designed to be consulted here.
 
 import gleam/list
 import gleam/set.{type Set}
 import twocore/ir.{type Expr, type Function, type Module, type Value}
-import twocore/runtime/instance.{type Binding, Safe, Unsafe}
+import twocore/runtime/instance.{type Binding, MeterFuel, MeterOff}
 import twocore/runtime/rt_bif
+import twocore/runtime/rt_stdlib
 
 // ─────────────────────────────── policy data (build-time) ───────────────────────────────
 
@@ -60,18 +82,6 @@ pub const fn_cost: Int = 1
 /// `fn_cost` the value is arbitrary; `1` makes fuel grow by exactly one per iteration so a
 /// test can assert metering is proportional to loop work.
 pub const loop_cost: Int = 1
-
-/// The Phase-1 `own`-stdlib surface: each `#(ir_name, beam_fn, arity)` maps the *name* used
-/// in an IR `CallHost(stdlib_capability, ir_name, _)` to the `rt_stdlib` function and arity
-/// it resolves to.
-///
-/// Phase 1 ships exactly one vetted entry, `gcd/2` (state.md). The concrete BEAM module of a
-/// resolved target is taken from `binding.stdlib_module` (not hard-coded here), and the
-/// resolved `module:fn/arity` is then gated through `rt_bif.allowlist()` — so this surface
-/// and the `rt_bif` allowlist cannot disagree without a cross-check test failing.
-fn own_stdlib_surface() -> List(#(String, String, Int)) {
-  [#("gcd", "gcd", 2)]
-}
 
 // ─────────────────────────────── error type (D4) ───────────────────────────────
 
@@ -96,46 +106,48 @@ pub type LowerError {
 
 // ─────────────────────────────── entry point ───────────────────────────────
 
-/// Apply the Safe-mode capability/stdlib/metering policy to `module`, returning the
+/// Apply the build-time capability/stdlib/metering POLICY to `module`, returning the
 /// rewritten module or the FIRST policy violation.
 ///
 /// - `module`: the IR module produced by the frontend lowering (unit 10). Its functions'
 ///   bodies are walked; `globals`/`imports`/`exports`/`data_segments` are unchanged
 ///   (Phase-1 globals carry only constant initialisers and contain no `CallHost`/`Loop`).
-/// - `binding`: the build-time runtime binding. Only `binding.mode` and
-///   `binding.stdlib_module` are read here; the impl module *bodies* are never imported.
+/// - `binding`: the build-time runtime binding. Posture is read from the Phase-3 policy
+///   fields (F7), NOT from `binding.mode`:
+///   - `binding.meter`   — `MeterFuel` inserts `Charge` (Phase-2 cost model); `MeterOff`
+///     inserts NONE (F5 zero-overhead — the emitted `.core` has no charge calls).
+///   - `binding.stdlib`  — BOTH postures resolve shared calls to `binding.stdlib_module`
+///     (F6); `StdlibPassthrough` only re-points the resolved *function* to a vetted
+///     in-`rt_stdlib` shim (identical to `own` for the Phase-3 `gcd` corpus).
+///   - `binding.bif_gate`— `BifAllowlist` rejects a resolved target off the `rt_bif`
+///     allowlist (fail-closed); `BifOpen` admits any build-controlled resolved target (F6).
+///   The impl module *bodies* are never imported (D3a); only `rt_stdlib`'s build-time
+///   routing table and `rt_bif`'s build-time gate are consulted.
 ///
-/// Behaviour by mode:
-/// - `Safe`: runs the full pass — gates every `CallHost` (see `LowerError`) and inserts the
-///   `Charge` metering effect at every function body and loop body.
-/// - `Unsafe` (Phase 2, not shipped): returns `module` unchanged. There is no way to obtain
-///   an `Unsafe` binding from the Phase-1 `profiles` (fail-closed), so this branch is a
-///   forward-compatible placeholder, never reached by the Phase-1 pipeline.
+/// The `CallHost` provenance gate (`ForbiddenHost` for an undeclared capability) is applied
+/// under EVERY posture — it is a well-formedness check, independent of `host_policy` (a
+/// run-time `rt_host` decision, out of this pass's scope). `binding.mode` remains on the
+/// record for other consumers (the linker; audit) but this pass no longer branches on it.
 ///
 /// Returns `Ok(rewritten_module)` if every `CallHost` is permitted, or `Error(LowerError)`
 /// on the first violation (fail-closed). Total — never panics on any input IR.
 pub fn lower(module: Module, binding: Binding) -> Result(Module, LowerError) {
-  case binding.mode {
-    Unsafe -> Ok(module)
-    Safe -> {
-      let imports = import_set(module)
-      case
-        list.try_map(module.functions, fn(f) {
-          lower_function(f, binding, imports)
-        })
-      {
-        Error(e) -> Error(e)
-        Ok(fns) -> Ok(ir.Module(..module, functions: fns))
-      }
-    }
+  let imports = import_set(module)
+  case
+    list.try_map(module.functions, fn(f) { lower_function(f, binding, imports) })
+  {
+    Error(e) -> Error(e)
+    Ok(fns) -> Ok(ir.Module(..module, functions: fns))
   }
 }
 
 // ─────────────────────────────── per-function ───────────────────────────────
 
-/// Lower one function: gate every `CallHost` in its body and meter loop bodies, then wrap
-/// the whole (rewritten) body in a `Charge(fn_cost, _)` so each call to the function meters
-/// once on entry. Returns the rewritten `Function` or the first policy violation.
+/// Lower one function: gate every `CallHost` in its body and meter loop bodies, then — under
+/// `MeterFuel` — wrap the whole (rewritten) body in a `Charge(fn_cost, _)` so each call to the
+/// function meters once on entry. Under `MeterOff` NO wrapping `Charge` is emitted (F5
+/// zero-overhead: the absence of the node, not `Charge(0, …)`). Returns the rewritten
+/// `Function` or the first policy violation.
 fn lower_function(
   f: Function,
   binding: Binding,
@@ -143,7 +155,11 @@ fn lower_function(
 ) -> Result(Function, LowerError) {
   case lower_expr(f.body, binding, imports) {
     Error(e) -> Error(e)
-    Ok(body) -> Ok(ir.Function(..f, body: ir.Charge(fn_cost, body)))
+    Ok(body) ->
+      case binding.meter {
+        MeterFuel -> Ok(ir.Function(..f, body: ir.Charge(fn_cost, body)))
+        MeterOff -> Ok(ir.Function(..f, body:))
+      }
   }
 }
 
@@ -198,12 +214,18 @@ fn lower_expr(
         Ok(body2) -> Ok(ir.Block(label, result, body2))
       }
 
-    // a loop body is metered once per iteration: wrap the rewritten body in `Charge`
+    // a loop body is metered once per iteration under `MeterFuel`: wrap the rewritten body in
+    // `Charge`. Under `MeterOff` the body is emitted unwrapped (F5) — the label/params/result
+    // are untouched either way, so the constant-space tail-`apply` loop template survives.
     ir.Loop(label, params, result, body) ->
       case lower_expr(body, binding, imports) {
         Error(e) -> Error(e)
         Ok(body2) ->
-          Ok(ir.Loop(label, params, result, ir.Charge(loop_cost, body2)))
+          case binding.meter {
+            MeterFuel ->
+              Ok(ir.Loop(label, params, result, ir.Charge(loop_cost, body2)))
+            MeterOff -> Ok(ir.Loop(label, params, result, body2))
+          }
       }
 
     ir.If(cond, result, then_branch, else_branch) ->
@@ -244,9 +266,15 @@ fn lower_expr(
 
 // ─────────────────────────────── the capability gate ───────────────────────────────
 
-/// Decide whether a single `CallHost(capability, name, args)` is PERMITTED under the Safe
+/// Decide whether a single `CallHost(capability, name, args)` is PERMITTED under `binding`'s
 /// policy. Returns `Ok(Nil)` if it may stand (the node is left unchanged for `emit_core` to
 /// route), or the typed `LowerError` on a violation. See `LowerError` for the three cases.
+///
+/// Posture-aware: the reserved-stdlib branch resolves the target under `binding.stdlib` and
+/// gates it under `binding.bif_gate` (`BifAllowlist` fail-closed vs `BifOpen` admit). The
+/// non-stdlib branch (declared-import vs `ForbiddenHost`) is posture-INDEPENDENT — an open BIF
+/// gate widens the *build-controlled BIF* allow-set, never host provenance (a `ForbiddenHost`
+/// stays fail-closed under every posture).
 fn classify_call_host(
   capability: String,
   name: String,
@@ -255,22 +283,15 @@ fn classify_call_host(
   imports: Set(#(String, String)),
 ) -> Result(Nil, LowerError) {
   case capability == stdlib_capability {
-    // reserved stdlib capability → must resolve against the surface AND pass `rt_bif`
+    // reserved stdlib capability → resolve posture-aware, then gate on `binding.bif_gate`
     True ->
-      case resolve_stdlib_fn(name) {
+      case resolve_stdlib_fn(name, list.length(args), binding) {
         Error(_) -> Error(UnknownStdlibFn(capability, name))
-        Ok(fn_name) -> {
-          let target =
-            rt_bif.BifTarget(
-              module: binding.stdlib_module,
-              function: fn_name,
-              arity: list.length(args),
-            )
-          case rt_bif.check(target) {
+        Ok(target) ->
+          case rt_bif.check_gated(target, binding.bif_gate) {
             Ok(Nil) -> Ok(Nil)
             Error(_) -> Error(BifNotAllowed(name))
           }
-        }
       }
     // any other capability → a declared host import is allowed (run-time deny); else reject
     False ->
@@ -281,14 +302,52 @@ fn classify_call_host(
   }
 }
 
-/// Resolve a stdlib `name` to its `rt_stdlib` function name, or `Error(Nil)` if `name` is
-/// not on the `own` surface. Phase 1: only `gcd`. The surface arity is NOT used to gate the
-/// call — the actual emitted arity (`list.length(args)`) is, so an arity mismatch is caught
-/// by `rt_bif` rather than silently accepted.
-fn resolve_stdlib_fn(name: String) -> Result(String, Nil) {
-  case list.find(own_stdlib_surface(), fn(e) { e.0 == name }) {
-    Ok(#(_ir_name, fn_name, _arity)) -> Ok(fn_name)
+/// Resolve a shared-stdlib IR `name` at call `arity` to its concrete BEAM `BifTarget` under
+/// `binding` — posture-aware, and the single resolution seam `emit_core` (unit 09) shares so
+/// its emission target cannot disagree with this gate (§C.3). The target module is invariably
+/// `binding.stdlib_module` (a `twocore@runtime@rt_*` module), never a raw BEAM module (F6/D3a).
+///
+/// The shared surface + passthrough routing come from `rt_stdlib` (the single source of truth;
+/// unit 08 retired its local copy):
+/// - `StdlibOwn`: `rt_stdlib.resolve` returns the vetted `own` target.
+/// - `StdlibPassthrough`: `rt_stdlib.resolve` returns the vetted in-`rt_stdlib` shim — which,
+///   for the Phase-3 `gcd` corpus (no active passthrough route), EQUALS the `own` target
+///   byte-for-byte, so emit is identical under both postures.
+///
+/// Failure mapping around `rt_stdlib.resolve/4`, which keys on name AND arity:
+/// - `name` is NOT on `rt_stdlib.shared_surface()` (name-only) → `Error(Nil)` → the caller
+///   maps this to `UnknownStdlibFn` (fail-closed).
+/// - `name` IS on the surface but the CALL arity differs from the surface arity → the own
+///   target is reconstructed AT THE CALL ARITY and returned as `Ok`, so the downstream
+///   `rt_bif` gate rejects it (`BifAllowlist` → `BifNotAllowed`) or admits it (`BifOpen`) —
+///   preserving the Phase-2 semantics that a wrong-arity `gcd/1` is a gate-level rejection,
+///   not an unknown-name rejection.
+///
+/// Returns `Ok(target)` when `name` is on the surface (target at the call arity), else
+/// `Error(Nil)`. Total — never panics.
+pub fn resolve_stdlib_fn(
+  name: String,
+  arity: Int,
+  binding: Binding,
+) -> Result(rt_bif.BifTarget, Nil) {
+  case list.find(rt_stdlib.shared_surface(), fn(e) { e.0 == name }) {
+    // name not on the shared surface → unknown stdlib fn (fail-closed)
     Error(_) -> Error(Nil)
+    Ok(#(_ir_name, own_fn, _surface_arity)) ->
+      case
+        rt_stdlib.resolve(name, arity, binding.stdlib, binding.stdlib_module)
+      {
+        // correct arity: the posture-aware resolved target (own, or the passthrough shim)
+        Ok(target) -> Ok(target)
+        // name known, arity mismatch: rebuild the own target at the CALL arity so the BIF gate
+        // decides (rejected under allowlist, admitted under open) — never an unknown-name error.
+        Error(_) ->
+          Ok(rt_bif.BifTarget(
+            module: binding.stdlib_module,
+            function: own_fn,
+            arity:,
+          ))
+      }
   }
 }
 
@@ -305,13 +364,21 @@ fn import_set(module: Module) -> Set(#(String, String)) {
 
 // ─────────────────────────────── audit / cross-check support ───────────────────────────────
 
-/// The concrete `rt_bif` targets this pass would resolve its `own`-stdlib surface to, under
-/// `binding`. Exposed for the anti-drift cross-check test (overview §11a): it must equal the
-/// `rt_bif.allowlist()` set, so the stdlib surface here and the allowlist in unit 09 cannot
-/// silently diverge. Total.
+/// The concrete `rt_bif` targets this pass resolves its shared-stdlib surface to, under
+/// `binding` — posture-aware. Every target's module is `binding.stdlib_module` (a
+/// `twocore@runtime@rt_*` module) under BOTH postures. Exposed for the anti-drift cross-check
+/// test so the surface here and the published passthrough/allowlist surfaces cannot silently
+/// diverge (§C.3):
+/// - `StdlibOwn`         ⇒ the `own` targets (must equal `rt_bif.allowlist()`).
+/// - `StdlibPassthrough` ⇒ the passthrough targets (unit 06's published passthrough surface —
+///   all `binding.stdlib_module` targets; for the Phase-3 `gcd` corpus these EQUAL the `own`
+///   targets, since no active passthrough route ships).
+///
+/// Each surface entry is resolved at its own surface arity, so the resolution never falls into
+/// the wrong-arity path. Total.
 pub fn resolved_stdlib_targets(binding: Binding) -> List(rt_bif.BifTarget) {
-  list.map(own_stdlib_surface(), fn(entry) {
-    let #(_ir_name, fn_name, arity) = entry
-    rt_bif.BifTarget(module: binding.stdlib_module, function: fn_name, arity:)
+  list.filter_map(rt_stdlib.shared_surface(), fn(entry) {
+    let #(ir_name, _own_fn, arity) = entry
+    rt_stdlib.resolve(ir_name, arity, binding.stdlib, binding.stdlib_module)
   })
 }

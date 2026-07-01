@@ -12,7 +12,6 @@ import gleam/set
 import twocore/ir
 import twocore/middle/ir_lower
 import twocore/pipeline
-import twocore/runtime/instance
 import twocore/runtime/profiles
 import twocore/runtime/rt_bif
 import twocore/runtime/rt_meter
@@ -207,16 +206,101 @@ fn sum_to_loop_body() -> ir.Expr {
   body
 }
 
-// ─────────────────────────────── Unsafe is a pass-through (Phase-2 placeholder) ───────────────────────────────
+// ─────────────────────────────── Phase-3 Unsafe posture (F5/F6/F7) ───────────────────────────────
 
-/// Under a (non-shipping) `Unsafe` binding the pass is a no-op pass-through: no metering, no
-/// gating. There is no way to obtain an `Unsafe` binding from `profiles` (fail-closed), so
-/// this is only reachable by hand-constructing the binding.
-pub fn unsafe_mode_passthrough_test() {
-  let unsafe_binding =
-    instance.Binding(..instance.safe_default(), mode: instance.Unsafe)
-  let m = module_with([add_fn()], [])
-  assert ir_lower.lower(m, unsafe_binding) == Ok(m)
+/// Recursively count every `ir.Charge` node in `expr` (only `Charge`, `Let`, `Block`, `Loop`,
+/// `If`, `Switch` bear sub-expressions; every other node is a leaf). Used to prove metering
+/// PRESENCE (`MeterFuel`) / ABSENCE (`MeterOff`, F5 zero-overhead) structurally.
+fn count_charge(expr: ir.Expr) -> Int {
+  case expr {
+    ir.Charge(_cost, body) -> 1 + count_charge(body)
+    ir.Let(_, rhs, body) -> count_charge(rhs) + count_charge(body)
+    ir.Block(_, _, body) -> count_charge(body)
+    ir.Loop(_, _, _, body) -> count_charge(body)
+    ir.If(_, _, then_b, else_b) -> count_charge(then_b) + count_charge(else_b)
+    ir.Switch(_, _, arms, default) ->
+      list.fold(arms, count_charge(default), fn(acc, arm) {
+        acc + count_charge(arm.body)
+      })
+    _ -> 0
+  }
+}
+
+/// Total `ir.Charge` nodes across every function body of `module`.
+fn count_charge_module(module: ir.Module) -> Int {
+  list.fold(module.functions, 0, fn(acc, f) { acc + count_charge(f.body) })
+}
+
+/// F5 zero-overhead: under the real `profiles.unsafe()` posture (`meter: MeterOff`) lowering a
+/// module with a plain function AND a function containing a `Loop` inserts **no `ir.Charge`
+/// node at all** — neither the function-entry wrapper nor the per-loop `Charge`. Absence, not
+/// `Charge(0, …)`.
+pub fn meter_off_inserts_zero_charge_test() {
+  let m = module_with([add_fn(), sum_to_fn()], [])
+  let assert Ok(out) = ir_lower.lower(m, profiles.unsafe())
+  assert count_charge_module(out) == 0
+}
+
+/// The metering contract re-asserted (not a lock-in of magnitudes): under `profiles.safe()`
+/// (`meter: MeterFuel`) each function body is wrapped in exactly one `Charge` and each `Loop`
+/// body in exactly one `Charge`, so the total is `#functions + #loops` (here 2 + 1 == 3).
+pub fn meter_fuel_inserts_phase2_charges_test() {
+  let m = module_with([add_fn(), sum_to_fn()], [])
+  let assert Ok(out) = ir_lower.lower(m, profiles.safe())
+  assert count_charge_module(out) == 3
+}
+
+/// F6 passthrough resolution: a shared-stdlib `gcd/2` resolves to the SAME
+/// `stdlib_module` target under BOTH postures (passthrough ≡ own for the Phase-3 corpus, since
+/// `gcd` has no active passthrough route). The emitted module atom is invariably
+/// `binding.stdlib_module`, never a raw BEAM module.
+pub fn passthrough_resolution_picks_stdlib_module_target_test() {
+  let safe = profiles.safe()
+  let unsafe = profiles.unsafe()
+  let own_target =
+    rt_bif.BifTarget(module: safe.stdlib_module, function: "gcd", arity: 2)
+  assert ir_lower.resolve_stdlib_fn("gcd", 2, safe) == Ok(own_target)
+  assert ir_lower.resolve_stdlib_fn("gcd", 2, unsafe) == Ok(own_target)
+}
+
+/// The extended anti-drift cross-check (§C.3): the passthrough surface resolves to the SAME
+/// targets as the `own` surface (F6: passthrough ≡ own; zero active routes) and both equal the
+/// `rt_bif` allowlist — so own/passthrough resolution cannot silently drift from unit 06.
+pub fn passthrough_targets_match_own_and_allowlist_test() {
+  let own = set.from_list(ir_lower.resolved_stdlib_targets(profiles.safe()))
+  let passthrough =
+    set.from_list(ir_lower.resolved_stdlib_targets(profiles.unsafe()))
+  let allowed = set.from_list(rt_bif.allowlist())
+  assert passthrough == own
+  assert passthrough == allowed
+}
+
+/// F6 open admits / allowlist rejects: a `gcd/1` `CallHost` resolves to `rt_stdlib:gcd/1`, a
+/// build-controlled target that is OFF the allowlist (only `gcd/2` is on it). Under Safe
+/// (`BifAllowlist`) the same call is rejected fail-closed; under Unsafe (`BifOpen`) it is
+/// admitted (and, under `MeterOff`, no `Charge` is inserted, so the module is returned
+/// unchanged).
+pub fn open_admits_target_allowlist_rejects_test() {
+  let m = module_with([call_host_fn("g", "std", "gcd", [ir.Var("p0")])], [])
+  assert ir_lower.lower(m, profiles.safe())
+    == Error(ir_lower.BifNotAllowed("gcd"))
+  assert ir_lower.lower(m, profiles.unsafe()) == Ok(m)
+}
+
+/// D3a preserved under `open` (§A.3): the open BIF gate is NOT open provenance. An UNRESOLVED
+/// stdlib name still fails `UnknownStdlibFn` (open admits only resolved targets), and an
+/// UNDECLARED non-stdlib capability still fails `ForbiddenHost` (host provenance is fail-closed
+/// under every posture).
+pub fn open_still_rejects_unknown_and_undeclared_host_test() {
+  let unknown =
+    module_with([call_host_fn("g", "std", "frobnicate", [ir.Var("p0")])], [])
+  assert ir_lower.lower(unknown, profiles.unsafe())
+    == Error(ir_lower.UnknownStdlibFn("std", "frobnicate"))
+
+  let undeclared =
+    module_with([call_host_fn("e", "evil", "run", [ir.Var("p0")])], [])
+  assert ir_lower.lower(undeclared, profiles.unsafe())
+    == Error(ir_lower.ForbiddenHost("evil", "run"))
 }
 
 // ─────────────────────────────── anti-drift cross-check (policy == rt_bif) ───────────────────────────────
