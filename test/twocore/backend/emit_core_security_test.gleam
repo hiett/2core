@@ -311,6 +311,54 @@ pub fn no_ambient_authority_under_unsafe_test() {
   assert has_call(m, binding.trap_module, "raise")
 }
 
+/// D3a holds under the THREADED posture (P4-02): with `state_strategy: Threaded`, generated
+/// code threads the `InstanceState` record as an ordinary VALUE, yet the emitted module STILL
+/// targets only fixed `Binding` runtime atoms with literal function atoms, and every `apply` is
+/// a compile-time-local `FName`. The threaded seam emits the `t_*`/`fresh` family on the SAME
+/// fixed `twocore@runtime@*` modules; `St` is an ordinary argument (a Core var), never a
+/// module/function selector; the `call_indirect` index is still the sole runtime-data input to
+/// a control transfer and the closures are build-controlled captures of literal `f<idx>` names.
+/// Because `runtime_modules(threaded)` is the same fixed set (identical `*_module` names),
+/// passing the identical walk IS the proof (keystone §note, unit-doc §"Effect note"). Uses the
+/// SAME `stateful_module()` fixture (call_indirect + every mem/global/table op + the record-
+/// returning `instantiate/0`).
+pub fn no_ambient_authority_under_threaded_test() {
+  let binding =
+    instance.Binding(
+      ..instance.safe_default(),
+      state_strategy: instance.Threaded,
+    )
+  let allowed = runtime_modules(binding)
+  let assert Ok(m) = emit_core.emit_module(stateful_module(), binding)
+  // (a) Every `call` — INCLUDING the threaded `t_*` seam and the record-BUILDING
+  // `rt_state:fresh` in `instantiate/0` — targets a fixed runtime module atom with a literal
+  // function atom.
+  assert_calls_are_runtime(m, binding)
+  // The threaded seam calls the `t_*`/`fresh` family on the fixed `Binding` modules, never a
+  // program-chosen module/function.
+  assert has_call(m, binding.mem_module, "t_store")
+  assert has_call(m, binding.mem_module, "t_load")
+  assert has_call(m, binding.state_module, "t_global_get")
+  assert has_call(m, binding.state_module, "t_global_set")
+  assert has_call(m, binding.table_module, "t_call_indirect")
+  assert has_call(m, binding.state_module, "fresh")
+  // (b) No data-driven `apply`: every `CApply` is a static local `FName`, never a runtime
+  // module atom — the same closed-set dispatch as Cell (the threaded `St` is a closure/function
+  // PARAMETER, not a dispatch key).
+  let applies =
+    list.flat_map(m.defs, fn(d) {
+      let core_erlang.FunDef(_, v) = d
+      applies_in(v)
+    })
+  list.each(applies, fn(name) {
+    let core_erlang.FName(n, _arity) = name
+    assert set.contains(allowed, n) == False
+  })
+  // (c) The three call_indirect faults still delegate to `rt_table`/`rt_trap` (no emit-time
+  // per-fault branching) — threading the record widens no emit-site authority.
+  assert has_call(m, binding.trap_module, "raise")
+}
+
 /// True iff some def in `m` contains a `call '<module>':'<fun>'(…)`.
 fn has_call(m: CModule, module: String, fun: String) -> Bool {
   list.any(m.defs, fn(d) {

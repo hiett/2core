@@ -108,7 +108,7 @@ import twocore/ir.{
 }
 import twocore/runtime/instance.{
   type Binding, type HostPolicy, HostDenyAll, HostOpen, HostWhitelist, MeterFuel,
-  MeterOff,
+  MeterOff, Threaded,
 }
 
 // ─────────────────────────────── error type (D4) ───────────────────────────────
@@ -149,17 +149,26 @@ pub type EmitError {
 /// Read-only emission context shared across one module:
 /// - `binding`: the runtime `Binding` (the chokepoint table).
 /// - `fn_arity`: each defined function's PARAMETER count (the `apply 'f'/n` arity, for
-///   resolving `CallDirect`/exports).
+///   resolving `CallDirect`/exports). NOTE: this is the Phase-1 arity (`n`); a
+///   state-reaching function under `Threaded` is emitted and applied at `n+1` (the leading
+///   `InstanceState`), so the seam adds `+1` at the call/export site (§B).
 /// - `fn_results`: each defined function's RESULT count, needed to unpack a call: a
 ///   function returning 0/1/many values is realised as a single BEAM value (a dummy / the
 ///   bare value / a tuple — see `function_return`), so the caller must unpack it back into
 ///   the right number of values.
+/// - `fn_sig`: each defined function's `FuncType` (for the `call_indirect` element type tag).
+/// - `fn_state_reaching`: under `state_strategy: Threaded`, the transitive-closure set of
+///   functions that touch instance state (§A.3). A function in this set is emitted at
+///   arity `n+1`, threads the `InstanceState` record as its leading parameter, and returns
+///   `{ResultPackage, St'}`. Computed once in `emit_module`; unused (but harmless) under
+///   `Cell`, where every function keeps its Phase-1 shape.
 type Ctx {
   Ctx(
     binding: Binding,
     fn_arity: Dict(String, Int),
     fn_results: Dict(String, Int),
     fn_sig: Dict(String, FuncType),
+    fn_state_reaching: Set(String),
   )
 }
 
@@ -173,6 +182,23 @@ type Cont {
   KReturn
   KJump(target: FName)
   KBind(names: List(String), body: Expr, next: Cont)
+}
+
+/// The state-threading channel carried alongside `cont` under `state_strategy: Threaded`
+/// (keystone §A.2). It is *environment*, not accumulator: it flows down, is REBOUND after
+/// each mutating op, and BRANCHES (each `if` arm / loop iteration has its own live record),
+/// so it is a parameter, never stored in `EmitState`.
+///
+/// - `NoState`: the `Cell` strategy, OR a PURE function under `Threaded` — emit today's
+///   code. No record is threaded; functions keep their Phase-1 arity; `KReturn` yields the
+///   bare `function_return` package.
+/// - `Threading(cur)`: `cur` is the raw Core-variable name currently holding the live
+///   `InstanceState`. Reads pass `cur`; mutators REBIND a fresh var and continue under
+///   `Threading(fresh)`; `KReturn` pairs the package with `cur` into `{Package, cur}`; a
+///   `KJump`/loop back-edge PREPENDS `cur` to the value list.
+type StateChan {
+  NoState
+  Threading(cur: String)
 }
 
 /// One entry of the compile-time label → continuation stack.
@@ -270,20 +296,21 @@ pub fn emit_module(
   let fn_sig =
     list.map(module.functions, fn(f) { #(f.name, ir.signature(f)) })
     |> dict.from_list
+  // The state-reaching call-graph closure (§A.3) — computed ONCE, keyed on only under
+  // `Threaded`. Under `Cell` it is inert (every function keeps its Phase-1 shape).
+  let fn_state_reaching = state_reaching_closure(module.functions)
   let ctx =
     Ctx(
       binding: binding,
       fn_arity: fn_arity,
       fn_results: fn_results,
       fn_sig: fn_sig,
+      fn_state_reaching: fn_state_reaching,
     )
   use defs <- result.try(
     list.try_map(module.functions, fn(f) { emit_function(f, ctx) }),
   )
-  use #(export_names, wrappers) <- result.try(emit_exports(
-    module.exports,
-    fn_arity,
-  ))
+  use #(export_names, wrappers) <- result.try(emit_exports(module.exports, ctx))
   // The generated instantiation entry (E5) — seeds the fresh per-instance cell and runs
   // the active element/data segments + start in WASM spec order. Always emitted and
   // exported so the harness (unit 11) can call `instantiate/0` in the instance process.
@@ -298,31 +325,101 @@ pub fn emit_module(
 
 /// Build the Core export list and any forwarding wrappers from the IR exports.
 ///
-/// For `ExportFn(export_name, fn_name)`: if the two names are equal, export
-/// `'fn_name'/arity` directly; otherwise emit a wrapper `'export_name'/arity = fun(A…) ->
-/// apply 'fn_name'/arity(A…)` (Core Erlang exports a function by its own name) and export
-/// the wrapper. `Error(UnknownFunction)` if `fn_name` is not defined in the module.
+/// **Under `Cell`** (byte-identical to Phase 2/3): for `ExportFn(export_name, fn_name)`, if
+/// the two names are equal export `'fn_name'/arity` directly; otherwise emit a forwarding
+/// wrapper `'export_name'/arity = fun(A…) -> apply 'fn_name'/arity(A…)` (Core Erlang exports
+/// a function by its own name/arity).
+///
+/// **Under `Threaded`** the export boundary is made UNIFORM (§B.4) so unit 08's run-ABI can
+/// always pass the `InstanceState` leading and always receive `{Package, St'}` — every export
+/// presents at arity `n+1`. For `ExportFn(export_name, fn_name)`:
+/// - `fn_name` STATE-REACHING and `export_name == fn_name` → export the internal
+///   `'fn_name'/(n+1)` DIRECTLY (no wrapper). `emit_function` already emitted it with exactly
+///   the run-ABI shape `fun(St, A…) -> {Package, St'}`; synthesizing a same-name/arity wrapper
+///   would emit a DUPLICATE `FunDef` (invalid Core) that also self-applies (infinite
+///   recursion). This mirrors the `Cell` name-equality check and is the common case
+///   (`ExportFn(f, f)`).
+/// - `fn_name` STATE-REACHING and `export_name != fn_name` → forwarding wrapper
+///   `'export_name'/(n+1) = fun(St, A…) -> apply 'fn_name'/(n+1)(St, A…)` (already
+///   `{Package, St'}`). A distinct name cannot collide with the internal `'fn_name'/(n+1)`.
+/// - `fn_name` PURE (either name relation) → adapting wrapper
+///   `'export_name'/(n+1) = fun(St, A…) -> {apply 'fn_name'/n(A…), St}` — threads `St`
+///   straight through. Even when `export_name == fn_name`, the DISTINCT ARITY (`n+1` vs the
+///   internal `'fn_name'/n`) keeps them apart, so no collision.
+///
+/// `Error(UnknownFunction)` if `fn_name` is not defined in the module.
 fn emit_exports(
   exports: List(ir.ExportDecl),
-  fn_arity: Dict(String, Int),
+  ctx: Ctx,
 ) -> Result(#(List(FName), List(FunDef)), EmitError) {
   list.try_fold(exports, #([], []), fn(acc, exp) {
     let #(names, wrappers) = acc
     let ir.ExportFn(export_name, fn_name) = exp
-    case dict.get(fn_arity, fn_name) {
+    case dict.get(ctx.fn_arity, fn_name) {
       Error(_) -> Error(UnknownFunction(fn_name))
       Ok(arity) ->
-        case export_name == fn_name {
-          True -> Ok(#([FName(fn_name, arity), ..names], wrappers))
-          False -> {
-            let params =
-              list.index_map(list.repeat("", arity), fn(_, i) {
-                "ea" <> int.to_string(i)
-              })
-            let body = CApply(FName(fn_name, arity), list.map(params, CVar))
-            let wrapper = FunDef(FName(export_name, arity), CFun(params, body))
-            Ok(#([FName(export_name, arity), ..names], [wrapper, ..wrappers]))
-          }
+        case is_threaded(ctx) {
+          False ->
+            // ── Cell: unchanged (direct export when names match, else a bare forwarder). ──
+            case export_name == fn_name {
+              True -> Ok(#([FName(fn_name, arity), ..names], wrappers))
+              False -> {
+                let params = wrapper_arg_params(arity)
+                let body = CApply(FName(fn_name, arity), list.map(params, CVar))
+                let wrapper =
+                  FunDef(FName(export_name, arity), CFun(params, body))
+                Ok(
+                  #([FName(export_name, arity), ..names], [wrapper, ..wrappers]),
+                )
+              }
+            }
+          True ->
+            case set.contains(ctx.fn_state_reaching, fn_name) {
+              // A state-reaching def already IS the `n+1` run-ABI export.
+              True ->
+                case export_name == fn_name {
+                  // Export it directly — NO second def (the P3 collision fix).
+                  True -> Ok(#([FName(fn_name, arity + 1), ..names], wrappers))
+                  // A distinctly-named forwarder to the internal `n+1` def.
+                  False -> {
+                    let params = wrapper_arg_params(arity)
+                    let body =
+                      CApply(FName(fn_name, arity + 1), [
+                        CVar(wrapper_state_param),
+                        ..list.map(params, CVar)
+                      ])
+                    let wrapper =
+                      FunDef(
+                        FName(export_name, arity + 1),
+                        CFun([wrapper_state_param, ..params], body),
+                      )
+                    Ok(
+                      #([FName(export_name, arity + 1), ..names], [
+                        wrapper,
+                        ..wrappers
+                      ]),
+                    )
+                  }
+                }
+              // A pure def gets a thin `n+1` adapter returning `{apply 'g'/n(A…), St}`.
+              False -> {
+                let params = wrapper_arg_params(arity)
+                let applied =
+                  CApply(FName(fn_name, arity), list.map(params, CVar))
+                let body = CTuple([applied, CVar(wrapper_state_param)])
+                let wrapper =
+                  FunDef(
+                    FName(export_name, arity + 1),
+                    CFun([wrapper_state_param, ..params], body),
+                  )
+                Ok(
+                  #([FName(export_name, arity + 1), ..names], [
+                    wrapper,
+                    ..wrappers
+                  ]),
+                )
+              }
+            }
         }
     }
   })
@@ -332,91 +429,366 @@ fn emit_exports(
   })
 }
 
+/// The `arity` positional argument-parameter names for a synthesized export wrapper
+/// (`ea0`, `ea1`, …). Wrapper-local, so they only need to be internally distinct + Core-legal.
+fn wrapper_arg_params(arity: Int) -> List(String) {
+  list.index_map(list.repeat("", arity), fn(_, i) { "ea" <> int.to_string(i) })
+}
+
+/// The leading `InstanceState` parameter name of a synthesized THREADED export wrapper.
+/// Distinct from every `wrapper_arg_params` name (`ea…`), so no wrapper-local collision.
+const wrapper_state_param = "est"
+
 /// Lower one IR `Function` to a top-level Core `FunDef`.
 ///
 /// The body is emitted in tail position under `KReturn`. The Core `fun`'s parameters are
 /// the IR param names verbatim (the printer legalizes them). Declared `locals` are not
 /// pre-bound: in the Phase-1 corpus `locals` is empty and all body bindings come from
 /// `Let`/loop params; a frontend that populates `locals` must also bind them.
+///
+/// Under `state_strategy: Threaded`, a STATE-REACHING function (`ctx.fn_state_reaching`) is
+/// emitted as `'f'/(n+1) = fun (St, params…) -> {ResultPackage, St'}` — the `InstanceState`
+/// record threaded as the LEADING parameter and paired with the outgoing record on return
+/// (§B.1). A PURE function (and every function under `Cell`) keeps its Phase-1 `'f'/n` shape
+/// (channel `NoState`), so pure numeric leaves pay nothing.
 fn emit_function(f: Function, ctx: Ctx) -> Result(FunDef, EmitError) {
   let reserved_vars = collect_vars(f)
   let reserved_fns = set.from_list(dict.keys(ctx.fn_arity))
   let state0 =
     EmitState(counter: 0, vars: reserved_vars, fns: reserved_fns, labels: [])
-  use #(body, _state) <- result.try(emit(f.body, KReturn, state0, ctx))
-  let params = list.map(f.params, fn(l) { l.name })
-  Ok(FunDef(FName(f.name, list.length(f.params)), CFun(params, body)))
+  case is_threaded(ctx) && set.contains(ctx.fn_state_reaching, f.name) {
+    True -> {
+      let #(st0, state1) = fresh_var(state0)
+      use #(body, _state) <- result.try(emit(
+        f.body,
+        KReturn,
+        Threading(st0),
+        state1,
+        ctx,
+      ))
+      let params = [st0, ..list.map(f.params, fn(l) { l.name })]
+      Ok(FunDef(FName(f.name, list.length(f.params) + 1), CFun(params, body)))
+    }
+    False -> {
+      use #(body, _state) <- result.try(emit(
+        f.body,
+        KReturn,
+        NoState,
+        state0,
+        ctx,
+      ))
+      let params = list.map(f.params, fn(l) { l.name })
+      Ok(FunDef(FName(f.name, list.length(f.params)), CFun(params, body)))
+    }
+  }
+}
+
+/// `True` when the build threads the `InstanceState` record (`state_strategy: Threaded`),
+/// `False` for the `Cell` (pdict) strategy — the ONE codegen-shape switch (§A.1).
+fn is_threaded(ctx: Ctx) -> Bool {
+  ctx.binding.state_strategy == Threaded
+}
+
+// ─────────────────────────── the state-reaching call-graph closure (§A.3) ───────────────────────────
+
+/// Compute the set of STATE-REACHING functions: the transitive `CallDirect` closure of the
+/// functions whose body contains a stateful op (§A.3). A function is state-reaching iff it
+/// (1) contains any of the seven stateful nodes — `MemLoad`/`MemStore`/`MemSize`/`MemGrow`/
+/// `GlobalGet`/`GlobalSet`/`CallIndirect` (reads count, since they need the record to read
+/// FROM) — or (2) transitively `CallDirect`s a state-reaching function. Computing it as a
+/// closure (not just "direct") is the correctness crux of uniform threading: a caller of a
+/// memory-touching helper must thread the record even with no stateful node of its own.
+///
+/// `CallHost`/`Charge` are NOT seeds (the host boundary + fuel counter never touch the
+/// record); a `CallIndirect` TARGET is reached via the table (not a `CallDirect` edge), so a
+/// pure table target stays pure and only the closure adapter absorbs the ABI (§C). Under
+/// `Cell` the result is unused.
+fn state_reaching_closure(functions: List(Function)) -> Set(String) {
+  let seeds =
+    list.filter_map(functions, fn(f) {
+      case expr_touches_state(f.body) {
+        True -> Ok(f.name)
+        False -> Error(Nil)
+      }
+    })
+    |> set.from_list
+  let edges =
+    list.map(functions, fn(f) { #(f.name, direct_callees(f.body, set.new())) })
+    |> dict.from_list
+  reaching_fixpoint(functions, edges, seeds)
+}
+
+/// The monotone fixpoint over the `CallDirect` edge graph: add any function whose callee set
+/// intersects the current state-reaching set, until no function is added. Terminates because
+/// the set only grows and is bounded by the (finite) function count.
+fn reaching_fixpoint(
+  functions: List(Function),
+  edges: Dict(String, Set(String)),
+  current: Set(String),
+) -> Set(String) {
+  let next =
+    list.fold(functions, current, fn(acc, f) {
+      case set.contains(acc, f.name) {
+        True -> acc
+        False -> {
+          let callees = result.unwrap(dict.get(edges, f.name), set.new())
+          case any_member(callees, acc) {
+            True -> set.insert(acc, f.name)
+            False -> acc
+          }
+        }
+      }
+    })
+  case set.size(next) == set.size(current) {
+    True -> current
+    False -> reaching_fixpoint(functions, edges, next)
+  }
+}
+
+/// `True` iff any element of `xs` is a member of `ys` (a non-empty set intersection).
+fn any_member(xs: Set(String), ys: Set(String)) -> Bool {
+  set.fold(xs, False, fn(found, x) { found || set.contains(ys, x) })
+}
+
+/// `True` iff `expr` (recursively) contains one of the seven stateful nodes — the seeding
+/// condition (§A.3). `CallDirect`/`CallHost`/`Charge` are NOT stateful nodes (a caller's
+/// state-reaching-ness flows through the `CallDirect` closure, not this scan).
+fn expr_touches_state(expr: Expr) -> Bool {
+  case expr {
+    MemLoad(..)
+    | MemStore(..)
+    | MemSize
+    | MemGrow(..)
+    | GlobalGet(..)
+    | GlobalSet(..)
+    | CallIndirect(..) -> True
+    Let(_, rhs, body) -> expr_touches_state(rhs) || expr_touches_state(body)
+    If(_, _, t, e) -> expr_touches_state(t) || expr_touches_state(e)
+    Switch(_, _, arms, default) ->
+      list.any(arms, fn(a) {
+        let SwitchArm(_, b) = a
+        expr_touches_state(b)
+      })
+      || expr_touches_state(default)
+    Block(_, _, body) -> expr_touches_state(body)
+    Loop(_, _, _, body) -> expr_touches_state(body)
+    Charge(_, body) -> expr_touches_state(body)
+    _ -> False
+  }
+}
+
+/// Accumulate every `CallDirect` target name reachable in `expr` (the call-graph edges out of
+/// a function body). Only `CallDirect` edges — `CallIndirect` targets go through the table, so
+/// they are not static edges.
+fn direct_callees(expr: Expr, acc: Set(String)) -> Set(String) {
+  case expr {
+    CallDirect(name, _) -> set.insert(acc, name)
+    Let(_, rhs, body) -> direct_callees(body, direct_callees(rhs, acc))
+    If(_, _, t, e) -> direct_callees(e, direct_callees(t, acc))
+    Switch(_, _, arms, default) -> {
+      let acc =
+        list.fold(arms, acc, fn(a, arm) {
+          let SwitchArm(_, b) = arm
+          direct_callees(b, a)
+        })
+      direct_callees(default, acc)
+    }
+    Block(_, _, body) -> direct_callees(body, acc)
+    Loop(_, _, _, body) -> direct_callees(body, acc)
+    Charge(_, body) -> direct_callees(body, acc)
+    _ -> acc
+  }
 }
 
 // ─────────────────────────────── the core emitter ───────────────────────────────
 
-/// Emit `expr` in tail position under continuation `cont`, threading `state`.
+/// Emit `expr` in tail position under continuation `cont` and state channel `sc`, threading
+/// `state`.
 ///
 /// Returns the Core expression for `expr` (its yielded values disposed of by `cont`) and
 /// the advanced state, or an `EmitError`. The non-returning transfers (`Return`/`Trap`/
-/// `Break`/`Continue`) ignore `cont` and emit the transfer directly.
+/// `Break`/`Continue`) ignore `cont` and emit the transfer directly. Under `Threading(cur)`
+/// (§A.2), reads pass `cur`, mutators rebind it, and `Return`/`KReturn` pair the package with
+/// the live record; under `NoState` the Phase-2/3 cell code is emitted verbatim.
 fn emit(
   expr: Expr,
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case expr {
-    Values(vs) -> apply_cont(cont, list.map(vs, emit_value), state, ctx)
-    Return(vs) -> Ok(#(function_return(list.map(vs, emit_value)), state))
-    Num(op, args) -> emit_num(op, args, cont, state, ctx)
-    Convert(op, arg) -> emit_convert(op, arg, cont, state, ctx)
+    Values(vs) -> apply_cont(cont, list.map(vs, emit_value), sc, state, ctx)
+    Return(vs) -> emit_return(vs, sc, state)
+    Num(op, args) -> emit_num(op, args, cont, sc, state, ctx)
+    Convert(op, arg) -> emit_convert(op, arg, cont, sc, state, ctx)
     CallDirect(fn_name, args) ->
-      emit_call_direct(fn_name, args, cont, state, ctx)
+      emit_call_direct(fn_name, args, cont, sc, state, ctx)
     CallHost(cap, name, args) ->
-      emit_call_host(cap, name, args, cont, state, ctx)
-    Let(names, rhs, body) -> emit(rhs, KBind(names, body, cont), state, ctx)
-    If(cond, result, t, e) -> emit_if(cond, result, t, e, cont, state, ctx)
+      emit_call_host(cap, name, args, cont, sc, state, ctx)
+    Let(names, rhs, body) -> emit(rhs, KBind(names, body, cont), sc, state, ctx)
+    If(cond, result, t, e) -> emit_if(cond, result, t, e, cont, sc, state, ctx)
     Switch(sel, result, arms, default) ->
-      emit_switch(sel, result, arms, default, cont, state, ctx)
+      emit_switch(sel, result, arms, default, cont, sc, state, ctx)
     Block(label, result, body) ->
-      emit_block(label, result, body, cont, state, ctx)
+      emit_block(label, result, body, cont, sc, state, ctx)
     Loop(label, params, result, body) ->
-      emit_loop(label, params, result, body, cont, state, ctx)
-    Break(label, vs) -> emit_break(label, vs, state, ctx)
-    Continue(label, vs) -> emit_continue(label, vs, state)
+      emit_loop(label, params, result, body, cont, sc, state, ctx)
+    Break(label, vs) -> emit_break(label, vs, sc, state, ctx)
+    Continue(label, vs) -> emit_continue(label, vs, sc, state)
     Trap(reason) ->
       Ok(#(raise_trap(ctx, CAtom(trap_reason_atom(reason))), state))
-    Charge(cost, body) -> emit_charge(cost, body, cont, state, ctx)
-    // ── Phase-2 stateful ops — routed through the ONE state-access seam (`seam_call`),
-    // each a direct `call '<binding.X_module>':'op'(...)` with no ambient authority. ──
-    MemSize ->
+    Charge(cost, body) -> emit_charge(cost, body, cont, sc, state, ctx)
+    // ── Stateful ops — routed through the ONE state-access seam (`seam_call`). Under
+    // `NoState` each is today's cell `call '<binding.X_module>':'op'(...)`; under
+    // `Threading(cur)` each threads the `InstanceState` record through the `t_*` family. ──
+    MemSize -> emit_mem_size(cont, sc, state, ctx)
+    MemGrow(delta) -> emit_mem_grow(delta, cont, sc, state, ctx)
+    MemLoad(op, addr, offset, result) ->
+      emit_mem_load(op, addr, offset, result, cont, sc, state, ctx)
+    MemStore(op, addr, value, offset) ->
+      emit_mem_store(op, addr, value, offset, cont, sc, state, ctx)
+    GlobalGet(name) -> emit_global_get(name, cont, sc, state, ctx)
+    GlobalSet(name, value) -> emit_global_set(name, value, cont, sc, state, ctx)
+    CallIndirect(_table, index, ty, args) ->
+      emit_call_indirect(index, ty, args, cont, sc, state, ctx)
+    // Out of scope — typed error, never a panic. Only the term layer (`TermOp`) and the
+    // term↔numeric boxing `Convert`s remain unlowered (handled in `emit_convert`).
+    TermOp(..) -> Error(UnsupportedNode("term_op"))
+  }
+}
+
+/// Lower `Return(vs)` (the non-continuation transfer). Under `NoState` it yields the bare
+/// `function_return` package; under `Threading(cur)` it pairs that package with the CURRENT
+/// live record into the `{Package, St'}` 2-tuple (§B.2).
+fn emit_return(
+  vs: List(Value),
+  sc: StateChan,
+  state: EmitState,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let pkg = function_return(list.map(vs, emit_value))
+  case sc {
+    NoState -> Ok(#(pkg, state))
+    Threading(cur) -> Ok(#(CTuple([pkg, CVar(cur)]), state))
+  }
+}
+
+// ─────────────────────────── the per-op state seam (cell / threaded) ───────────────────────────
+
+/// `memory.size` (read-only). `NoState`: `call '<mem>':'size'()`. `Threading(cur)`:
+/// `call '<mem>':'t_size'(St)` — the record is threaded on UNCHANGED.
+fn emit_mem_size(
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case sc {
+    NoState ->
       apply_cont(
         cont,
         [seam_call(ctx.binding.mem_module, "size", [])],
+        sc,
         state,
         ctx,
       )
-    MemGrow(delta) ->
+    Threading(cur) ->
+      apply_cont(
+        cont,
+        [seam_call(ctx.binding.mem_module, "t_size", [CVar(cur)])],
+        sc,
+        state,
+        ctx,
+      )
+  }
+}
+
+/// `memory.grow` (effectful). `NoState`: a bare `call '<mem>':'grow'(Delta)` (i32).
+/// `Threading(cur)`: `{V, St2} = call '<mem>':'t_grow'(St, Delta)` — bind the old page count
+/// `V`, REBIND the record to `St2` (`t_grow` charges the success-path fuel internally, unit
+/// 04, so emit charges nothing here).
+fn emit_mem_grow(
+  delta: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case sc {
+    NoState ->
       apply_cont(
         cont,
         [seam_call(ctx.binding.mem_module, "grow", [emit_value(delta)])],
+        sc,
         state,
         ctx,
       )
-    MemLoad(op, addr, offset, result) -> {
-      // `load(Bytes, Signed, ResultWidth, Addr, Off)` → `{ok,V}`/`{error,R}` (trapping).
+    Threading(cur) -> {
       let call =
-        seam_call(ctx.binding.mem_module, "load", [
-          CInt(op.bytes),
-          bool_atom(op.signed),
-          CInt(result_width(result)),
-          emit_value(addr),
-          CInt(offset),
+        seam_call(ctx.binding.mem_module, "t_grow", [
+          CVar(cur),
+          emit_value(delta),
         ])
-      emit_trapping_result(call, cont, state, ctx)
+      emit_value_state_pair(call, cont, state, ctx)
     }
-    MemStore(op, addr, value, offset) -> {
-      // `store(Bytes, Addr, Val, Off)` → `{ok,_}`/`{error,R}`; a ZERO-RESULT ordered
-      // effect (`op.signed` is irrelevant for stores — `storeN` writes the low N bytes).
-      // Eval order is addr → value → store: the args are already atomic `Value`s, so
-      // left-to-right `call` arg order fixes addr-before-value; the store is the single
-      // sequenced effect (non-DCE, non-reorderable, E6).
+  }
+}
+
+/// `t.load` (trapping, read-only). `NoState`: `case '<mem>':'load'(Bytes,Signed,W,Addr,Off)`.
+/// `Threading(cur)`: `case '<mem>':'t_load'(St, Bytes,Signed,W,Addr,Off)`. Both reduce the
+/// trapping `Result(Int, _)` to one value (`emit_trapping_result`); the record is read-only,
+/// so `cur` is threaded on unchanged (the surrounding `sc` is preserved).
+fn emit_mem_load(
+  op: ir.MemAccess,
+  addr: Value,
+  offset: Int,
+  result: ValType,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let call = case sc {
+    NoState ->
+      seam_call(ctx.binding.mem_module, "load", [
+        CInt(op.bytes),
+        bool_atom(op.signed),
+        CInt(result_width(result)),
+        emit_value(addr),
+        CInt(offset),
+      ])
+    Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_load", [
+        CVar(cur),
+        CInt(op.bytes),
+        bool_atom(op.signed),
+        CInt(result_width(result)),
+        emit_value(addr),
+        CInt(offset),
+      ])
+  }
+  emit_trapping_result(call, cont, sc, state, ctx)
+}
+
+/// `t.store` (trapping, ZERO-RESULT ordered effect). `op.signed` is irrelevant for stores
+/// (`storeN` writes the low N bytes); eval order is addr → value → store (left-to-right `call`
+/// args). `NoState`: reduce `{ok,_}`/`{error,E}` to a discardable `'ok'`/`raise` and sequence.
+/// `Threading(cur)`: `St2 = case '<mem>':'t_store'(St,…) of {ok,S}->S; {error,R}->raise` —
+/// REBIND the record to `St2` (`t_store` returns the updated record); continue under
+/// `Threading(St2)` disposing zero values. This makes store-before-load a visible dataflow
+/// edge through `St` (stronger than the cell `let`-discard barrier, §G).
+fn emit_mem_store(
+  op: ir.MemAccess,
+  addr: Value,
+  value: Value,
+  offset: Int,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case sc {
+    NoState -> {
       let call =
         seam_call(ctx.binding.mem_module, "store", [
           CInt(op.bytes),
@@ -425,9 +797,34 @@ fn emit(
           CInt(offset),
         ])
       let #(effect, state2) = trapping_effect(call, ctx, state)
-      emit_zero_effect(effect, cont, state2, ctx)
+      emit_zero_effect(effect, cont, sc, state2, ctx)
     }
-    GlobalGet(name) ->
+    Threading(cur) -> {
+      let call =
+        seam_call(ctx.binding.mem_module, "t_store", [
+          CVar(cur),
+          CInt(op.bytes),
+          emit_value(addr),
+          emit_value(value),
+          CInt(offset),
+        ])
+      emit_threaded_record_effect(call, cont, state, ctx)
+    }
+  }
+}
+
+/// `global.get` (read-only). `NoState`: `call '<state>':'global_get'(NameBin)`.
+/// `Threading(cur)`: `call '<state>':'t_global_get'(St, NameBin)` — the record is threaded on
+/// unchanged.
+fn emit_global_get(
+  name: String,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case sc {
+    NoState ->
       apply_cont(
         cont,
         [
@@ -435,44 +832,173 @@ fn emit(
             core_binary_string(name),
           ]),
         ],
+        sc,
         state,
         ctx,
       )
-    GlobalSet(name, value) -> {
-      // A pure (non-trapping) ZERO-RESULT ordered effect.
+    Threading(cur) ->
+      apply_cont(
+        cont,
+        [
+          seam_call(ctx.binding.state_module, "t_global_get", [
+            CVar(cur),
+            core_binary_string(name),
+          ]),
+        ],
+        sc,
+        state,
+        ctx,
+      )
+  }
+}
+
+/// `global.set` (ZERO-RESULT ordered effect). `NoState`: the pure cell effect
+/// `call '<state>':'global_set'(NameBin, Val)` sequenced with a `let`-discard.
+/// `Threading(cur)`: `St2 = call '<state>':'t_global_set'(St, NameBin, Val)` — NON-trapping,
+/// returns the record directly; REBIND `cur := St2` and continue disposing zero values.
+fn emit_global_set(
+  name: String,
+  value: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case sc {
+    NoState -> {
       let effect =
         seam_call(ctx.binding.state_module, "global_set", [
           core_binary_string(name),
           emit_value(value),
         ])
-      emit_zero_effect(effect, cont, state, ctx)
+      emit_zero_effect(effect, cont, sc, state, ctx)
     }
-    CallIndirect(_table, index, ty, args) ->
-      emit_call_indirect(index, ty, args, cont, state, ctx)
-    // Out of scope — typed error, never a panic. Only the term layer (`TermOp`) and the
-    // term↔numeric boxing `Convert`s remain unlowered (handled in `emit_convert`).
-    TermOp(..) -> Error(UnsupportedNode("term_op"))
+    Threading(cur) -> {
+      let call =
+        seam_call(ctx.binding.state_module, "t_global_set", [
+          CVar(cur),
+          core_binary_string(name),
+          emit_value(value),
+        ])
+      let #(newst, state2) = fresh_var(state)
+      use #(rest, state3) <- result.try(apply_cont(
+        cont,
+        [],
+        Threading(newst),
+        state2,
+        ctx,
+      ))
+      Ok(#(CLet([newst], call, rest), state3))
+    }
   }
 }
 
-/// Dispose of the produced `vals` according to `cont`.
+/// Bind a `#(value, InstanceState)` pair a threaded seam call returns (`t_grow`): a
+/// `case <call> of <{V, St2}> when 'true' -> <continue with V under Threading(St2)>`. Used by
+/// `memory.grow`, whose runtime returns `#(Int, InstanceState)`.
+fn emit_value_state_pair(
+  call: CExpr,
+  cont: Cont,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(vvar, state2) = fresh_var(state)
+  let #(stvar, state3) = fresh_var(state2)
+  use #(rest, state4) <- result.try(apply_cont(
+    cont,
+    [CVar(vvar)],
+    Threading(stvar),
+    state3,
+    ctx,
+  ))
+  Ok(#(
+    CCase(call, [
+      CClause([PTuple([PVar(vvar), PVar(stvar)])], CAtom("true"), rest),
+    ]),
+    state4,
+  ))
+}
+
+/// Sequence a threaded RECORD-rebinding effect: reduce a trapping
+/// `Result(InstanceState, TrapReason)` producer to the record on `{ok,S}` (raise on
+/// `{error,E}`), bind it to a fresh state var, and continue under `Threading(new)` disposing
+/// zero values. Used by `MemStore` (and by the threaded `instantiate` for element/data
+/// segments). The `{ok,S}` arm yields the rebound record `S` (not a discardable `'ok'`).
+fn emit_threaded_record_effect(
+  call: CExpr,
+  cont: Cont,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(newst, state2) = fresh_var(state)
+  let #(reduced, state3) = record_result_case(call, ctx, state2)
+  use #(rest, state4) <- result.try(apply_cont(
+    cont,
+    [],
+    Threading(newst),
+    state3,
+    ctx,
+  ))
+  Ok(#(CLet([newst], reduced, rest), state4))
+}
+
+/// Reduce a trapping `Result(InstanceState, TrapReason)` producer to the record:
+/// `case <call> of <{'ok',S}> -> S; <{'error',E}> -> raise(E) end`. The `{ok,S}` arm yields
+/// the rebound record `S`; the `{error,E}` arm raises via `rt_trap`. Both arms yield exactly
+/// one value, so the shape is arity-correct in any surrounding context.
+fn record_result_case(
+  call: CExpr,
+  ctx: Ctx,
+  state: EmitState,
+) -> #(CExpr, EmitState) {
+  let #(svar, state2) = fresh_var(state)
+  let #(evar, state3) = fresh_var(state2)
+  let reduced =
+    CCase(call, [
+      CClause([PTuple([PAtom("ok"), PVar(svar)])], CAtom("true"), CVar(svar)),
+      CClause(
+        [PTuple([PAtom("error"), PVar(evar)])],
+        CAtom("true"),
+        raise_trap(ctx, CVar(evar)),
+      ),
+    ])
+  #(reduced, state3)
+}
+
+/// Dispose of the produced `vals` according to `cont`, under state channel `sc`.
 ///
-/// `KReturn` yields them as a value list; `KJump` tail-applies the join point; `KBind`
-/// binds them to its names (`ArityMismatch` if the counts differ) and emits its body.
+/// - `KReturn`: `NoState` → yield `vals` as the `function_return` package; `Threading(cur)` →
+///   pair it with the live record into `{Package, cur}` (§B.2).
+/// - `KJump(target)`: `NoState` → tail-apply the join point `apply target(vals)`;
+///   `Threading(cur)` → PREPEND the live record `apply target(cur, vals)` (the join was
+///   widened by one leading state slot, §D).
+/// - `KBind(names, body, next)`: bind `vals` to `names` (`ArityMismatch` if the counts
+///   differ), then emit `body` under `next` — `sc` flows through unchanged (a bound value
+///   list is state-neutral).
 fn apply_cont(
   cont: Cont,
   vals: List(CExpr),
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case cont {
-    KReturn -> Ok(#(function_return(vals), state))
-    KJump(target) -> Ok(#(CApply(target, vals), state))
+    KReturn ->
+      case sc {
+        NoState -> Ok(#(function_return(vals), state))
+        Threading(cur) ->
+          Ok(#(CTuple([function_return(vals), CVar(cur)]), state))
+      }
+    KJump(target) ->
+      case sc {
+        NoState -> Ok(#(CApply(target, vals), state))
+        Threading(cur) -> Ok(#(CApply(target, [CVar(cur), ..vals]), state))
+      }
     KBind(names, body, next) ->
       case list.length(names) == list.length(vals) {
         False -> Error(ArityMismatch(list.length(names), list.length(vals)))
         True -> {
-          use #(body_c, state2) <- result.try(emit(body, next, state, ctx))
+          use #(body_c, state2) <- result.try(emit(body, next, sc, state, ctx))
           Ok(#(CLet(names, value_list(vals), body_c), state2))
         }
       }
@@ -499,36 +1025,57 @@ fn apply_cont(
 /// `r` is the callee's result count (from `ctx.fn_results` for `CallDirect`; `1` for a
 /// `CallHost`, whose Phase-1 fates each yield one value or raise). Validation guarantees
 /// `r` matches the surrounding binding, so no arity error is raised here.
+///
+/// The `KReturn` STRAIGHT-THROUGH (yield `produced` unpackaged) is sound ONLY under
+/// `NoState`: there the caller's own result is the same `r`-valued package. Under
+/// `Threading(cur)` the caller must return `{Package, cur}`, so `produced` cannot be yielded
+/// bare — it is unpacked into `r` values and re-disposed through `KReturn`, which pairs the
+/// re-formed package with `cur`. (A THREADED callee's `{Package, St'}` tail call is handled
+/// by `emit_call_direct` directly, preserving the cross-function tail call, §B.3.)
 fn apply_cont_call(
   cont: Cont,
   produced: CExpr,
   r: Int,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  case cont {
-    KReturn -> Ok(#(produced, state))
-    _ ->
-      case r {
-        0 -> {
-          let #(g, state2) = fresh_var(state)
-          use #(rest, state3) <- result.try(apply_cont(cont, [], state2, ctx))
-          Ok(#(CLet([g], produced, rest), state3))
-        }
-        1 -> apply_cont(cont, [produced], state, ctx)
-        _ -> {
-          let #(names, state2) = fresh_n_vars(state, r)
-          use #(rest, state3) <- result.try(apply_cont(
-            cont,
-            list.map(names, CVar),
-            state2,
-            ctx,
-          ))
-          let clause =
-            CClause([PTuple(list.map(names, PVar))], CAtom("true"), rest)
-          Ok(#(CCase(produced, [clause]), state3))
-        }
-      }
+  case cont, sc {
+    KReturn, NoState -> Ok(#(produced, state))
+    _, _ -> apply_cont_call_unpack(cont, produced, r, sc, state, ctx)
+  }
+}
+
+/// Unpack a single `function_return`-packaged value `produced` into its `r` values and
+/// dispose them through `cont` under `sc`: `r==0` binds+discards the dummy (keeping the
+/// effect); `r==1` continues with the bare value; `r>=2` destructures the `{V1,…,Vr}` tuple.
+fn apply_cont_call_unpack(
+  cont: Cont,
+  produced: CExpr,
+  r: Int,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case r {
+    0 -> {
+      let #(g, state2) = fresh_var(state)
+      use #(rest, state3) <- result.try(apply_cont(cont, [], sc, state2, ctx))
+      Ok(#(CLet([g], produced, rest), state3))
+    }
+    1 -> apply_cont(cont, [produced], sc, state, ctx)
+    _ -> {
+      let #(names, state2) = fresh_n_vars(state, r)
+      use #(rest, state3) <- result.try(apply_cont(
+        cont,
+        list.map(names, CVar),
+        sc,
+        state2,
+        ctx,
+      ))
+      let clause = CClause([PTuple(list.map(names, PVar))], CAtom("true"), rest)
+      Ok(#(CCase(produced, [clause]), state3))
+    }
   }
 }
 
@@ -545,16 +1092,23 @@ fn fresh_n_vars(state: EmitState, n: Int) -> #(List(String), EmitState) {
   }
 }
 
-/// Materialise `cont` into a shared join point if it is non-trivial.
+/// Materialise `cont` into a shared join point if it is non-trivial, under state channel `sc`.
 ///
 /// `arity` is the number of values the multi-exit construct yields. A `KBind` continuation
-/// is lowered to a `letrec 'J'/arity = fun(names…) -> <body under next>`; the returned
-/// `Cont` becomes `KJump('J')` so every exit tail-applies it once. A trivial continuation
+/// is lowered to a `letrec` join `fun(names…) -> <body under next>`; the returned `Cont`
+/// becomes `KJump('J')` so every exit tail-applies it once. A trivial continuation
 /// (`KReturn`/`KJump`) is returned unchanged with no join point. `ArityMismatch` if the
 /// bind's name count differs from `arity`.
+///
+/// Under `Threading(_)` the join is WIDENED by one leading state slot (§D):
+/// `'J'/(arity+1) = fun(St, names…) -> <body under Threading(St)>`. Every exit appends its
+/// live record to the value list (`apply_cont`'s `KJump` prepend), so the branches' differing
+/// records UNIFY at the merge — the natural functional join, in constant stack (the join
+/// `apply` stays a tail call). Under `NoState` the Phase-2/3 join is emitted verbatim.
 fn materialize(
   cont: Cont,
   arity: Int,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(Option(FunDef), Cont, EmitState), EmitError) {
@@ -564,13 +1118,42 @@ fn materialize(
     KBind(names, body, next) ->
       case list.length(names) == arity {
         False -> Error(ArityMismatch(arity, list.length(names)))
-        True -> {
-          let #(jname, state2) = fresh_fn(state)
-          let fname = FName(jname, arity)
-          use #(jbody, state3) <- result.try(emit(body, next, state2, ctx))
-          let jdef = FunDef(fname, CFun(names, jbody))
-          Ok(#(Some(jdef), KJump(fname), state3))
-        }
+        True ->
+          case sc {
+            NoState -> {
+              let #(jname, state2) = fresh_fn(state)
+              let fname = FName(jname, arity)
+              use #(jbody, state3) <- result.try(emit(
+                body,
+                next,
+                NoState,
+                state2,
+                ctx,
+              ))
+              Ok(#(
+                Some(FunDef(fname, CFun(names, jbody))),
+                KJump(fname),
+                state3,
+              ))
+            }
+            Threading(_) -> {
+              let #(jname, state2) = fresh_fn(state)
+              let #(st_join, state3) = fresh_var(state2)
+              let fname = FName(jname, arity + 1)
+              use #(jbody, state4) <- result.try(emit(
+                body,
+                next,
+                Threading(st_join),
+                state3,
+                ctx,
+              ))
+              Ok(#(
+                Some(FunDef(fname, CFun([st_join, ..names], jbody))),
+                KJump(fname),
+                state4,
+              ))
+            }
+          }
       }
   }
 }
@@ -596,6 +1179,7 @@ fn emit_num(
   op: NumOp,
   args: List(Value),
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
@@ -606,8 +1190,8 @@ fn emit_num(
       list.map(args, emit_value),
     )
   case is_trapping(op) {
-    False -> apply_cont(cont, [call], state, ctx)
-    True -> emit_trapping_result(call, cont, state, ctx)
+    False -> apply_cont(cont, [call], sc, state, ctx)
+    True -> emit_trapping_result(call, cont, sc, state, ctx)
   }
 }
 
@@ -638,6 +1222,7 @@ fn seam_call(module: String, fn_name: String, args: List(CExpr)) -> CExpr {
 fn emit_trapping_result(
   produced: CExpr,
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
@@ -653,7 +1238,13 @@ fn emit_trapping_result(
         raise_trap(ctx, CVar(evar)),
       ),
     ])
-  use #(rest, state5) <- result.try(apply_cont(cont, [CVar(rvar)], state4, ctx))
+  use #(rest, state5) <- result.try(apply_cont(
+    cont,
+    [CVar(rvar)],
+    sc,
+    state4,
+    ctx,
+  ))
   Ok(#(CLet([rvar], result_case, rest), state5))
 }
 
@@ -687,11 +1278,12 @@ fn trapping_effect(
 fn emit_zero_effect(
   effect: CExpr,
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let #(g, state2) = fresh_var(state)
-  use #(rest, state3) <- result.try(apply_cont(cont, [], state2, ctx))
+  use #(rest, state3) <- result.try(apply_cont(cont, [], sc, state2, ctx))
   Ok(#(CLet([g], effect, rest), state3))
 }
 
@@ -723,6 +1315,7 @@ fn emit_convert(
   op: ConvOp,
   arg: Value,
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
@@ -731,8 +1324,8 @@ fn emit_convert(
     Ok(fn_name) -> {
       let call = seam_call(ctx.binding.num_module, fn_name, [emit_value(arg)])
       case is_trapping_conv(op) {
-        True -> emit_trapping_result(call, cont, state, ctx)
-        False -> apply_cont(cont, [call], state, ctx)
+        True -> emit_trapping_result(call, cont, sc, state, ctx)
+        False -> apply_cont(cont, [call], sc, state, ctx)
       }
     }
   }
@@ -748,10 +1341,21 @@ fn raise_trap(ctx: Ctx, reason_expr: CExpr) -> CExpr {
 
 /// Lower a `CallDirect` to `apply 'fn'/arity(args…)` against a same-module function
 /// (a static local name — D3a-safe). `Error(UnknownFunction)` if the target is undefined.
+///
+/// Under `Threading(cur)` with a STATE-REACHING callee `g`, the record is threaded:
+/// `apply 'g'/(n+1)(cur, args…)` yields `{Package, St'}`.
+/// - `cont == KReturn` → emit the `apply` STRAIGHT THROUGH — `{Package, St'}` is already
+///   exactly what the caller must return, so a tail `CallDirect` to a threaded callee stays a
+///   TAIL CALL (cross-function tail recursion keeps constant stack, §B.3).
+/// - otherwise → `case {Pkg, St'} -> …` destructures the pair, unpacks `Pkg` into `r` values,
+///   and continues under `Threading(St')`.
+/// A PURE callee is `apply 'g'/n(args…)` with `cur` flowing AROUND it unchanged (dispatched
+/// by `apply_cont_call`, which under `Threading` re-pairs the result with `cur` at `KReturn`).
 fn emit_call_direct(
   fn_name: String,
   args: List(Value),
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
@@ -759,15 +1363,57 @@ fn emit_call_direct(
     Error(_) -> Error(UnknownFunction(fn_name))
     Ok(arity) -> {
       let r = result.unwrap(dict.get(ctx.fn_results, fn_name), 1)
-      apply_cont_call(
-        cont,
-        CApply(FName(fn_name, arity), list.map(args, emit_value)),
-        r,
-        state,
-        ctx,
-      )
+      let cargs = list.map(args, emit_value)
+      let callee_threaded =
+        is_threaded(ctx) && set.contains(ctx.fn_state_reaching, fn_name)
+      case sc, callee_threaded {
+        Threading(cur), True -> {
+          let applied = CApply(FName(fn_name, arity + 1), [CVar(cur), ..cargs])
+          case cont {
+            KReturn -> Ok(#(applied, state))
+            _ -> emit_threaded_call_unpack(applied, r, cont, state, ctx)
+          }
+        }
+        _, _ ->
+          apply_cont_call(
+            cont,
+            CApply(FName(fn_name, arity), cargs),
+            r,
+            sc,
+            state,
+            ctx,
+          )
+      }
     }
   }
+}
+
+/// Destructure a threaded callee's `{Package, St'}` at a NON-tail site: `case <applied> of
+/// <{Pkg, St'}> -> <unpack Pkg into r values, continue under Threading(St')>`. Unpacking `Pkg`
+/// reuses the same `r∈{0,1,≥2}` logic as a pure call (`apply_cont_call`).
+fn emit_threaded_call_unpack(
+  applied: CExpr,
+  r: Int,
+  cont: Cont,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(pkgvar, state2) = fresh_var(state)
+  let #(stvar, state3) = fresh_var(state2)
+  use #(rest, state4) <- result.try(apply_cont_call(
+    cont,
+    CVar(pkgvar),
+    r,
+    Threading(stvar),
+    state3,
+    ctx,
+  ))
+  Ok(#(
+    CCase(applied, [
+      CClause([PTuple([PVar(pkgvar), PVar(stvar)])], CAtom("true"), rest),
+    ]),
+    state4,
+  ))
 }
 
 /// Lower a `CallHost` (the capability boundary, D9). Two fates:
@@ -792,17 +1438,20 @@ fn emit_call_host(
   name: String,
   args: List(Value),
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let cargs = list.map(args, emit_value)
   case resolve_stdlib(capability, name) {
     Some(fn_name) ->
-      // A vetted `own`-stdlib call yields a single value (Phase-1: `gcd/2`).
+      // A vetted `own`-stdlib call yields a single value (Phase-1: `gcd/2`). State-neutral:
+      // the host boundary never touches the record, so `cur` flows through unchanged (§G).
       apply_cont_call(
         cont,
         CCall(CAtom(ctx.binding.stdlib_module), CAtom(fn_name), cargs),
         1,
+        sc,
         state,
         ctx,
       )
@@ -816,7 +1465,7 @@ fn emit_call_host(
           core_binary_string(name),
           core_list(cargs),
         ])
-      apply_cont_call(cont, call, 1, state, ctx)
+      apply_cont_call(cont, call, 1, sc, state, ctx)
     }
   }
 }
@@ -854,37 +1503,91 @@ fn emit_call_indirect(
   ty: FuncType,
   args: List(Value),
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let r = list.length(ty.results)
-  let call =
-    seam_call(ctx.binding.table_module, "call_indirect", [
-      emit_value(index),
-      func_type_term(ty),
-      core_list(list.map(args, emit_value)),
-    ])
-  // Bind one var to the unwrapped result LIST (or raise on `{error,R}`), then unpack it.
-  let #(xvar, state2) = fresh_var(state)
-  let #(evar, state3) = fresh_var(state2)
-  let #(lvar, state4) = fresh_var(state3)
-  let result_case =
-    CCase(call, [
-      CClause([PTuple([PAtom("ok"), PVar(xvar)])], CAtom("true"), CVar(xvar)),
-      CClause(
-        [PTuple([PAtom("error"), PVar(evar)])],
-        CAtom("true"),
-        raise_trap(ctx, CVar(evar)),
-      ),
-    ])
-  use #(rest, state5) <- result.try(unpack_result_list(
-    lvar,
-    r,
-    cont,
-    state4,
-    ctx,
-  ))
-  Ok(#(CLet([lvar], result_case, rest), state5))
+  case sc {
+    NoState -> {
+      let call =
+        seam_call(ctx.binding.table_module, "call_indirect", [
+          emit_value(index),
+          func_type_term(ty),
+          core_list(list.map(args, emit_value)),
+        ])
+      // Bind one var to the unwrapped result LIST (or raise on `{error,R}`), then unpack it.
+      let #(xvar, state2) = fresh_var(state)
+      let #(evar, state3) = fresh_var(state2)
+      let #(lvar, state4) = fresh_var(state3)
+      let result_case =
+        CCase(call, [
+          CClause(
+            [PTuple([PAtom("ok"), PVar(xvar)])],
+            CAtom("true"),
+            CVar(xvar),
+          ),
+          CClause(
+            [PTuple([PAtom("error"), PVar(evar)])],
+            CAtom("true"),
+            raise_trap(ctx, CVar(evar)),
+          ),
+        ])
+      use #(rest, state5) <- result.try(unpack_result_list(
+        lvar,
+        r,
+        cont,
+        sc,
+        state4,
+        ctx,
+      ))
+      Ok(#(CLet([lvar], result_case, rest), state5))
+    }
+    Threading(cur) -> {
+      // `{Rs, St2} = case '<table>':'t_call_indirect'(St, Idx, TypeTag, Args) of
+      //   {ok,P} -> P; {error,R} -> raise end` — unpack `Rs` to `len(ty.results)` values,
+      // REBIND `cur := St2`. `t_call_indirect` returns `#(List(Int), InstanceState)`.
+      let call =
+        seam_call(ctx.binding.table_module, "t_call_indirect", [
+          CVar(cur),
+          emit_value(index),
+          func_type_term(ty),
+          core_list(list.map(args, emit_value)),
+        ])
+      let #(pvar, state2) = fresh_var(state)
+      let #(evar, state3) = fresh_var(state2)
+      let #(pbound, state4) = fresh_var(state3)
+      let result_case =
+        CCase(call, [
+          CClause(
+            [PTuple([PAtom("ok"), PVar(pvar)])],
+            CAtom("true"),
+            CVar(pvar),
+          ),
+          CClause(
+            [PTuple([PAtom("error"), PVar(evar)])],
+            CAtom("true"),
+            raise_trap(ctx, CVar(evar)),
+          ),
+        ])
+      // Destructure `pbound = {Rs, St2}`, then unpack `Rs` under `Threading(St2)`.
+      let #(rsvar, state5) = fresh_var(state4)
+      let #(stvar, state6) = fresh_var(state5)
+      use #(rest, state7) <- result.try(unpack_result_list(
+        rsvar,
+        r,
+        cont,
+        Threading(stvar),
+        state6,
+        ctx,
+      ))
+      let destructure =
+        CCase(CVar(pbound), [
+          CClause([PTuple([PVar(rsvar), PVar(stvar)])], CAtom("true"), rest),
+        ])
+      Ok(#(CLet([pbound], result_case, destructure), state7))
+    }
+  }
 }
 
 /// Unpack the result LIST bound to `lvar` (length `r`, the callee's result count) into `r`
@@ -895,16 +1598,18 @@ fn unpack_result_list(
   lvar: String,
   r: Int,
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case r {
-    0 -> apply_cont(cont, [], state, ctx)
+    0 -> apply_cont(cont, [], sc, state, ctx)
     _ -> {
       let #(names, state2) = fresh_n_vars(state, r)
       use #(rest, state3) <- result.try(apply_cont(
         cont,
         list.map(names, CVar),
+        sc,
         state2,
         ctx,
       ))
@@ -928,17 +1633,19 @@ fn emit_if(
   then_branch: Expr,
   else_branch: Expr,
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use #(maybe_def, jcont, state2) <- result.try(materialize(
     cont,
     list.length(result),
+    sc,
     state,
     ctx,
   ))
-  use #(then_c, state3) <- result.try(emit(then_branch, jcont, state2, ctx))
-  use #(else_c, state4) <- result.try(emit(else_branch, jcont, state3, ctx))
+  use #(then_c, state3) <- result.try(emit(then_branch, jcont, sc, state2, ctx))
+  use #(else_c, state4) <- result.try(emit(else_branch, jcont, sc, state3, ctx))
   let #(wild, state5) = fresh_var(state4)
   let case_expr =
     CCase(emit_value(cond), [
@@ -957,19 +1664,21 @@ fn emit_switch(
   arms: List(SwitchArm),
   default: Expr,
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use #(maybe_def, jcont, state2) <- result.try(materialize(
     cont,
     list.length(result),
+    sc,
     state,
     ctx,
   ))
   use #(arm_clauses, state3) <- result.try(
-    emit_switch_arms(arms, jcont, state2, ctx, []),
+    emit_switch_arms(arms, jcont, sc, state2, ctx, []),
   )
-  use #(default_c, state4) <- result.try(emit(default, jcont, state3, ctx))
+  use #(default_c, state4) <- result.try(emit(default, jcont, sc, state3, ctx))
   let #(wild, state5) = fresh_var(state4)
   let clauses =
     list.append(arm_clauses, [CClause([PVar(wild)], CAtom("true"), default_c)])
@@ -980,6 +1689,7 @@ fn emit_switch(
 fn emit_switch_arms(
   arms: List(SwitchArm),
   jcont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
   acc: List(CClause),
@@ -987,32 +1697,36 @@ fn emit_switch_arms(
   case arms {
     [] -> Ok(#(list.reverse(acc), state))
     [SwitchArm(match, body), ..rest] -> {
-      use #(body_c, state2) <- result.try(emit(body, jcont, state, ctx))
+      use #(body_c, state2) <- result.try(emit(body, jcont, sc, state, ctx))
       let clause = CClause([PInt(match)], CAtom("true"), body_c)
-      emit_switch_arms(rest, jcont, state2, ctx, [clause, ..acc])
+      emit_switch_arms(rest, jcont, sc, state2, ctx, [clause, ..acc])
     }
   }
 }
 
 /// Lower `Block` to a forward continuation. A non-trivial continuation is materialised into
 /// a join point; the block body is emitted with both fall-through and `Break(label, …)`
-/// resolving to that exit continuation (so the code after the block is emitted once).
+/// resolving to that exit continuation (so the code after the block is emitted once). Under
+/// `Threading`, the materialised join carries the record (§D) and each exit prepends its live
+/// record (`apply_cont`'s `KJump`).
 fn emit_block(
   label: String,
   result: List(ir.ValType),
   body: Expr,
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use #(maybe_def, exit_cont, state2) <- result.try(materialize(
     cont,
     list.length(result),
+    sc,
     state,
     ctx,
   ))
   let state3 = push_label(state2, LabelEntry(label, exit_cont, None))
-  use #(body_c, state4) <- result.try(emit(body, exit_cont, state3, ctx))
+  use #(body_c, state4) <- result.try(emit(body, exit_cont, sc, state3, ctx))
   let state5 = restore_labels(state4, state2.labels)
   Ok(#(wrap_join(maybe_def, body_c), state5))
 }
@@ -1021,12 +1735,20 @@ fn emit_block(
 /// applied to the loop-param inits. `Continue(label, vs)` becomes a tail `apply 'L'(vs)`
 /// (the back-edge → constant space); fall-through and `Break(label, …)` exit through the
 /// (materialised) continuation.
+///
+/// Under `Threading(cur)` (the G4 crux), the record is carried as the LEADING loop param:
+/// `letrec 'L'/(k+1) = fun(St, P1…Pk) -> <body under Threading(St)>` applied to
+/// `apply 'L'(St_entry, Init1…Initk)`. `Continue` prepends the LIVE record
+/// (`apply 'L'(St', vs…)`) and `Break`/fall-through prepend the exit record. The back-edge
+/// stays a TAIL `apply`, and the `InstanceState` is a fixed-size box, so threading it does NOT
+/// grow the stack — constant space and preemption are preserved.
 fn emit_loop(
   label: String,
   params: List(ir.LoopParam),
   result: List(ir.ValType),
   body: Expr,
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
@@ -1034,59 +1756,101 @@ fn emit_loop(
   use #(maybe_def, exit_cont, state2) <- result.try(materialize(
     cont,
     list.length(result),
+    sc,
     state,
     ctx,
   ))
   let #(lname, state3) = fresh_fn(state2)
-  let lfname = FName(lname, arity)
-  let state4 = push_label(state3, LabelEntry(label, exit_cont, Some(lfname)))
-  use #(body_c, state5) <- result.try(emit(body, exit_cont, state4, ctx))
-  let state6 = restore_labels(state5, state3.labels)
-  let param_names = list.map(params, fn(p) { p.name })
-  let inits = list.map(params, fn(p) { emit_value(p.init) })
-  let loop_def = FunDef(lfname, CFun(param_names, body_c))
-  let loop_expr = CLetrec([loop_def], CApply(lfname, inits))
-  Ok(#(wrap_join(maybe_def, loop_expr), state6))
+  case sc {
+    NoState -> {
+      let lfname = FName(lname, arity)
+      let state4 =
+        push_label(state3, LabelEntry(label, exit_cont, Some(lfname)))
+      use #(body_c, state5) <- result.try(emit(
+        body,
+        exit_cont,
+        NoState,
+        state4,
+        ctx,
+      ))
+      let state6 = restore_labels(state5, state3.labels)
+      let param_names = list.map(params, fn(p) { p.name })
+      let inits = list.map(params, fn(p) { emit_value(p.init) })
+      let loop_def = FunDef(lfname, CFun(param_names, body_c))
+      let loop_expr = CLetrec([loop_def], CApply(lfname, inits))
+      Ok(#(wrap_join(maybe_def, loop_expr), state6))
+    }
+    Threading(cur) -> {
+      let #(st_loop, state3b) = fresh_var(state3)
+      let lfname = FName(lname, arity + 1)
+      let state4 =
+        push_label(state3b, LabelEntry(label, exit_cont, Some(lfname)))
+      use #(body_c, state5) <- result.try(emit(
+        body,
+        exit_cont,
+        Threading(st_loop),
+        state4,
+        ctx,
+      ))
+      let state6 = restore_labels(state5, state3b.labels)
+      let param_names = [st_loop, ..list.map(params, fn(p) { p.name })]
+      let inits = [CVar(cur), ..list.map(params, fn(p) { emit_value(p.init) })]
+      let loop_def = FunDef(lfname, CFun(param_names, body_c))
+      let loop_expr = CLetrec([loop_def], CApply(lfname, inits))
+      Ok(#(wrap_join(maybe_def, loop_expr), state6))
+    }
+  }
 }
 
 /// Lower `Break(label, vs)`: resolve the label's exit continuation and dispose `vs`
-/// through it. `Error(UnboundLabel)` if the label is not in scope.
+/// through it (under the break-site's `sc`, so a threaded break prepends its live record).
+/// `Error(UnboundLabel)` if the label is not in scope.
 fn emit_break(
   label: String,
   vs: List(Value),
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use entry <- result.try(find_label(state, label))
-  apply_cont(entry.break_cont, list.map(vs, emit_value), state, ctx)
+  apply_cont(entry.break_cont, list.map(vs, emit_value), sc, state, ctx)
 }
 
-/// Lower `Continue(label, vs)`: tail-apply the loop head `apply 'L'(vs)`.
-/// `Error(UnboundLabel)` if the label is not in scope or names a `Block` (no back-edge).
+/// Lower `Continue(label, vs)`: tail-apply the loop head `apply 'L'(vs)` — under
+/// `Threading(cur)` the LIVE record leads (`apply 'L'(cur, vs)`), keeping the back-edge a tail
+/// call (constant space). `Error(UnboundLabel)` if the label is not in scope or names a
+/// `Block` (no back-edge).
 fn emit_continue(
   label: String,
   vs: List(Value),
+  sc: StateChan,
   state: EmitState,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use entry <- result.try(find_label(state, label))
   case entry.continue_target {
-    Some(lfname) -> Ok(#(CApply(lfname, list.map(vs, emit_value)), state))
+    Some(lfname) ->
+      case sc {
+        NoState -> Ok(#(CApply(lfname, list.map(vs, emit_value)), state))
+        Threading(cur) ->
+          Ok(#(CApply(lfname, [CVar(cur), ..list.map(vs, emit_value)]), state))
+      }
     None -> Error(UnboundLabel(label))
   }
 }
 
 /// Lower `Charge(cost, body)` to the metering seam (D9): `let _ =
-/// call '<meter_module>':'charge'(Cost) in <body>`. The seam must exist; the impl being a
-/// fuel counter is unit 09's job.
+/// call '<meter_module>':'charge'(Cost) in <body>`. State-neutral — `charge` never touches the
+/// record, so `sc` (and the live `cur`) flows through `body` unchanged (§G).
 fn emit_charge(
   cost: Int,
   body: Expr,
   cont: Cont,
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let #(wild, state2) = fresh_var(state)
-  use #(body_c, state3) <- result.try(emit(body, cont, state2, ctx))
+  use #(body_c, state3) <- result.try(emit(body, cont, sc, state2, ctx))
   let charge_call =
     CCall(CAtom(ctx.binding.meter_module), CAtom("charge"), [CInt(cost)])
   Ok(#(CLet([wild], charge_call, body_c), state3))
@@ -1243,7 +2007,24 @@ fn byte_seg(b: Int) -> CBitSeg {
 ///
 /// Returns `Error(NonConstInit)` if a global init / segment offset is not a constant
 /// literal, or `Error(UnknownFunction)` if an element/`start` function is undefined.
+///
+/// Under `state_strategy: Threaded` the body instead BUILDS and RETURNS the `InstanceState`
+/// record (`emit_instantiate_threaded`, §E); the `seed_fuel`/`seed_policy` seeds are unchanged
+/// (metering/host are pdict-seeded — orthogonal to state threading).
 fn emit_instantiate(module: Module, ctx: Ctx) -> Result(FunDef, EmitError) {
+  case is_threaded(ctx) {
+    False -> emit_instantiate_cell(module, ctx)
+    True -> emit_instantiate_threaded(module, ctx)
+  }
+}
+
+/// The `Cell` `instantiate/0` (byte-identical to Phase 2/3): seed the pdict cell
+/// (`rt_state:seed(Decl)` as a `let`-discard), write element → data segments, run `start`, and
+/// return `'ok'`. Every step is a zero-result ordered effect chained with `chain_effects`.
+fn emit_instantiate_cell(
+  module: Module,
+  ctx: Ctx,
+) -> Result(FunDef, EmitError) {
   let state0 =
     EmitState(
       counter: 0,
@@ -1275,6 +2056,283 @@ fn emit_instantiate(module: Module, ctx: Ctx) -> Result(FunDef, EmitError) {
     ])
   let #(body, _state4) = chain_effects(effects, state3)
   Ok(FunDef(FName("instantiate", 0), CFun([], body)))
+}
+
+/// The `Threaded` `instantiate/0` (§E) — BUILDS and RETURNS the `InstanceState` record
+/// instead of seeding the pdict. The body, in order:
+///
+/// - (0a/0b) `seed_fuel` (MeterFuel only) / `seed_policy` — UNCHANGED `let`-discards (metering
+///   and the host boundary are pdict-seeded, orthogonal to state threading, F5/F4).
+/// - (1) `St0 = call '<state>':'fresh'(Decl)` — the SAME `Decl` term the cell strategy passes
+///   to `seed`, but its consumer is `fresh(Decl) -> InstanceState` (bound, not discarded), so a
+///   `Threaded` and a `Cell` build start from byte-identical state (G7).
+/// - (2) each active ELEMENT segment: `St' = case '<table>':'t_init_elem'(St, Off, Entries) of
+///   {ok,S}->S; {error,E}->raise` — rebinds the record; `Entries` are the THREADED closures
+///   (`fun(St, Args) -> {Results, St'}`, §C).
+/// - (3) each active DATA segment: `St' = case '<mem>':'t_init_data'(St, Off, Bytes) of …`.
+/// - (4) `start` (WASM `[]→[]`): a STATE-REACHING start threads
+///   `{_, St'} = apply 'f<start>'/(a+1)(St)`; a PURE start is `apply 'f<start>'/a()` with the
+///   record unchanged. Element BEFORE data BEFORE start (spec instantiation order); a
+///   segment-OOB / trapping start raises and fails instantiation, abandoning the record.
+/// - (5) RETURN the final `InstanceState` (not `'ok'`).
+fn emit_instantiate_threaded(
+  module: Module,
+  ctx: Ctx,
+) -> Result(FunDef, EmitError) {
+  let state0 =
+    EmitState(
+      counter: 0,
+      vars: set.new(),
+      fns: set.from_list(dict.keys(ctx.fn_arity)),
+      labels: [],
+    )
+  use #(decl_term, state1) <- result.try(state_decl_term(module, ctx, state0))
+  // (0) The unchanged metering/host seed discards.
+  let seed_effects =
+    list.flatten([seed_fuel_effect(ctx), seed_policy_effect(ctx)])
+  let #(seed_wraps, state2) = discard_wrappers(seed_effects, state1)
+  // (1) St0 = fresh(Decl).
+  let #(st0, state3) = fresh_var(state2)
+  let fresh_wrap = fn(rest) {
+    CLet([st0], seam_call(ctx.binding.state_module, "fresh", [decl_term]), rest)
+  }
+  // (2) element segments, (3) data segments, (4) start — each threading the record.
+  use #(elem_wraps, cur1, state4) <- result.try(threaded_elem_wrappers(
+    module.elements,
+    st0,
+    state3,
+    ctx,
+  ))
+  use #(data_wraps, cur2, state5) <- result.try(threaded_data_wrappers(
+    module.data_segments,
+    cur1,
+    state4,
+    ctx,
+  ))
+  use #(start_wraps, cur3, _state6) <- result.try(threaded_start_wrapper(
+    module,
+    cur2,
+    state5,
+    ctx,
+  ))
+  // Assemble: seeds → fresh → element → data → start, wrapping the returned final record.
+  let all_wraps =
+    list.flatten([seed_wraps, [fresh_wrap], elem_wraps, data_wraps, start_wraps])
+  let body =
+    list.fold_right(all_wraps, CVar(cur3), fn(rest, wrap) { wrap(rest) })
+  Ok(FunDef(FName("instantiate", 0), CFun([], body)))
+}
+
+/// Turn a list of zero-result seed effects into `let <g> = <effect> in …` wrappers, each with
+/// a fresh discarded binder — the `seed_fuel`/`seed_policy` lines under threaded `instantiate`.
+fn discard_wrappers(
+  effects: List(CExpr),
+  state: EmitState,
+) -> #(List(fn(CExpr) -> CExpr), EmitState) {
+  list.fold(effects, #([], state), fn(acc, effect) {
+    let #(wraps, st) = acc
+    let #(g, st2) = fresh_var(st)
+    let wrap = fn(rest) { CLet([g], effect, rest) }
+    #(list.append(wraps, [wrap]), st2)
+  })
+}
+
+/// Build the threaded element-segment wrappers, threading the record from `cur`. Each active
+/// segment produces `let St' = case '<table>':'t_init_elem'(St, Off, Entries) of {ok,S}->S;
+/// {error,E}->raise in …` and advances the current state var. Returns the wrappers (in order),
+/// the final state var, and the emit state. `Error(NonConstInit)` for a non-const offset;
+/// `Error(UnknownFunction)` for an undefined element target.
+fn threaded_elem_wrappers(
+  segs: List(ir.ElementSegment),
+  cur: String,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(List(fn(CExpr) -> CExpr), String, EmitState), EmitError) {
+  list.try_fold(segs, #([], cur, state), fn(acc, seg) {
+    let #(wraps, cur, st) = acc
+    use offset <- result.try(const_fold(seg.offset))
+    use #(entries, st2) <- result.try(build_threaded_entries(seg.funcs, ctx, st))
+    let call =
+      seam_call(ctx.binding.table_module, "t_init_elem", [
+        CVar(cur),
+        CInt(offset),
+        core_list(entries),
+      ])
+    let #(reduced, st3) = record_result_case(call, ctx, st2)
+    let #(newvar, st4) = fresh_var(st3)
+    let wrap = fn(rest) { CLet([newvar], reduced, rest) }
+    Ok(#(list.append(wraps, [wrap]), newvar, st4))
+  })
+}
+
+/// Build the threaded data-segment wrappers, threading the record from `cur`. Each active
+/// segment produces `let St' = case '<mem>':'t_init_data'(St, Off, Bytes) of {ok,S}->S;
+/// {error,E}->raise in …`. `Error(NonConstInit)` for a non-const offset.
+fn threaded_data_wrappers(
+  segs: List(ir.DataSegment),
+  cur: String,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(List(fn(CExpr) -> CExpr), String, EmitState), EmitError) {
+  list.try_fold(segs, #([], cur, state), fn(acc, seg) {
+    let #(wraps, cur, st) = acc
+    use offset <- result.try(const_fold(seg.offset))
+    let call =
+      seam_call(ctx.binding.mem_module, "t_init_data", [
+        CVar(cur),
+        CInt(offset),
+        core_binary_bytes(seg.bytes),
+      ])
+    let #(reduced, st2) = record_result_case(call, ctx, st)
+    let #(newvar, st3) = fresh_var(st2)
+    let wrap = fn(rest) { CLet([newvar], reduced, rest) }
+    Ok(#(list.append(wraps, [wrap]), newvar, st3))
+  })
+}
+
+/// Build the threaded `start` wrapper (WASM `start` is `[]→[]`). A STATE-REACHING start
+/// threads the record: `case apply 'f<start>'/(a+1)(St) of <{_, St'}> -> …` (the `'ok'`
+/// package is discarded), advancing the current state var to `St'`. A PURE start is
+/// `let _ = apply 'f<start>'/a() in …` with the record unchanged. No `start` → no wrapper.
+/// `Error(UnknownFunction)` if `start` names no defined function.
+fn threaded_start_wrapper(
+  module: Module,
+  cur: String,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(List(fn(CExpr) -> CExpr), String, EmitState), EmitError) {
+  case module.start {
+    None -> Ok(#([], cur, state))
+    Some(name) ->
+      case dict.get(ctx.fn_arity, name) {
+        Error(_) -> Error(UnknownFunction(name))
+        Ok(arity) ->
+          case set.contains(ctx.fn_state_reaching, name) {
+            True -> {
+              let applied = CApply(FName(name, arity + 1), [CVar(cur)])
+              let #(wildvar, state2) = fresh_var(state)
+              let #(newvar, state3) = fresh_var(state2)
+              let wrap = fn(rest) {
+                CCase(applied, [
+                  CClause(
+                    [PTuple([PVar(wildvar), PVar(newvar)])],
+                    CAtom("true"),
+                    rest,
+                  ),
+                ])
+              }
+              Ok(#([wrap], newvar, state3))
+            }
+            False -> {
+              let applied = CApply(FName(name, arity), [])
+              let #(wildvar, state2) = fresh_var(state)
+              let wrap = fn(rest) { CLet([wildvar], applied, rest) }
+              Ok(#([wrap], cur, state2))
+            }
+          }
+      }
+  }
+}
+
+/// Build the threaded `{TypeTag, Closure}` entry list for an element segment's `funcs`.
+fn build_threaded_entries(
+  funcs: List(String),
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(List(CExpr), EmitState), EmitError) {
+  list.try_fold(funcs, #([], state), fn(acc, fname) {
+    let #(entries, st) = acc
+    use #(entry, st2) <- result.try(threaded_element_entry(fname, ctx, st))
+    Ok(#(list.append(entries, [entry]), st2))
+  })
+}
+
+/// One THREADED element-segment entry `{TypeTag, Closure}`: the function's IR `FuncType` (the
+/// SAME `func_type_term` renderer the call site uses, so `rt_table`'s type guard matches)
+/// paired with a threaded closure over the compile-time-fixed target name.
+/// `Error(UnknownFunction)` if `fname` is not defined.
+fn threaded_element_entry(
+  fname: String,
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case dict.get(ctx.fn_sig, fname) {
+    Error(_) -> Error(UnknownFunction(fname))
+    Ok(sig) -> {
+      let arity = result.unwrap(dict.get(ctx.fn_arity, fname), 0)
+      let r = result.unwrap(dict.get(ctx.fn_results, fname), 0)
+      let reaching = set.contains(ctx.fn_state_reaching, fname)
+      let #(closure, state2) =
+        threaded_element_closure(fname, arity, r, reaching, state)
+      Ok(#(CTuple([func_type_term(sig), closure]), state2))
+    }
+  }
+}
+
+/// A build-controlled THREADED element-segment closure `fun(St, ArgsList) -> {ResultList, St'}`
+/// matching the frozen table-entry ABI `fn(InstanceState, List(Int)) -> #(List(Int),
+/// InstanceState)` (§C). Unpacks `ArgsList` to the target's static `arity`, then:
+/// - PURE target: `{wrap(apply 'f'/n(args…)), St}` — thread `St` through UNTOUCHED.
+/// - STATE-REACHING target: `{Pkg, St'} = apply 'f'/(n+1)(St, args…)` then `{wrap(Pkg), St'}`.
+/// Always a static `apply` of a COMPILE-TIME-LITERAL name — `St` is a parameter, never a
+/// dispatch key (D3a).
+fn threaded_element_closure(
+  fname: String,
+  arity: Int,
+  r: Int,
+  reaching: Bool,
+  state: EmitState,
+) -> #(CExpr, EmitState) {
+  let #(stvar, state1) = fresh_var(state)
+  let #(argsvar, state2) = fresh_var(state1)
+  let #(argnames, state3) = fresh_n_vars(state2, arity)
+  case reaching {
+    False -> {
+      let applied = CApply(FName(fname, arity), list.map(argnames, CVar))
+      let #(wrapped, state4) = wrap_result_list(applied, r, state3)
+      let paired = CTuple([wrapped, CVar(stvar)])
+      let body = wrap_args_case(argsvar, arity, argnames, paired)
+      #(CFun([stvar, argsvar], body), state4)
+    }
+    True -> {
+      let applied =
+        CApply(FName(fname, arity + 1), [
+          CVar(stvar),
+          ..list.map(argnames, CVar)
+        ])
+      let #(pkgvar, state4) = fresh_var(state3)
+      let #(stoutvar, state5) = fresh_var(state4)
+      let #(wrapped, state6) = wrap_result_list(CVar(pkgvar), r, state5)
+      let paired = CTuple([wrapped, CVar(stoutvar)])
+      let destructure =
+        CCase(applied, [
+          CClause(
+            [PTuple([PVar(pkgvar), PVar(stoutvar)])],
+            CAtom("true"),
+            paired,
+          ),
+        ])
+      let body = wrap_args_case(argsvar, arity, argnames, destructure)
+      #(CFun([stvar, argsvar], body), state6)
+    }
+  }
+}
+
+/// Wrap `inner` in the args-list unpack for an element closure: `case ArgsList of <[A0,…]> ->
+/// inner` (or `inner` verbatim for a 0-arity target, whose args list is the empty `[]`).
+fn wrap_args_case(
+  argsvar: String,
+  arity: Int,
+  argnames: List(String),
+  inner: CExpr,
+) -> CExpr {
+  case arity {
+    0 -> inner
+    _ ->
+      CCase(CVar(argsvar), [
+        CClause([list_pattern(argnames)], CAtom("true"), inner),
+      ])
+  }
 }
 
 /// The `rt_meter:seed_fuel(binding.fuel_budget)` per-instance seed — `[seam_call…]` under

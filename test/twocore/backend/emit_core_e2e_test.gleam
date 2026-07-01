@@ -9,6 +9,7 @@
 //// the deny-all capability boundary, and the resolved `own` stdlib.
 
 import gleam/bit_array
+import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/option
@@ -753,4 +754,298 @@ fn is_trap(r: Result(Int, String)) -> Bool {
     Error(t) -> string.contains(t, "wasm_trap")
     Ok(_) -> False
   }
+}
+
+// ════════════════════ Phase-4 (P4-02): THREADED state end-to-end ════════════════════
+//
+// The headline P4-02 proof (unit-doc §"Verification" test 6): a hand-built stateful IR `Module`
+// compiled under `state_strategy: Threaded` instantiates, runs, and traps BYTE-IDENTICALLY to
+// the `Cell` build — but as a purely-functional record-threading `.core` (no process dictionary
+// in the linked output). The run-ABI is HAND-DRIVEN here (unit 08 owns it in the pipeline): the
+// generated `instantiate/0` RETURNS the `InstanceState`; each export takes it LEADING and
+// returns `{Package, St'}`; the test threads `St'` across successive invokes via a small FFI.
+
+// Test-only FFI (see `test/twocore_threaded_test_ffi.erl`): run the record-returning
+// `instantiate/0`, and apply an export with the record leading, capturing traps as `Error`.
+@external(erlang, "twocore_threaded_test_ffi", "instantiate")
+fn t_instantiate(module: Atom) -> Result(Dynamic, String)
+
+// Invoke a VALUE-returning export: `{IntResult, St'}` on success (the package is coerced to
+// `Int` at the FFI boundary, as the cell `catch_apply` does), a trap text on `Error`.
+@external(erlang, "twocore_threaded_test_ffi", "invoke")
+fn t_invoke_int(
+  module: Atom,
+  function: Atom,
+  st: Dynamic,
+  args: List(Int),
+) -> Result(#(Int, Dynamic), String)
+
+// Invoke a ZERO-RESULT export (`store`/`set`): the package is the discardable `'ok'` atom, so
+// it stays `Dynamic`; only the threaded-out record `St'` matters.
+@external(erlang, "twocore_threaded_test_ffi", "invoke")
+fn t_invoke_unit(
+  module: Atom,
+  function: Atom,
+  st: Dynamic,
+  args: List(Int),
+) -> Result(#(Dynamic, Dynamic), String)
+
+/// A Safe binding switched to the tier-P `Threaded` state strategy (the same fixed
+/// `twocore@runtime@*` modules; only the codegen shape differs).
+fn threaded_binding() -> instance.Binding {
+  instance.Binding(..instance.safe_default(), state_strategy: instance.Threaded)
+}
+
+/// Emit `module` under `Threaded` to Core text, compile it, and load it; return the module atom.
+fn load_threaded(module: ir.Module) -> Atom {
+  let assert Ok(cm) = emit_core.emit_module(module, threaded_binding())
+  let core = core_printer.print_module(cm)
+  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  mod
+}
+
+/// THREADED memory round-trip: `instantiate/0` returns the record, `store32` threads the
+/// UPDATED record forward, and `load32`/`load8s`/`load16u` read it back — sign-/zero-extending
+/// per `exec/memory`. Diffed against the `Cell` oracle (same IR, `state_strategy: Cell`).
+pub fn threaded_memory_store_load_roundtrip_e2e_test() {
+  let m =
+    full(
+      "threadedmem",
+      option.Some(ir.MemoryDecl(1, option.None)),
+      [],
+      [
+        store_fn("store32", 4),
+        load_fn("load32", 4, False, ir.TI32),
+        load_fn("load8s", 1, True, ir.TI32),
+        load_fn("load16u", 2, False, ir.TI32),
+      ],
+      [],
+      [],
+      [],
+      option.None,
+    )
+  let mod = load_threaded(m)
+  let assert Ok(st0) = t_instantiate(mod)
+  // store a full i32 word at addr 0, threading the record forward, then load it back.
+  let assert Ok(#(_, st1)) =
+    t_invoke_unit(mod, atom.create("store32"), st0, [0, 305_419_896])
+  let assert Ok(#(v, st2)) = t_invoke_int(mod, atom.create("load32"), st1, [0])
+  assert v == 305_419_896
+  // little-endian + sign-/zero-extension on the width matrix, still threading.
+  let assert Ok(#(_, st3)) =
+    t_invoke_unit(mod, atom.create("store32"), st2, [0, 4_294_967_168])
+  let assert Ok(#(v8, st4)) = t_invoke_int(mod, atom.create("load8s"), st3, [0])
+  assert v8 == 4_294_967_168
+  let assert Ok(#(v16, _)) = t_invoke_int(mod, atom.create("load16u"), st4, [0])
+  assert v16 == 65_408
+  // diff vs the Cell oracle — byte-identical observable results (G7).
+  let cmod = load(m)
+  instantiate(cmod)
+  let assert Ok(_) = catch_apply(cmod, atom.create("store32"), [0, 305_419_896])
+  assert catch_apply(cmod, atom.create("load32"), [0]) == Ok(305_419_896)
+}
+
+/// THREADED `memory.grow`: returns the OLD page count and rebinds the record; a load of the
+/// freshly-grown zero region returns `0`; a grow past the declared max returns `-1`.
+pub fn threaded_memory_grow_e2e_test() {
+  let m =
+    full(
+      "threadedgrow",
+      option.Some(ir.MemoryDecl(1, option.Some(3))),
+      [],
+      [
+        ir.Function(
+          "grow",
+          [ir.Local("d", ir.TI32)],
+          [ir.TI32],
+          [],
+          ir.MemGrow(ir.Var("d")),
+        ),
+        ir.Function("size", [], [ir.TI32], [], ir.MemSize),
+        load_fn("load32", 4, False, ir.TI32),
+      ],
+      [],
+      [],
+      [],
+      option.None,
+    )
+  let mod = load_threaded(m)
+  let assert Ok(st0) = t_instantiate(mod)
+  let assert Ok(#(s0, st1)) = t_invoke_int(mod, atom.create("size"), st0, [])
+  assert s0 == 1
+  // grow(1) returns the OLD page count (1) and rebinds the record.
+  let assert Ok(#(old, st2)) = t_invoke_int(mod, atom.create("grow"), st1, [1])
+  assert old == 1
+  let assert Ok(#(s1, st3)) = t_invoke_int(mod, atom.create("size"), st2, [])
+  assert s1 == 2
+  // a load of the freshly-grown (zero-filled) region returns 0.
+  let assert Ok(#(z, st4)) =
+    t_invoke_int(mod, atom.create("load32"), st3, [65_536])
+  assert z == 0
+  // grow past the declared max (2 + 5 > 3) returns -1 and allocates nothing.
+  let assert Ok(#(neg, st5)) = t_invoke_int(mod, atom.create("grow"), st4, [5])
+  assert neg == -1
+  let assert Ok(#(s2, _)) = t_invoke_int(mod, atom.create("size"), st5, [])
+  assert s2 == 2
+}
+
+/// THE headline hand-driven proof: a mutable GLOBAL round-trips `global.set`/`global.get`, and
+/// state PERSISTS across two invokes THROUGH THE THREADED RECORD (not a pdict cell). The OLD
+/// record still reads the OLD value — purely-functional threading (immutable versions). Diffed
+/// against the `Cell` oracle.
+pub fn threaded_mutable_global_persists_across_invokes_e2e_test() {
+  let m =
+    full(
+      "threadedglobal",
+      option.None,
+      [ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(7)]))],
+      [
+        ir.Function("get", [], [ir.TI32], [], ir.GlobalGet("g0")),
+        ir.Function(
+          "set",
+          [ir.Local("v", ir.TI32)],
+          [],
+          [],
+          ir.Let([], ir.GlobalSet("g0", ir.Var("v")), ir.Values([])),
+        ),
+      ],
+      [],
+      [],
+      [],
+      option.None,
+    )
+  let mod = load_threaded(m)
+  let assert Ok(st0) = t_instantiate(mod)
+  // get reads the constant init 7 (record unchanged).
+  let assert Ok(#(v0, st1)) = t_invoke_int(mod, atom.create("get"), st0, [])
+  assert v0 == 7
+  // set 99 → thread the UPDATED record forward.
+  let assert Ok(#(_, st2)) = t_invoke_unit(mod, atom.create("set"), st1, [99])
+  // get on the threaded record sees 99 — state PERSISTED across invokes via the value.
+  let assert Ok(#(v2, _)) = t_invoke_int(mod, atom.create("get"), st2, [])
+  assert v2 == 99
+  // the ORIGINAL record st0 STILL reads 7 — the old version was never mutated (functional).
+  let assert Ok(#(v_old, _)) = t_invoke_int(mod, atom.create("get"), st0, [])
+  assert v_old == 7
+  // diff vs the Cell oracle — same observable round-trip (G7).
+  let cmod = load(m)
+  instantiate(cmod)
+  assert catch_apply(cmod, atom.create("get"), []) == Ok(7)
+  let assert Ok(_) = catch_apply(cmod, atom.create("set"), [99])
+  assert catch_apply(cmod, atom.create("get"), []) == Ok(99)
+}
+
+/// THREADED `call_indirect`: dispatch to the right type runs (threading the record through the
+/// invoked closure), and each of the three faults traps with the spec reason — never via a
+/// data-driven `apply` (the closure `St` is a parameter, not a dispatch key).
+pub fn threaded_call_indirect_e2e_test() {
+  let inc =
+    ir.Function(
+      "inc",
+      [ir.Local("x", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Let(
+        ["r"],
+        ir.Num(ir.IAdd(ir.W32), [ir.Var("x"), ir.ConstI32(1)]),
+        ir.Return([ir.Var("r")]),
+      ),
+    )
+  let callfn =
+    ir.Function(
+      "callfn",
+      [ir.Local("idx", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.CallIndirect("t0", ir.Var("idx"), ir.FuncType([ir.TI32], [ir.TI32]), [
+        ir.ConstI32(41),
+      ]),
+    )
+  let callwrong =
+    ir.Function(
+      "callwrong",
+      [ir.Local("idx", ir.TI32)],
+      [ir.TI64],
+      [],
+      ir.CallIndirect("t0", ir.Var("idx"), ir.FuncType([ir.TI64], [ir.TI64]), [
+        ir.ConstI64(0),
+      ]),
+    )
+  let m =
+    full(
+      "threadedci",
+      option.None,
+      [],
+      [inc, callfn, callwrong],
+      [ir.TableDecl("t0", 4, option.None)],
+      [ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["inc"])],
+      [],
+      option.None,
+    )
+  let mod = load_threaded(m)
+  let assert Ok(st0) = t_instantiate(mod)
+  // slot 0 holds `inc` [i32]->[i32]: dispatch runs, threading the record.
+  let assert Ok(#(v, st1)) = t_invoke_int(mod, atom.create("callfn"), st0, [0])
+  assert v == 42
+  // index past the table bound (size 4).
+  let assert Error(undef) = t_invoke_int(mod, atom.create("callfn"), st1, [10])
+  assert string.contains(undef, "undefined_element")
+  // in-bounds but null (uninitialised) slot.
+  let assert Error(uninit) = t_invoke_int(mod, atom.create("callfn"), st1, [2])
+  assert string.contains(uninit, "uninitialized_element")
+  // right slot, wrong expected type ([i64]->[i64] vs the stored [i32]->[i32]).
+  let assert Error(mismatch) =
+    t_invoke_int(mod, atom.create("callwrong"), st1, [0])
+  assert string.contains(mismatch, "indirect_call_type_mismatch")
+}
+
+/// An out-of-bounds active DATA segment traps AT INSTANTIATION under `Threaded` too
+/// (`instantiate/0` raises "out of bounds memory access" — the record is abandoned).
+pub fn threaded_oob_data_segment_traps_at_instantiation_e2e_test() {
+  let m =
+    full(
+      "threadeddataoob",
+      option.Some(ir.MemoryDecl(1, option.None)),
+      [],
+      [],
+      [],
+      [],
+      [ir.DataSegment(ir.Values([ir.ConstI32(65_535)]), <<1, 2, 3>>)],
+      option.None,
+    )
+  let mod = load_threaded(m)
+  let assert Error(reason) = t_instantiate(mod)
+  assert string.contains(reason, "memory_out_of_bounds")
+}
+
+/// An out-of-bounds active ELEMENT segment traps AT INSTANTIATION under `Threaded`
+/// (`instantiate/0` raises "out of bounds table access").
+pub fn threaded_oob_element_segment_traps_at_instantiation_e2e_test() {
+  let target =
+    ir.Function(
+      "target",
+      [ir.Local("p0", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Return([ir.Var("p0")]),
+    )
+  let m =
+    full(
+      "threadedelemoob",
+      option.None,
+      [],
+      [target],
+      [ir.TableDecl("t0", 2, option.None)],
+      [
+        ir.ElementSegment("t0", ir.Values([ir.ConstI32(1)]), [
+          "target",
+          "target",
+        ]),
+      ],
+      [],
+      option.None,
+    )
+  let mod = load_threaded(m)
+  let assert Error(reason) = t_instantiate(mod)
+  assert string.contains(reason, "table_out_of_bounds")
 }

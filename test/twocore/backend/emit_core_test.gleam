@@ -15,8 +15,8 @@ import gleam/list
 import gleam/option
 import twocore/backend/core_erlang.{
   type CExpr, CApply, CAtom, CBinary, CCall, CCase, CClause, CCons, CFun, CInt,
-  CLet, CLetrec, CNil, CTuple, CVar, FName, FunDef, PAtom, PCons, PInt, PNil,
-  PTuple, PVar,
+  CLet, CLetrec, CNil, CTuple, CValues, CVar, FName, FunDef, PAtom, PCons, PInt,
+  PNil, PTuple, PVar,
 }
 import twocore/backend/emit_core
 import twocore/ir
@@ -1068,4 +1068,552 @@ fn emit_one(expr: ir.Expr) -> Result(core_erlang.CModule, emit_core.EmitError) {
       body: expr,
     )
   emit_core.emit_module(module_with(f), binding())
+}
+
+// ════════════════════ Phase-4 (P4-02): threaded-seam AST goldens ════════════════════
+//
+// These assert the `state_strategy: Threaded` codegen SHAPE against the keystone
+// (`01-interface-freeze.md` §A) and the unit doc (`02-emit-threaded-seam.md` §B–§E) — the
+// uniform-threading rule (a state-reaching `'f'/(n+1)` returning `{Package, St'}`), the per-op
+// record threading (rebind on write, read-through on read), the G4 constant-space loop
+// back-edge, the record-returning `instantiate/0`, and the §B.4 export-collision fix. They are
+// structural (pattern-match the AST), not change-detectors: each cites the frozen decision.
+
+/// A Safe binding switched to the tier-P `Threaded` state strategy (keystone §A) — same fixed
+/// `twocore@runtime@*` modules, only the codegen SHAPE differs (the strategy is the sole switch).
+fn threaded_binding() -> instance.Binding {
+  instance.Binding(..instance.safe_default(), state_strategy: instance.Threaded)
+}
+
+/// A single-function module WITH memory/global/table declared (so every stateful op has a
+/// backing decl), exported by its own name — for asserting a state-reaching function's shape.
+fn st_module(f: ir.Function) -> ir.Module {
+  ir.Module(
+    name: "twocore@test@" <> f.name,
+    uses_numerics: True,
+    memory: option.Some(ir.MemoryDecl(1, option.None)),
+    globals: [ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(0)]))],
+    imports: [],
+    functions: [f],
+    exports: [ir.ExportFn(f.name, f.name)],
+    data_segments: [],
+    tables: [ir.TableDecl("t0", 4, option.None)],
+    elements: [],
+    start: option.None,
+  )
+}
+
+/// Emit `module` under `Threaded` and return the FIRST def whose function atom is `name`.
+fn threaded_def(module: ir.Module, name: String) -> core_erlang.FunDef {
+  let assert Ok(m) = emit_core.emit_module(module, threaded_binding())
+  let assert Ok(def) =
+    list.find(m.defs, fn(d) {
+      let FunDef(FName(n, _), _) = d
+      n == name
+    })
+  def
+}
+
+/// A state-reaching `store(addr,val)` becomes `'store'/3 = fun(St, addr, val) -> {…, St'}`:
+/// the `InstanceState` is the LEADING param, `MemStore` REBINDS it via
+/// `let St2 = case t_store(St,…) of {ok,S}->S; {error,E}->raise`, and the zero-result body
+/// returns `{'ok', St2}` — the outgoing REBOUND record (keystone §10 / unit-doc §B.1, §C).
+pub fn threaded_store_rebinds_record_test() {
+  let b = threaded_binding()
+  let store =
+    ir.Function(
+      name: "store",
+      params: [ir.Local("addr", ir.TI32), ir.Local("val", ir.TI32)],
+      result: [],
+      locals: [],
+      body: ir.Let(
+        [],
+        ir.MemStore(ir.MemAccess(4, False), ir.Var("addr"), ir.Var("val"), 0),
+        ir.Values([]),
+      ),
+    )
+  let assert FunDef(FName("store", 3), CFun([st, "addr", "val"], body)) =
+    threaded_def(st_module(store), "store")
+  let assert CLet(
+    [newst],
+    CCase(
+      CCall(
+        CAtom(mem),
+        CAtom("t_store"),
+        [CVar(st_arg), CInt(4), CVar("addr"), CVar("val"), CInt(0)],
+      ),
+      [
+        CClause([PTuple([PAtom("ok"), PVar(s)])], CAtom("true"), CVar(s2)),
+        CClause(
+          [PTuple([PAtom("error"), PVar(_)])],
+          CAtom("true"),
+          CCall(CAtom(_), CAtom("raise"), [CVar(_)]),
+        ),
+      ],
+    ),
+    tail,
+  ) = body
+  assert mem == b.mem_module
+  // the store reads the LEADING record param and the `{ok,S}` arm yields the REBOUND record.
+  assert st_arg == st
+  assert s == s2
+  // the zero-result function returns `{'ok', St2}` — the rebound record, NOT the incoming St.
+  let assert CLet([], CValues([]), CTuple([CAtom("ok"), CVar(ret)])) = tail
+  assert ret == newst
+}
+
+/// A state-reaching `load(addr)` becomes `'load'/2 = fun(St, addr) -> {V, St}`: `MemLoad`
+/// reads through `t_load(St,…)` and threads the SAME record on UNCHANGED (read-only, §C).
+pub fn threaded_load_reads_without_rebind_test() {
+  let load =
+    ir.Function(
+      name: "load",
+      params: [ir.Local("addr", ir.TI32)],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.MemLoad(ir.MemAccess(4, False), ir.Var("addr"), 0, ir.TI32),
+    )
+  let assert FunDef(FName("load", 2), CFun([st, "addr"], body)) =
+    threaded_def(st_module(load), "load")
+  let assert CLet(
+    [rvar],
+    CCase(
+      CCall(
+        CAtom(_),
+        CAtom("t_load"),
+        [CVar(st_arg), CInt(4), CAtom("false"), CInt(32), CVar("addr"), CInt(0)],
+      ),
+      _clauses,
+    ),
+    CTuple([CVar(rv2), CVar(ret)]),
+  ) = body
+  assert st_arg == st
+  assert rv2 == rvar
+  // read-only: the record threaded out is the SAME leading param St.
+  assert ret == st
+}
+
+/// `MemSize` reads through `t_size(St)` and threads the SAME record on (read-only, §C):
+/// `'size'/1 = fun(St) -> {t_size(St), St}`.
+pub fn threaded_size_reads_without_rebind_test() {
+  let size =
+    ir.Function(
+      name: "size",
+      params: [],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.MemSize,
+    )
+  let assert FunDef(FName("size", 1), CFun([st], body)) =
+    threaded_def(st_module(size), "size")
+  let assert CTuple([
+    CCall(CAtom(_), CAtom("t_size"), [CVar(st_arg)]),
+    CVar(ret),
+  ]) = body
+  assert st_arg == st
+  assert ret == st
+}
+
+/// `MemGrow(delta)` binds `{V, St2} = t_grow(St, Delta)` — the old page count `V` paired with
+/// the REBOUND record `St2` (§C): `'grow'/2 = fun(St, d) -> {V, St2}`.
+pub fn threaded_grow_binds_value_and_rebinds_test() {
+  let grow =
+    ir.Function(
+      name: "grow",
+      params: [ir.Local("d", ir.TI32)],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.MemGrow(ir.Var("d")),
+    )
+  let assert FunDef(FName("grow", 2), CFun([st, "d"], body)) =
+    threaded_def(st_module(grow), "grow")
+  let assert CCase(
+    CCall(CAtom(_), CAtom("t_grow"), [CVar(st_arg), CVar("d")]),
+    [
+      CClause(
+        [PTuple([PVar(v), PVar(st2)])],
+        CAtom("true"),
+        CTuple([CVar(v2), CVar(ret)]),
+      ),
+    ],
+  ) = body
+  assert st_arg == st
+  assert v == v2
+  // the REBOUND record (St2) is threaded out — distinct from the incoming leading St.
+  assert ret == st2
+  assert st2 != st
+}
+
+/// `GlobalGet(name)` reads through `t_global_get(St, NameBin)` and threads the SAME record on
+/// (read-only, §C): `'get'/1 = fun(St) -> {t_global_get(St, <<"g0">>), St}`.
+pub fn threaded_global_get_reads_without_rebind_test() {
+  let b = threaded_binding()
+  let get =
+    ir.Function(
+      name: "get",
+      params: [],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.GlobalGet("g0"),
+    )
+  let assert FunDef(FName("get", 1), CFun([st], body)) =
+    threaded_def(st_module(get), "get")
+  let assert CTuple([
+    CCall(CAtom(state), CAtom("t_global_get"), [CVar(st_arg), CBinary(_)]),
+    CVar(ret),
+  ]) = body
+  assert state == b.state_module
+  assert st_arg == st
+  assert ret == st
+}
+
+/// `GlobalSet(name, value)` REBINDS the record via the non-trapping `t_global_set(St, …)`
+/// (returns the record directly, §C): `'set'/2 = fun(St, v) -> …{'ok', St2}`.
+pub fn threaded_global_set_rebinds_record_test() {
+  let set =
+    ir.Function(
+      name: "set",
+      params: [ir.Local("v", ir.TI32)],
+      result: [],
+      locals: [],
+      body: ir.Let([], ir.GlobalSet("g0", ir.Var("v")), ir.Values([])),
+    )
+  let assert FunDef(FName("set", 2), CFun([st, "v"], body)) =
+    threaded_def(st_module(set), "set")
+  let assert CLet(
+    [newst],
+    CCall(
+      CAtom(_),
+      CAtom("t_global_set"),
+      [CVar(st_arg), CBinary(_), CVar("v")],
+    ),
+    CLet([], CValues([]), CTuple([CAtom("ok"), CVar(ret)])),
+  ) = body
+  assert st_arg == st
+  assert ret == newst
+}
+
+/// `CallIndirect` binds `{Rs, St2}` from `t_call_indirect(St, …)` — the results LIST `Rs`
+/// (unpacked to `len(ty.results)` values) with the REBOUND record `St2` (§C, §G).
+pub fn threaded_call_indirect_binds_results_and_rebinds_test() {
+  let b = threaded_binding()
+  let f =
+    ir.Function(
+      name: "f",
+      params: [ir.Local("i", ir.TI32), ir.Local("x", ir.TI32)],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.CallIndirect(
+        "t0",
+        ir.Var("i"),
+        ir.FuncType([ir.TI32], [ir.TI32]),
+        [ir.Var("x")],
+      ),
+    )
+  let assert FunDef(FName("f", 3), CFun([st, "i", "x"], body)) =
+    threaded_def(st_module(f), "f")
+  let assert CLet(
+    [pbound],
+    CCase(
+      CCall(
+        CAtom(table),
+        CAtom("t_call_indirect"),
+        [CVar(st_arg), CVar("i"), CTuple(_ty), CCons(CVar("x"), CNil)],
+      ),
+      _reduce,
+    ),
+    CCase(
+      CVar(pb2),
+      [CClause([PTuple([PVar(rs), PVar(st2)])], CAtom("true"), inner)],
+    ),
+  ) = body
+  assert table == b.table_module
+  assert st_arg == st
+  assert pbound == pb2
+  // the results list is unpacked (r=1 → `[V]`) and returned with the REBOUND record.
+  let assert CCase(
+    CVar(rs2),
+    [
+      CClause(
+        [PCons(PVar(vn), PNil)],
+        CAtom("true"),
+        CTuple([CVar(vn2), CVar(ret)]),
+      ),
+    ],
+  ) = inner
+  assert rs == rs2
+  assert vn == vn2
+  assert ret == st2
+}
+
+/// A PURE function under `Threaded` keeps its Phase-1 `'g'/n` shape (no `St`, no return
+/// tuple) — byte-identical to `Cell`. So pure numeric leaves pay NOTHING (§B.1, §D).
+pub fn threaded_pure_function_keeps_phase1_shape_test() {
+  let b = threaded_binding()
+  let assert FunDef(
+    FName("add", 2),
+    CFun(
+      ["p0", "p1"],
+      CLet(
+        ["r"],
+        CCall(CAtom(num), CAtom("i32_add"), [CVar("p0"), CVar("p1")]),
+        CVar("r"),
+      ),
+    ),
+  ) = threaded_def(module_with(add_fn()), "add")
+  assert num == b.num_module
+}
+
+/// A tail `CallDirect` to a STATE-REACHING callee stays a TAIL CALL: `apply 'g'/(n+1)(St, x)`
+/// straight through — `{Package, St'}` is already what the caller returns, so cross-function
+/// tail recursion keeps constant stack (§B.3). No wrapping `case`/`let`.
+pub fn threaded_tail_call_to_state_reaching_stays_tail_test() {
+  let g =
+    ir.Function(
+      name: "g",
+      params: [ir.Local("x", ir.TI32)],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.MemLoad(ir.MemAccess(4, False), ir.Var("x"), 0, ir.TI32),
+    )
+  let f =
+    ir.Function(
+      name: "f",
+      params: [ir.Local("x", ir.TI32)],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.CallDirect("g", [ir.Var("x")]),
+    )
+  let m =
+    ir.Module(
+      name: "twocore@test@tailcall",
+      uses_numerics: True,
+      memory: option.Some(ir.MemoryDecl(1, option.None)),
+      globals: [],
+      imports: [],
+      functions: [g, f],
+      exports: [ir.ExportFn("g", "g"), ir.ExportFn("f", "f")],
+      data_segments: [],
+      tables: [],
+      elements: [],
+      start: option.None,
+    )
+  let assert FunDef(FName("f", 2), CFun([st, "x"], body)) = threaded_def(m, "f")
+  // the whole body IS the tail apply — {Package, St'} passed straight through.
+  let assert CApply(FName("g", 2), [CVar(st_arg), CVar("x")]) = body
+  assert st_arg == st
+}
+
+/// A state-reaching `Loop` carries `St` as the LEADING loop param and the `Continue`
+/// back-edge is a TAIL `apply 'L'(St', vs…)` — the G4 constant-space template (unit-doc §D).
+pub fn threaded_loop_is_constant_space_template_test() {
+  let run =
+    ir.Function(
+      name: "run",
+      params: [],
+      result: [],
+      locals: [],
+      body: ir.Loop(
+        label: "go",
+        params: [ir.LoopParam("i", ir.TI32, ir.ConstI32(0))],
+        result: [],
+        body: ir.Let(
+          [],
+          ir.MemStore(ir.MemAccess(4, False), ir.Var("i"), ir.Var("i"), 0),
+          ir.Continue("go", [ir.Var("i")]),
+        ),
+      ),
+    )
+  let assert FunDef(FName("run", 1), CFun([st], body)) =
+    threaded_def(st_module(run), "run")
+  // `letrec 'L'/2 = fun(St, i) -> …` applied to `apply 'L'(St_entry, 0)`.
+  let assert CLetrec(
+    [FunDef(FName(lname, 2), CFun([st_loop, "i"], lbody))],
+    CApply(FName(entry, 2), [CVar(st_entry), CInt(0)]),
+  ) = body
+  assert entry == lname
+  // the loop is entered with the function's LEADING record param.
+  assert st_entry == st
+  // the back-edge is a TAIL apply of the loop head, prepending the LIVE (rebound) record. The
+  // store's `let St2 = <case>` rebinds the record; the `Let([], …, Continue)` interposes only a
+  // trivial zero-value `let <> = <>` (identical to the cell path), then the `apply` is in TAIL
+  // position — no `case`/wrapping between it and the loop head, so the loop is constant space.
+  let assert CLet(
+    [st2],
+    _store_case,
+    CLet([], CValues([]), CApply(FName(back, 2), [CVar(st2b), CVar("i")])),
+  ) = lbody
+  assert back == lname
+  assert st2b == st2
+  // St2 is the store's rebound record, threaded on the loop param slot (not `st_loop`).
+  assert st2 != st_loop
+}
+
+/// §B.4 export collision: a state-reaching `ExportFn(f, f)` (`export_name == fn_name`) yields
+/// EXACTLY ONE `'f'/(n+1)` def — the internal one, exported DIRECTLY, with NO self-applying
+/// wrapper. Without the fix, a second `'f'/(n+1)` (self-applying → duplicate def + infinite
+/// recursion) would be emitted (unit-doc §B.4 / the `emit_core.gleam:315` name-equality mirror).
+pub fn threaded_export_name_equals_fn_no_duplicate_test() {
+  let store =
+    ir.Function(
+      name: "f",
+      params: [ir.Local("addr", ir.TI32)],
+      result: [],
+      locals: [],
+      body: ir.Let(
+        [],
+        ir.MemStore(ir.MemAccess(4, False), ir.Var("addr"), ir.Var("addr"), 0),
+        ir.Values([]),
+      ),
+    )
+  let assert Ok(m) = emit_core.emit_module(st_module(store), threaded_binding())
+  let fdefs =
+    list.filter(m.defs, fn(d) {
+      let FunDef(FName(n, a), _) = d
+      n == "f" && a == 2
+    })
+  // exactly one `'f'/2` def, exported directly at arity n+1, and it is the REAL body …
+  assert list.length(fdefs) == 1
+  assert list.contains(m.exports, FName("f", 2))
+  let assert [FunDef(_, CFun(_, fbody))] = fdefs
+  // … not a self-applying forwarder (`fun(St,A) -> apply 'f'/2(St,A)`).
+  assert applies_to(fbody, "f") == False
+}
+
+/// §B.4: a state-reaching `ExportFn(main, f)` with DISTINCT names emits a separate forwarder
+/// `'main'/(n+1) = fun(St, A…) -> apply 'f'/(n+1)(St, A…)` (already `{Package, St'}`).
+pub fn threaded_export_alias_forwards_at_plus_one_test() {
+  let store =
+    ir.Function(
+      name: "f",
+      params: [ir.Local("addr", ir.TI32)],
+      result: [],
+      locals: [],
+      body: ir.Let(
+        [],
+        ir.MemStore(ir.MemAccess(4, False), ir.Var("addr"), ir.Var("addr"), 0),
+        ir.Values([]),
+      ),
+    )
+  let m =
+    ir.Module(
+      name: "twocore@test@threadedalias",
+      uses_numerics: True,
+      memory: option.Some(ir.MemoryDecl(1, option.None)),
+      globals: [],
+      imports: [],
+      functions: [store],
+      exports: [ir.ExportFn("main", "f")],
+      data_segments: [],
+      tables: [],
+      elements: [],
+      start: option.None,
+    )
+  let assert Ok(cm) = emit_core.emit_module(m, threaded_binding())
+  assert list.contains(cm.exports, FName("main", 2))
+  let assert Ok(FunDef(
+    FName("main", 2),
+    CFun([mst, ma], CApply(FName("f", 2), [CVar(mst2), CVar(ma2)])),
+  )) =
+    list.find(cm.defs, fn(d) {
+      let FunDef(FName(n, a), _) = d
+      n == "main" && a == 2
+    })
+  assert mst == mst2
+  assert ma == ma2
+}
+
+/// §B.4: a PURE export gets an `'export'/(n+1)` adapter `fun(St, A…) -> {apply 'g'/n(A…), St}`
+/// that COEXISTS with the internal `'g'/n` (distinct arity, no collision).
+pub fn threaded_pure_export_adapter_test() {
+  let assert Ok(cm) =
+    emit_core.emit_module(module_with(add_fn()), threaded_binding())
+  // the uniform threaded export ABI is arity n+1.
+  assert list.contains(cm.exports, FName("add", 3))
+  // the internal `'add'/2` still exists (a pure def; internal callers use it) …
+  assert list.any(cm.defs, fn(d) {
+    let FunDef(FName(n, a), _) = d
+    n == "add" && a == 2
+  })
+  // … and the `'add'/3` adapter threads St straight through: `{apply 'add'/2(A0,A1), St}`.
+  let assert Ok(FunDef(
+    FName("add", 3),
+    CFun(
+      [ast, a0, a1],
+      CTuple([CApply(FName("add", 2), [CVar(a0b), CVar(a1b)]), CVar(ast2)]),
+    ),
+  )) =
+    list.find(cm.defs, fn(d) {
+      let FunDef(FName(n, a), _) = d
+      n == "add" && a == 3
+    })
+  assert ast == ast2
+  assert a0 == a0b
+  assert a1 == a1b
+}
+
+/// The `Threaded` `instantiate/0` (§E) BUILDS the record via `fresh(Decl)` (not `seed`),
+/// threads it through element → data → start in WASM order (each a record-rebinding step), and
+/// RETURNS the `InstanceState` (not `'ok'`). The `Decl` term is BIT-IDENTICAL to the `Cell`
+/// `seed` decl, and `seed_fuel`/`seed_policy` still lead (spec instantiation order; keystone §A.3).
+pub fn threaded_instantiate_builds_and_returns_record_test() {
+  let tb = threaded_binding()
+  let assert Ok(cm) = emit_core.emit_module(full_module(), tb)
+  assert list.contains(cm.exports, FName("instantiate", 0))
+  let assert Ok(FunDef(_, CFun([], body))) =
+    list.find(cm.defs, fn(d) {
+      let FunDef(FName(n, _), _) = d
+      n == "instantiate"
+    })
+  // seed_fuel FIRST (MeterFuel), then seed_policy — UNCHANGED discards (§E 0a/0b).
+  let assert CLet([_], CCall(CAtom(meter), CAtom("seed_fuel"), [CInt(_)]), af) =
+    body
+  assert meter == tb.meter_module
+  let assert CLet(
+    [_],
+    CCall(CAtom(host), CAtom("seed_policy"), [CAtom("host_deny_all")]),
+    ap,
+  ) = af
+  assert host == tb.host_module
+  // St0 = fresh(Decl) — BUILDS the record (not `seed`); Decl bit-identical to the Cell decl.
+  let assert CLet([st0], CCall(CAtom(state), CAtom("fresh"), [decl]), a_fresh) =
+    ap
+  assert state == tb.state_module
+  assert decl == cell_seed_decl(full_module())
+  // element segment BEFORE data segment — each a record-rebinding `case`.
+  let assert CLet([st1], elem_case, a_elem) = a_fresh
+  assert contains_call(elem_case, tb.table_module, "t_init_elem")
+  assert applies_to(elem_case, "elemfn")
+  let assert CLet([st2], data_case, a_data) = a_elem
+  assert contains_call(data_case, tb.mem_module, "t_init_data")
+  // start (`init` is pure `[]→[]`): `let _ = apply 'init'/0() in <return the record>`.
+  let assert CLet([_], CApply(FName("init", 0), []), CVar(final)) = a_data
+  // RETURNS the threaded `InstanceState` (the final record), NOT `'ok'`.
+  assert final == st2
+  assert st0 != st1
+  assert st1 != st2
+}
+
+/// Extract the `Decl` term the `Cell` `instantiate/0` passes to `rt_state:seed(Decl)` — so the
+/// threaded `fresh(Decl)` can be asserted BIT-IDENTICAL to it (G7: both strategies materialise
+/// identical state).
+fn cell_seed_decl(module: ir.Module) -> CExpr {
+  let assert Ok(cm) = emit_core.emit_module(module, binding())
+  let assert Ok(FunDef(_, CFun([], body))) =
+    list.find(cm.defs, fn(d) {
+      let FunDef(FName(n, _), _) = d
+      n == "instantiate"
+    })
+  find_seed_decl(body)
+}
+
+/// Walk the `Cell` `instantiate/0` body's `let`-chain to the `rt_state:seed(Decl)` call and
+/// return its `Decl` argument. Panics if no `seed` call is present (an internal test invariant).
+fn find_seed_decl(e: CExpr) -> CExpr {
+  case e {
+    CLet(_, CCall(_, CAtom("seed"), [decl]), _) -> decl
+    CLet(_, _, rest) -> find_seed_decl(rest)
+    _ ->
+      panic as "find_seed_decl: no rt_state:seed call in the Cell instantiate body"
+  }
 }
