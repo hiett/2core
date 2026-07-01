@@ -1,9 +1,11 @@
 # 2core
 
-> ⚠️ **Experimental.** This is a research project, not a production tool. The
-> WebAssembly frontend now compiles end-to-end, but the platform is early and most
-> of the roadmap is not built yet. Treat the rest as direction, and check
-> [`specs/state.md`](specs/state.md) for exactly what is and isn't done.
+> ⚠️ **Experimental.** This is a research project, not a production tool. The WebAssembly
+> frontend and the whole compiler platform behind it — the shared optimizer, both security
+> modes, and the trust-tier runtime ladder — now work end-to-end. But it's early: several
+> post-MVP WASM proposals and all the non-WASM frontends aren't built yet, and it isn't
+> tuned for production. Check [`specs/state.md`](specs/state.md) for exactly what is and
+> isn't done.
 
 **2core is an experiment in compiling code to run fast and _preemptively_ on the BEAM.**
 
@@ -23,23 +25,28 @@ model.
 
 ## Status — what works today
 
-**Phases 1 & 2 are complete: essentially all of WebAssembly 1.0 compiles all the way to a
-loaded, running `.beam` module** — a real `.wasm` binary goes through a fully modular
-`decode → validate → lower → IR → Core Erlang → .beam → instantiate → run` pipeline, in
-the sandboxed "Safe" mode, driven by a CLI.
+**Phases 1–4 are complete.** A real `.wasm` binary compiles all the way to a loaded,
+running `.beam` module through a fully modular `decode → validate → lower → IR → optimize →
+Core Erlang → .beam → instantiate → run` pipeline — and it now runs under **two coexisting
+security modes** (sandboxed **Safe** and aggressive **Unsafe**) across a **trust-tier
+runtime ladder** (from a pure "runs-anywhere" build to O(1) native-ish memory). The whole
+project builds with **zero warnings** and **906 passing tests**.
 
 ```sh
-$ gleam run -- run add.wasm add 2 3     # decode → validate → lower → IR → Core Erlang → .beam → run
+$ gleam run -- run add.wasm add 2 3             # decode → validate → lower → IR → optimize → Core Erlang → .beam → run
 5
 $ gleam run -- run fib.wasm fib 10
 55
-$ gleam run -- ir add.wasm              # dump the shared IR in its textual form
+$ gleam run -- run add.wasm add 2 3 --portable  # the tier-P "runs-anywhere" build (no OTP-native state, no NIF)
+5
+$ gleam run -- run add.wasm add 2 3 --unsafe    # the aggressive-optimizer "Unsafe" profile
+5
+$ gleam run -- ir add.wasm                       # dump the shared IR in its textual form
 module @twocore@wasm@add { … }
 ```
 
 Every stage is independently invokable (`decode`, `validate`, `lower`, `ir`, `ir-lower`,
-`emit`, `to-core`, `build`, `run`), and the whole project builds with **zero warnings**
-and **509 passing tests**. What's proven end-to-end:
+`opt`, `emit`, `to-core`, `build`, `run`). What's proven end-to-end:
 
 - **the WASM 1.0 MVP** — integer + control flow (`block`/`loop`/`if`, `br`/`br_table`,
   `call`), **linear memory** (the full load/store matrix, `memory.size`/`grow`,
@@ -50,15 +57,30 @@ and **509 passing tests**. What's proven end-to-end:
   `div`/`rem` + trapping conversions, IEEE floats (round-to-nearest-ties-to-even, canonical
   NaN, the `INT_MIN / -1` / divide-by-zero / out-of-bounds / type-mismatch **traps**);
 - **constant-space, preemptible loops** — `sum_to(100000)` runs as a tail-recursive BEAM
-  loop without stack growth (even with metering + memory writes in the loop);
+  loop without stack growth (even with metering, memory writes, or the threaded state
+  record in the loop);
+- **a shared IR optimizer** — a *baseline* (trust-neutral) pass set and an *aggressive*
+  (Unsafe-only) pass set, proven to change **no** observable result: `OptNone ≡ Baseline ≡
+  Aggressive`, byte-identical across the whole corpus;
+- **two coexisting security modes** — **Safe** (vetted in-house stdlib, a tiny BEAM-function
+  allowlist, deny-all host, **enforcing** CPU-fuel metering that traps a runaway loop, no
+  node-crashing native code) and **Unsafe** (aggressive optimizer, passthrough stdlib, open
+  BIFs, no metering); the *same source* compiles to both, and they run isolated on one node;
+- **a trust-tier runtime ladder** — a tier-P **`threaded`** "runs-anywhere" build (a
+  purely-functional instance-state record threaded through the generated code — no process
+  dictionary, no OTP-native state, no NIF, provably can't crash the node), a tier-O
+  **`atomics`** O(1) memory backend, and a tier-N **`nif`** ceiling (interface + node-safe
+  skeleton; the production C impl is deferred). Every combination produces byte-identical
+  results;
 - **the sandbox seams** — the `call_host` capability boundary (fail-closed), bounds-checked
-  memory with a **grow resource cap**, and `call_indirect` with no ambient authority;
-  mutable state is per-instance (one-instance-one-process) and reset on instantiation.
+  memory with a **grow resource cap**, `call_indirect` with no ambient authority, and
+  Safe-mode's **fail-closed** rejection of node-crashing (tier-N) backends; mutable state is
+  per-instance (one-instance-one-process) and reset on instantiation.
 
-What's deliberately **not** here yet (Phase 3+): reference types, bulk memory, multi-memory,
-SIMD, non-function imports; the tier-P "runs-anywhere" build; the WAT text parser; the
-optimizer; the "Unsafe" performance profile; and the JS/Rust/Gleam frontends. The full
-roadmap and per-component status live in [`specs/state.md`](specs/state.md).
+What's deliberately **not** here yet (Phase 5+): reference types, bulk memory, multi-memory,
+SIMD, memory64, non-function imports, the WAT text parser; a production C NIF for the tier-N
+ceiling; and the JS/Rust/Gleam frontends. The full roadmap and per-component status live in
+[`specs/state.md`](specs/state.md).
 
 ## How it works
 
@@ -73,19 +95,35 @@ roadmap and per-component status live in [`specs/state.md`](specs/state.md).
   an opt-in **fixed-width numeric + linear-memory** model (for WASM/Rust), with explicit
   conversions between them — so term languages don't pay for linear memory, and low-level
   languages keep exact WASM semantics.
-- **Safe / Unsafe modes.** Two global modes: **Safe** sandboxes untrusted code (vetted
-  in-house stdlib, a tiny allowlist of BEAM functions, deny-all host access, metering on,
-  no node-crashing native code); **Unsafe** (later) emits the fastest possible code.
-  The two are designed to coexist on one node.
+- **Safe / Unsafe modes.** Two global modes that coexist on one node: **Safe** sandboxes
+  untrusted code (vetted in-house stdlib, a tiny allowlist of BEAM functions, deny-all host
+  access, enforcing CPU-fuel metering, no node-crashing native code); **Unsafe** emits the
+  fastest code (aggressive optimizer, passthrough stdlib, open BIFs, no metering). Same
+  source, two builds, isolated per instance.
+- **A trust-tier runtime ladder.** Orthogonal to Safe/Unsafe: the mutable-state layers
+  (memory, tables, instance state) have interchangeable backends spanning **P** (pure — no
+  OTP-native state, no NIF, runs anywhere, can't crash the node) → **O** (OTP-native, O(1),
+  memory-safe) → **N** (native NIF, the ceiling, can crash the node). Safe permits P or O,
+  never N; the tier is a build-time choice, so identical source yields different `.beam`s
+  with byte-identical behaviour.
 - **Everything modular.** Each stage and runtime layer is a narrow, independently-callable
   interface with interchangeable implementations — the design treats that modularity as
   *both* the security model and the replaceability model.
 - **Built in Gleam; output is pure Core Erlang.** The compiler runs at build time on the
   BEAM; whether any native code runs underneath is a per-deployment choice.
 
-The canonical architecture spec is [`specs/00-high-level.md`](specs/00-high-level.md), and
-the work is planned as independent units under [`specs/phase-1/`](specs/phase-1/) and
-[`specs/phase-2/`](specs/phase-2/).
+## An honest note on speed
+
+The pitch is *preemptive and close-to-native*; the measured reality (see the [Phase-4
+benchmark](docs/phase-4-benchmark.md)) is more nuanced, and we'd rather be honest about it.
+Compiling to Erlang buys preemption for free, and the "runs-anywhere" threaded build carries
+essentially **no** overhead over the tier-O default. On raw throughput, the tier-O `atomics`
+memory backend is a measured **~2.3–2.9×** faster than the pure `paged` one — but 2core is
+**not yet** faster than hand-written Erlang on a memory-heavy kernel (CRC-32 is ~32× slower,
+down from ~76×). The remaining gap is BEAM bignum numerics and the per-operation runtime
+seam call; the biggest lever left — a native-code (tier-N) numerics/memory backend — is
+deliberately deferred. In short: correct, sandboxed, preemptive, and runs-anywhere today;
+faster-than-hand-written-Erlang is future work, and honestly measured, not asserted.
 
 ## Planned frontend roadmap
 
@@ -104,9 +142,12 @@ In intended order (only the first is implemented):
 The WASM frontend is differential-tested against the official
 [WebAssembly spec test suite](https://github.com/WebAssembly/testsuite) (pinned), run
 through the real compile-and-execute pipeline. Of the assertions we attempt, **100% pass
-and 0 fail** (15,747 passing), and in-scope coverage of the MVP suite is now **~97%**; the
+and 0 fail** (15,747 passing), and in-scope coverage of the MVP suite is **~97%**; the
 remaining "out of scope" share is spec coverage for post-MVP proposals the platform doesn't
-target yet (reference types, bulk/multi-memory, SIMD).
+target yet (reference types, bulk/multi-memory, SIMD). Because the optimizer, both security
+modes, and every trust-tier are proven behaviour-preserving, that green holds **identically**
+under the Safe *and* Unsafe profiles and across every shipped `(state × memory-tier)`
+combination.
 
 <p align="center">
   <img src="docs/wasm-conformance.svg" width="640"
@@ -123,10 +164,12 @@ Requires the standard Gleam toolchain — **Gleam 1.17+**, Erlang/OTP 29. For th
 conformance run you also need **wabt** (`wat2wasm`/`wast2json`/`spectest-interp`).
 
 ```sh
-gleam test                      # run all tests (unit + the committed conformance subset)
-gleam format --check src test   # CI requires this
-gleam run -- run mod.wasm fn a b   # compile a .wasm and invoke an export on the BEAM
-gleam run -- ir mod.wasm           # dump the shared IR (.ir text)
+gleam test                          # run all tests (unit + the committed conformance subset)
+gleam format --check src test       # CI requires this
+gleam run -- run mod.wasm fn a b            # compile a .wasm and invoke an export on the BEAM
+gleam run -- run mod.wasm fn a b --unsafe   # …under the aggressive Unsafe profile
+gleam run -- run mod.wasm fn a b --portable # …under the tier-P runs-anywhere build
+gleam run -- ir mod.wasm                    # dump the shared IR (.ir text)
 
 # Full WASM spec-suite conformance (clones the pinned testsuite, needs wabt + network):
 bash test/twocore/conformance/vendor/vendor.sh && gleam test
@@ -141,4 +184,7 @@ against the spec, commit rules).
   (the IR, the layer map, the security model).
 - [`specs/state.md`](specs/state.md) — the live status ledger: every component, what's
   done, and what each leaves for the next.
-- [`specs/phase-1/`](specs/phase-1/) — the Phase-1 work breakdown, one unit per file.
+- Per-phase work breakdowns (one unit per file), each with an `00-overview.md`:
+  [`phase-1/`](specs/phase-1/) (WASM MVP foundations), [`phase-2/`](specs/phase-2/) (full
+  WASM 1.0), [`phase-3/`](specs/phase-3/) (the optimizer + Unsafe mode + real metering),
+  [`phase-4/`](specs/phase-4/) (the trust-tier ladder + the runs-anywhere build).
