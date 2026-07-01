@@ -24,3 +24,5 @@ erl_crash.dump
 !/test/twocore/conformance/fixtures/labels.*.wasm
 !/test/twocore/conformance/fixtures/fac.json
 !/test/twocore/conformance/fixtures/fac.*.wasm
+# macOS Finder metadata
+.DS_Store
