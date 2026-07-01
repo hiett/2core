@@ -1,0 +1,4 @@
+# Acceptance #7b — an out-of-bounds active data segment makes the module fail to
+# instantiate (spec exec/modules.html: the whole [offset,offset+len) range is bounds-checked
+# up front; no partial write). Trap phrase "out of bounds memory access".
+instantiate => trap out of bounds memory access

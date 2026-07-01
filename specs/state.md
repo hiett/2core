@@ -118,7 +118,7 @@ Unsafe profile are all **Phase 3** (deferred, not dropped).
 | **P2-08** validate ext | [`08`](phase-2/08-validate.md) | **done** | `«WASM-AST2»` | Typing for all new ops + memarg alignment + const-expr validation (AST-only security boundary). |
 | **P2-09** lower ext | [`09`](phase-2/09-lower.md) | **done** | `«WASM-AST2»`, `«IR2-FROZEN»` | WASM AST → IR2 for memory/table/global/float/select/conversions + active data/element/global-init. |
 | **P2-10** emit_core ext + instantiate entry | [`10`](phase-2/10-emit-core.md) | **done** | `«IR2-FROZEN»`,`«CELL-STATE-ABI-FROZEN»`,`«RTNUM2-SIG-FROZEN»` (∥ 03–06) | Lower the stateful ops via the seam + trapping converts + the generated `instantiate/N`; extended security-invariant test. |
-| **P2-11** capstone (run-ABI + linker + conformance) | [`11`](phase-2/11-capstone.md) | `unclaimed` | all above | `load→instantiate→invoke` run-ABI + harness isolation; Safe profile (mem/table/state + max-pages cap); Phase-2 `.wast` allowlist + acceptance; refresh the conformance image. |
+| **P2-11** capstone (run-ABI + linker + conformance) | [`11`](phase-2/11-capstone.md) | **done** | all above | `load→instantiate→invoke` run-ABI + harness isolation; Safe profile (mem/table/state + max-pages cap); Phase-2 `.wast` allowlist + acceptance; refresh the conformance image. |
 
 ### High-level spec coverage this phase takes (additions to the §-coverage table)
 

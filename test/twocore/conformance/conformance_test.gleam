@@ -1,4 +1,4 @@
-//// gleeunit entry for the spec-suite runner (Tier-A) — drives the PINNED Phase-1
+//// gleeunit entry for the spec-suite runner (Tier-A) — drives the PINNED Phase-2
 //// allowlist fixtures present in `fixtures/` through the REAL pipeline and reports
 //// honest pass/skip/fail counts (D9: skips are visible, never silent).
 ////
@@ -8,9 +8,10 @@
 //// local run — the runner adapts to whatever `*.json` are present.
 ////
 //// Gate: zero genuine FAILS (a fail is a real spec mismatch in the pipeline); SKIPS are
-//// expected and printed (constructs beyond the Phase-1 slice — floats, memory, …, and
-//// the 5 allowlist files un-convertible at the pin). At least one PASS is required so
-//// the suite is not vacuously green.
+//// expected and printed (constructs beyond the Phase-2 slice — reference types, bulk
+//// memory, multi-memory, non-function imports, multi-value, extended-const, memory64,
+//// text-format asserts, and the allowlist files un-convertible at the pin). At least one
+//// PASS is required so the suite is not vacuously green.
 
 import gleam/int
 import gleam/io
@@ -43,7 +44,7 @@ pub fn spec_suite_allowlist_test() {
     }
     _ -> {
       io.println(
-        "\n=== Phase-1 spec-suite conformance (Tier-A, pinned allowlist) ===",
+        "\n=== Phase-2 spec-suite conformance (Tier-A, pinned allowlist) ===",
       )
       let total =
         list.fold(jsons, runner.empty_report(), fn(acc, name) {

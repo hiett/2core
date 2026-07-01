@@ -1,0 +1,16 @@
+# Acceptance #1 — linear memory round-trip + out-of-bounds traps.
+# Bounds semantics per spec exec/instructions.html (ea = addr+offset, no wrap; trap iff
+# ea+N > byte_len). Trap phrase "out of bounds memory access" (rt_trap.spec_trap_message),
+# cross-checked against memory_trap.wast. Values are raw unsigned bit patterns (D5).
+
+# i32.store then i32.load round-trips.
+invoke roundtrip i32:0 i32:42 => return i32:42
+# Little-endian: store 0x04030201, load8_u of the base byte reads the LOW byte 0x01.
+invoke roundtrip i32:4 i32:67305985 => return i32:67305985
+invoke load8 i32:4 => return i32:1
+# A 4-byte load at 65533 spans byte 65536 (== byte_len) → out of bounds.
+invoke load i32:65533 => trap out of bounds memory access
+# A 4-byte store at 65533 traps BEFORE any byte is written (all-or-nothing)...
+invoke store i32:65533 i32:2864434397 => trap out of bounds memory access
+# ...proven by load8 of an in-bounds byte the store would have touched still reading 0.
+invoke load8 i32:65533 => return i32:0

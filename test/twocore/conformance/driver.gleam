@@ -32,7 +32,7 @@ import twocore/frontend/wasm/decode
 import twocore/frontend/wasm/lower
 import twocore/frontend/wasm/validate
 import twocore/ir
-import twocore/runtime/instance as rt_instance
+import twocore/runtime/profiles
 
 /// The real pipeline driver: the full Phase-1 vertical slice behind the runner seam.
 pub fn pipeline() -> Driver {
@@ -77,10 +77,22 @@ pub fn check_frontend(bytes: BitArray) -> Result(Nil, String) {
 
 // ─────────────────────────────── instantiate ───────────────────────────────
 
-/// Compile `.wasm` bytes all the way to a loaded BEAM module (D10). Each module gets a
-/// UNIQUE name so loading many modules from one fixture cannot clobber one another.
-/// Returns `Error(reason)` — never a panic — for any stage that rejects (including an
-/// `Unsupported` construct outside the Phase-1 slice, which becomes a graceful skip).
+/// Compile `.wasm` bytes to a loaded BEAM module (D10), then **instantiate** it in its
+/// own OWNED PROCESS (E5: `load → instantiate → invoke`, one-instance-one-process). Each
+/// module gets a UNIQUE name so loading many modules from one fixture cannot clobber one
+/// another.
+///
+/// `ffi.start_instance` spawns a process and runs the generated `instantiate/0` IN it,
+/// seeding that process's per-instance cell (fresh memory/table/globals + active
+/// element/data segments + `start`) before any export is invoked. The returned
+/// `Instance` carries the OWNING PID; every later `invoke` is routed into it so it reads
+/// that instance's state, and a (re)instantiation spawns a fresh process → a fresh zeroed
+/// cell (isolation + reset are automatic).
+///
+/// Returns `Error(reason)` — never a panic — for any stage that rejects: a compile-stage
+/// rejection (`decode:`/`validate:`/`lower:`/`emit:`/`build:`, an out-of-scope construct →
+/// a graceful skip) or, prefixed `instantiate: `, an INSTANTIATION-TIME TRAP (OOB active
+/// segment / trapping `start`). The runner uses the prefix to tell the two apart.
 pub fn instantiate(bytes: BitArray) -> Result(Instance, String) {
   use m <- result.try(
     decode.decode(bytes)
@@ -96,7 +108,7 @@ pub fn instantiate(bytes: BitArray) -> Result(Instance, String) {
   )
   let irmod = ir.Module(..irmod0, name: uniquify(irmod0.name))
   use cmod <- result.try(
-    emit_core.emit_module(irmod, rt_instance.safe_default())
+    emit_core.emit_module(irmod, profiles.safe())
     |> result.map_error(fn(e) { "emit: " <> string.inspect(e) }),
   )
   let core_text = core_printer.print_module(cmod)
@@ -104,15 +116,12 @@ pub fn instantiate(bytes: BitArray) -> Result(Instance, String) {
     build_beam.compile_and_load(bit_array.from_string(core_text))
     |> result.map_error(fn(e) { "build: " <> string.inspect(e) }),
   )
-  // Phase-2 run-ABI (E5): `load → instantiate → invoke`. Call the generated `instantiate/0`
-  // (emitted by unit 10) in THIS process so the per-instance cell — fresh memory, table, and
-  // globals + active element/data segments + start — is seeded before any export is invoked
-  // (one-instance-one-process: `catch_apply` runs inline). An instantiation-time trap (OOB
-  // active segment / trapping start) surfaces as `Error`, turning the module's dependent
-  // assertions into skips. NOTE: this is the MINIMAL seam to keep the cell seeded; unit 11
-  // owns the full run-ABI (per-instance process spawning, Safe-profile cap).
-  case ffi.catch_apply(mod_atom, atom.create("instantiate"), []) {
-    Ok(_) -> Ok(runner.Instance(module: mod_atom, exports: export_types(irmod)))
+  // Spawn the instance's owned process and run `instantiate/0` in it (E5). An
+  // instantiation-time trap surfaces here as `Error("instantiate: " <> reason)`, turning
+  // the module's dependent assertions into skips — except `assert_uninstantiable`, which
+  // the runner asserts MUST land here with the expected trap phrase.
+  case ffi.start_instance(mod_atom) {
+    Ok(proc) -> Ok(runner.Instance(proc: proc, exports: export_types(irmod)))
     Error(trap) -> Error("instantiate: " <> trap)
   }
 }
@@ -159,14 +168,16 @@ pub fn invoke(
     Error(_) -> runner.DriverError("no such export: " <> field)
     Ok(results) -> {
       let arg_ints = list.map(args, spec_to_raw)
+      // Route the invoke INTO the instance's owned process so it reads that instance's
+      // cell (one-instance-one-process). Cross-invoke state persists across these calls.
       case results {
         [] ->
-          case ffi.catch_apply(inst.module, atom.create(field), arg_ints) {
+          case ffi.call_instance(inst.proc, atom.create(field), arg_ints) {
             Ok(_) -> runner.Returned([])
             Error(t) -> runner.Trapped(t)
           }
         [ty] ->
-          case ffi.catch_apply(inst.module, atom.create(field), arg_ints) {
+          case ffi.call_instance(inst.proc, atom.create(field), arg_ints) {
             Ok(raw) -> runner.Returned([tag(ty, raw)])
             Error(t) -> runner.Trapped(t)
           }

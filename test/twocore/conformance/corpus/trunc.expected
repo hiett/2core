@@ -1,0 +1,8 @@
+# Acceptance #5 — trapping i32.trunc_f32_s (spec exec/numerics.html, conversions.wast).
+# NaN → "invalid conversion to integer"; ±Inf and out-of-range finite → "integer overflow"
+# (both traps distinct); in-range → truncate toward zero. f32 args are raw IEEE-754 bits.
+invoke trunc_s f32:1080033280 => return i32:3            # 3.5 → 3
+invoke trunc_s f32:3217031168 => return i32:4294967295   # -1.5 → -1 (raw unsigned bits)
+invoke trunc_s f32:2143289344 => trap invalid conversion to integer   # NaN
+invoke trunc_s f32:2139095040 => trap integer overflow                # +Inf (spec: overflow)
+invoke trunc_s f32:1325400064 => trap integer overflow                # 2^31 out of range

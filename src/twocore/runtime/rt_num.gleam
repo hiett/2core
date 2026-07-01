@@ -41,7 +41,6 @@
 ////   Gleam's `/` and `%` are TOTAL (`x / 0 == 0`), so these functions check the
 ////   divisor explicitly BEFORE dividing.
 
-import gleam/float
 import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/order
@@ -1219,10 +1218,15 @@ fn round_to_integral(fmt: FloatFmt, bits: Int, mode: RoundMode) -> Int {
 
 /// IEEE square root on raw `fmt` bits. NaN → canonical NaN; `-Inf` and any negative finite
 /// → canonical NaN; `+Inf` → `+Inf`; `±0` → that same signed zero; a positive finite is
-/// decoded to a native double, rooted, and re-rounded to `fmt`. `float.square_root` is
-/// reached ONLY on a positive-finite `d`, where it never returns `Error`, so the
-/// `let assert Ok` is genuinely unreachable-on-`Error`. The f32 path through the f64 root
-/// is correctly single-rounded (f64's 53 significand bits ≥ 2·24+2). Returns raw bits.
+/// decoded to a native double, rooted, and re-rounded to `fmt`.
+///
+/// Uses Erlang `math:sqrt/1` (the hardware/libm CORRECTLY-ROUNDED double sqrt), NOT
+/// `gleam/float.square_root` (which is `math:pow(_, 0.5)` — `pow` goes through `exp`/`log`
+/// and is NOT correctly rounded, so it returns a 1-ULP-off f64 result on several spec
+/// `sqrt` vectors). The WASM spec requires `fsqrt` to be correctly rounded
+/// (exec/numerics.html). `math:sqrt` is reached ONLY on a positive-finite `d`, so it never
+/// raises. The f32 path through the f64 root is correctly single-rounded (f64's 53
+/// significand bits ≥ 2·24+2). Returns raw bits.
 fn fsqrt(fmt: FloatFmt, bits: Int) -> Int {
   case classify(fmt, bits) {
     CNan -> canonical_nan(fmt)
@@ -1234,7 +1238,7 @@ fn fsqrt(fmt: FloatFmt, bits: Int) -> Int {
     // Positive finite (sign bit 0): the only remaining case.
     CFinite(_) -> {
       let d = decode_float(fmt, bits)
-      let assert Ok(s) = float.square_root(d)
+      let s = math_sqrt(d)
       case fmt.total {
         32 -> f32_round_to_bits(s)
         _ -> f64_to_bits(s)
@@ -1242,6 +1246,12 @@ fn fsqrt(fmt: FloatFmt, bits: Int) -> Int {
     }
   }
 }
+
+/// Erlang `math:sqrt/1` — the correctly-rounded IEEE-754 double square root. Used by `fsqrt`
+/// instead of `float.square_root` (= `math:pow(_, 0.5)`, not correctly rounded). Only ever
+/// called on a positive-finite operand, so it never raises `badarith`.
+@external(erlang, "math", "sqrt")
+fn math_sqrt(x: Float) -> Float
 
 /// Total order of two non-NaN floats. `Ok(order)` is the IEEE ordering of `a` and `b`
 /// (with `+0`/`-0` comparing `Eq` and `+Inf > finite > -Inf`); `Error(Nil)` iff EITHER

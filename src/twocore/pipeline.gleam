@@ -32,6 +32,7 @@
 
 import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
+import gleam/erlang/process.{type Pid}
 import gleam/string
 import twocore/backend/build_beam
 import twocore/backend/core_printer
@@ -96,18 +97,22 @@ pub type RunResult {
   Trapped(reason: String)
 }
 
-/// Load `beam` into the build VM (D10) and apply `export`/`length(args)`, catching any trap.
+/// Load `beam` into the build VM (D10) and apply `export`/`length(args)` IN THE CALLING
+/// PROCESS, catching any trap. This is the same-process one-shot: the apply runs in the
+/// caller's process, so a process-dictionary effect (e.g. `rt_meter` fuel) is observable by
+/// the caller afterwards. It does NOT call `instantiate/0`, so it is only correct for PURE
+/// modules (no memory/globals/tables); stateful modules must go through the
+/// `instantiate → invoke_instance` process ABI below (E5). Retained for the fuel-measuring
+/// `ir_lower` tests, which require same-process execution.
 ///
 /// - `beam`: the compiled `.beam` binary (from `core_to_beam`).
 /// - `mod`: the module's atom NAME (the name baked into the `.core`, i.e. `ir.Module.name`).
-///   It must match, or loading fails.
 /// - `export`: the exported function name to apply.
 /// - `args`: the call arguments as raw unsigned bit-pattern integers (see the ABI above).
 ///
 /// Returns `Returned([value])` on a normal single-result return, or `Trapped(reason)` if the
 /// call raises (a trap or a deny-all capability denial), or if loading the binary fails
-/// (`Trapped("load failed: …")`). Total — never panics; the catch lives in the
-/// `twocore_cli_ffi` shim.
+/// (`Trapped("load failed: …")`). Total — never panics.
 pub fn invoke(
   beam: BitArray,
   mod: String,
@@ -124,14 +129,92 @@ pub fn invoke(
   }
 }
 
-/// Apply `module:function(args)` capturing a trap as `Error(text)` (the catching-apply
-/// seam). See `src/twocore_cli_ffi.erl`.
+/// A live instance: the OWNING PROCESS that ran `instantiate/0` and holds this instance's
+/// per-instance cell (memory/globals/table) in its process dictionary
+/// (one-instance-one-process, E1). Every `invoke_instance` is routed into it, so each invoke
+/// reads this instance's state, and cross-invoke state persists.
+pub opaque type InstanceProc {
+  InstanceProc(proc: Pid)
+}
+
+/// **Instantiate** a loaded module in its own OWNED PROCESS (the run-ABI's middle step,
+/// E5: `load → instantiate → invoke`). Loads `beam` ONCE into the build VM, then spawns a
+/// process and runs the generated `instantiate/0` IN it — seeding that process's fresh
+/// per-instance cell (memory/table/globals + active element/data segments + `start`).
+///
+/// - `beam`: the compiled `.beam` binary (from `core_to_beam`).
+/// - `mod`: the module's atom NAME (must match the name baked into the `.core`).
+/// - Returns `Ok(InstanceProc)` once the cell is seeded and the process is ready for
+///   `invoke_instance`; `Error("load failed: …")` if the binary will not load; or
+///   `Error(reason)` for an INSTANTIATION-TIME TRAP (an OOB active segment / trapping
+///   `start`) — surfaced identically to a runtime trap. Total — never panics.
+pub fn instantiate(
+  beam: BitArray,
+  mod: String,
+) -> Result(InstanceProc, String) {
+  case build_beam.load_module(atom.create(mod), "twocore_cli", beam) {
+    Error(reason) -> Error("load failed: " <> reason)
+    Ok(mod_atom) ->
+      case ffi_start_instance(mod_atom) {
+        Ok(proc) -> Ok(InstanceProc(proc))
+        Error(reason) -> Error(reason)
+      }
+  }
+}
+
+/// **Invoke** an export on a live instance (the run-ABI's last step). Routes the call INTO
+/// the instance's owned process via `call_instance`, so it reads that instance's cell.
+///
+/// - `proc`: a live `InstanceProc` (from `instantiate`).
+/// - `export`: the exported function name to apply.
+/// - `args`: raw unsigned bit-pattern integer arguments (the D5 ABI).
+/// - Returns `Returned([value])` on a normal single-result return or `Trapped(reason)` on a
+///   trap / capability denial. Total — never panics.
+pub fn invoke_instance(
+  proc: InstanceProc,
+  export: String,
+  args: List(Int),
+) -> RunResult {
+  let InstanceProc(pid) = proc
+  case ffi_call_instance(pid, atom.create(export), args) {
+    Ok(value) -> Returned([value])
+    Error(reason) -> Trapped(reason)
+  }
+}
+
+/// Stop a live instance's owned process (its pdict cell is GC'd with it). Call when an
+/// instance is no longer needed; total.
+pub fn stop_instance(proc: InstanceProc) -> Nil {
+  let InstanceProc(pid) = proc
+  ffi_stop_instance(pid)
+}
+
+/// Apply `module:function(args)` IN THE CALLING PROCESS, capturing a trap as `Error(text)`
+/// (the same-process catching-apply seam). See `src/twocore_cli_ffi.erl`.
 @external(erlang, "twocore_cli_ffi", "catch_apply")
 fn ffi_catch_apply(
   module: Atom,
   function: Atom,
   args: List(Int),
 ) -> Result(Int, String)
+
+/// Spawn an instance's owned process and run `module:instantiate()` in it (the
+/// one-instance-one-process seam). `Ok(pid)` once seeded; `Error(reason)` on an
+/// instantiation-time trap. See `src/twocore_cli_ffi.erl`.
+@external(erlang, "twocore_cli_ffi", "start_instance")
+fn ffi_start_instance(module: Atom) -> Result(Pid, String)
+
+/// Apply `function(args)` inside an instance's owned process. `Ok(v)` / `Error(reason)`.
+@external(erlang, "twocore_cli_ffi", "call_instance")
+fn ffi_call_instance(
+  proc: Pid,
+  function: Atom,
+  args: List(Int),
+) -> Result(Int, String)
+
+/// Ask an instance's owned process to exit (cell GC'd with it).
+@external(erlang, "twocore_cli_ffi", "stop_instance")
+fn ffi_stop_instance(proc: Pid) -> Nil
 
 // ─────────────────────────────── composable stage drivers ───────────────────────────────
 
@@ -220,18 +303,22 @@ pub fn parse_ir(text: String) -> Result(ir.Module, ir_parser.ParseError) {
   ir_parser.parse_module(text)
 }
 
-/// End-to-end: `.wasm` bytes → result on the BEAM, with the Safe policy pass in the chain.
+/// End-to-end: `.wasm` bytes → result on the BEAM, through the Phase-2 run-ABI
+/// `load → instantiate → invoke` with one-instance-one-process isolation (E5).
 ///
-/// Composes `source_to_ir` → `ir_to_core(binding)` → `core_to_beam` → `invoke`. This is the
-/// CLI `run` subcommand's engine and the shape `11d`'s acceptance proves green.
+/// Composes `source_to_ir` → `ir_to_core(binding)` → `core_to_beam` → `instantiate` (spawn
+/// the instance's owned process + run `instantiate/0`) → `invoke_instance` → `stop_instance`.
+/// This is the CLI `run` subcommand's engine and the shape the acceptance corpus proves
+/// green. The raw-bit-pattern argument/result ABI (D5) is unchanged.
 ///
 /// - `wasm`: the `.wasm` bytes.
 /// - `binding`: the build-time runtime binding (use `profiles.safe()`).
 /// - `export`: the exported function name to invoke.
 /// - `args`: raw unsigned bit-pattern integer arguments.
-/// - Return: `Ok(RunResult)` (`Returned`/`Trapped`) once compilation succeeds, or the first
-///   compile-stage `Error(PipelineError)`. A runtime trap is `Ok(Trapped(_))`, not an
-///   `Error`. Total — never panics.
+/// - Return: `Ok(Returned(_))` on a normal return; `Ok(Trapped(reason))` for an
+///   INSTANTIATION-TIME trap (OOB active segment / trapping `start`) OR a runtime trap —
+///   both are runtime outcomes, surfaced identically; or the first compile-stage
+///   `Error(PipelineError)`. Total — never panics.
 pub fn run_source(
   wasm: BitArray,
   binding: Binding,
@@ -246,7 +333,16 @@ pub fn run_source(
         Ok(core) ->
           case core_to_beam(core, m.name) {
             Error(e) -> Error(e)
-            Ok(beam) -> Ok(invoke(beam, m.name, export, args))
+            Ok(beam) ->
+              case instantiate(beam, m.name) {
+                // An instantiation-time trap is a runtime outcome, not a compile error.
+                Error(reason) -> Ok(Trapped(reason))
+                Ok(proc) -> {
+                  let result = invoke_instance(proc, export, args)
+                  stop_instance(proc)
+                  Ok(result)
+                }
+              }
           }
       }
   }

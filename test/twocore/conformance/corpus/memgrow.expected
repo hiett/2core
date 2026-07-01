@@ -1,0 +1,8 @@
+# Acceptance #4 — memory.grow / memory.size + the declared-max cap (spec memory_size.wast).
+# grow returns the OLD size; a grow past the declared max (1 page) returns -1 (raw
+# 0xFFFFFFFF = 4294967295) and allocates nothing (size unchanged). State persists (E1).
+invoke size => return i32:0
+invoke grow i32:1 => return i32:0
+invoke size => return i32:1
+invoke grow i32:1 => return i32:4294967295
+invoke size => return i32:1

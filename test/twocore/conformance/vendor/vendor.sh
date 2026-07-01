@@ -46,20 +46,30 @@ if [ "$got" != "$TESTSUITE_SHA" ]; then
 fi
 
 # --- convert each allowlisted file + sanity-check it ----------------------------
+# ALLOWLIST format (Phase-2): `<name>` optionally followed by a whitespace-separated
+# trailing FLAG COLUMN (e.g. `align<TAB>--enable-memory64`) passed verbatim to
+# `wast2json`. Inline `# …` comments and blank lines are ignored. We read line by line
+# (not word by word) so the flag column and inline comments are handled correctly.
 mkdir -p "$fixtures_dir"
-allow="$(grep -vE '^\s*#|^\s*$' "$here/ALLOWLIST")"
 fail=0
 skipped=""
 converted=""
-for name in $allow; do
+while IFS= read -r raw || [ -n "$raw" ]; do
+  line="${raw%%#*}"                          # strip inline / whole-line comment
+  line="${line#"${line%%[![:space:]]*}"}"    # ltrim
+  line="${line%"${line##*[![:space:]]}"}"    # rtrim
+  [ -z "$line" ] && continue
+  read -r name flags <<< "$line"             # first word = name; remainder = wast2json flags
   src="$clone_dir/$name.wast"
   if [ ! -f "$src" ]; then echo "vendor: MISSING $name.wast at pin" >&2; fail=1; continue; fi
   out="$fixtures_dir/$name.json"
   # `wast2json` itself may reject a file whose `.wast` (at this pin) uses post-MVP
   # proposal syntax the pinned wabt cannot parse (e.g. reference types in local_tee).
   # That is an honest FILE-LEVEL coverage gap (D9): record it and move on — do NOT
-  # abort the whole vendor run, and do NOT pretend the file was covered.
-  if ! ( cd "$fixtures_dir" && wast2json "$src" -o "$out" ) >"$out.convert.log" 2>&1; then
+  # abort the whole vendor run, and do NOT pretend the file was covered. Per-file
+  # feature flags (the trailing column, e.g. align's --enable-memory64) are passed
+  # through unquoted so each token becomes a separate wast2json argument.
+  if ! ( cd "$fixtures_dir" && wast2json $flags "$src" -o "$out" ) >"$out.convert.log" 2>&1; then
     echo "vendor: SKIP $name  (wast2json could not convert at pin — see $name.json.convert.log)" >&2
     skipped="$skipped $name"
     rm -f "$out"
@@ -76,7 +86,7 @@ for name in $allow; do
   else
     echo "vendor: FAIL $name  spectest-interp: $res" >&2; fail=1
   fi
-done
+done < "$here/ALLOWLIST"
 
 echo "vendor: converted +validated:$converted"
 [ -n "$skipped" ] && echo "vendor: skipped (un-convertible at pin):$skipped"

@@ -1,0 +1,5 @@
+# Acceptance #3 — a mutable global round-trips through global.set / global.get.
+# State PERSISTS across these invokes because the instance owns one process (E1).
+invoke get => return i32:7
+invoke set i32:100 => return
+invoke get => return i32:100

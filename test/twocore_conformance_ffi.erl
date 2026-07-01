@@ -9,7 +9,103 @@
 -module(twocore_conformance_ffi).
 -export([catch_apply/3, read_file/1, parse_json/1, list_dir/1, run/2,
          find_executable/1, unique_int/0,
+         start_instance/1, call_instance/3, stop_instance/1, gc_and_memory/1,
          spy_reset/0, spy_mark/0, spy_called/0]).
+
+%% Force a garbage collection on process Pid, then report its total memory in bytes
+%% (heap + stack + message queue + pdict). Used by the constant-space store-loop test to
+%% assert the `cell` state strategy does not accumulate per-iteration memory — after GC,
+%% a constant-space loop's live memory is bounded by the (constant) page-map, not the
+%% iteration count. Returns 0 for a dead process.
+gc_and_memory(Pid) ->
+    erlang:garbage_collect(Pid),
+    case erlang:process_info(Pid, memory) of
+        {memory, M} -> M;
+        undefined -> 0
+    end.
+
+%% ── one-instance-one-process run-ABI (unit 11, E1/E5) ───────────────────────
+%%
+%% The instance's mutable state (memory page-map, mutable globals, table) lives in
+%% the process dictionary of ONE owned process (the `cell` strategy). So an
+%% instance's `instantiate/0` AND every one of its invokes must run in that SAME
+%% process, or an export reads the caller's empty pdict and returns garbage. These
+%% three functions give the Gleam driver/pipeline that owned process:
+%%
+%%   start_instance(Module) -> {ok, Pid} | {error, Reason}
+%%       spawn a process; run Module:instantiate() IN it (seeds ITS pdict cell).
+%%       An instantiation-time trap (OOB active segment / trapping start) replies
+%%       {error, RenderedReason} and the process exits. On success the process
+%%       enters a receive loop holding the cell for the instance's lifetime.
+%%   call_instance(Pid, Fun, Args) -> {ok, V} | {error, Reason}
+%%       message round-trip: the instance process runs apply(Module, Fun, Args) in
+%%       ITS OWN process (reads ITS cell) and replies. A trap is {error, Reason}.
+%%   stop_instance(Pid) -> nil
+%%       ask the process to exit; its pdict cell is auto-GC'd with it.
+%%
+%% (Re)instantiating a module starts a FRESH process → a FRESH zeroed cell, so
+%% per-instance isolation + reset-on-(re)instantiation are automatic, and
+%% cross-invoke state PERSISTS because successive invokes hit the same process.
+
+%% Spawn the instance process and run instantiate/0 in it, blocking until the
+%% process reports whether instantiation succeeded or trapped.
+start_instance(Module) ->
+    Parent = self(),
+    Pid = spawn(fun() ->
+        Outcome =
+            try Module:instantiate() of
+                _ -> ok
+            catch
+                _Class:Reason -> {error, render_reason(Reason)}
+            end,
+        case Outcome of
+            ok ->
+                Parent ! {started, self(), ok},
+                instance_loop(Module);
+            {error, _} = Err ->
+                Parent ! {started, self(), Err}
+        end
+    end),
+    receive
+        {started, Pid, ok} -> {ok, Pid};
+        {started, Pid, {error, Why}} -> {error, Why}
+    end.
+
+%% Run apply(Module, Fun, Args) inside the instance's own process and return its
+%% outcome to the caller; a trap surfaces as {error, RenderedReason}.
+call_instance(Pid, Fun, Args) ->
+    Ref = make_ref(),
+    Pid ! {invoke, Fun, Args, self(), Ref},
+    receive
+        {result, Ref, Result} -> Result
+    end.
+
+%% Ask the instance process to exit (its pdict cell is GC'd with it).
+stop_instance(Pid) ->
+    Pid ! stop,
+    nil.
+
+%% The instance process's receive loop: it owns the seeded cell and runs every
+%% invoke in-process so each one reads ITS state.
+instance_loop(Module) ->
+    receive
+        {invoke, Fun, Args, From, Ref} ->
+            Result =
+                try erlang:apply(Module, Fun, Args) of
+                    V -> {ok, V}
+                catch
+                    _Class:Reason -> {error, render_reason(Reason)}
+                end,
+            From ! {result, Ref, Result},
+            instance_loop(Module);
+        stop ->
+            ok
+    end.
+
+%% Render a caught trap/exit reason as a UTF-8 binary so the Gleam caller can
+%% substring-match the spec trap phrase (e.g. `{wasm_trap, memory_out_of_bounds}`).
+render_reason(Reason) ->
+    unicode:characters_to_binary(io_lib:format("~0p", [Reason])).
 
 %% A one-bit per-process spy used by the routing self-test to PROVE the partition:
 %% `assert_invalid`/`assert_malformed` must reach only `check_frontend`, never

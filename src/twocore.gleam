@@ -236,7 +236,7 @@ fn read_text(path: String) -> Result(String, String) {
 fn usage() -> String {
   string.join(
     [
-      "2core — WASM → Core Erlang compiler (Phase 1). Usage:",
+      "2core — WASM → Core Erlang compiler (Phase 2). Usage:",
       "  gleam run -- decode   <in.wasm>                 dump the WASM AST",
       "  gleam run -- validate <in.wasm>                 full-validate; print 'valid'",
       "  gleam run -- lower    <in.wasm>                 source → .ir (alias: to-ir, ir)",

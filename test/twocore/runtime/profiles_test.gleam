@@ -53,3 +53,28 @@ pub fn linker_cannot_produce_unsafe_test() {
   assert profiles.is_safe(profiles.instantiate(profiles.safe()))
   assert profiles.is_safe(profiles.safe_instance())
 }
+
+/// The Safe max-pages cap is FINITE and never exceeds the 65536-page (4 GiB) i32 hard cap
+/// (E3): untrusted code cannot allocate unboundedly. `profiles.safe()` bakes exactly this
+/// value into its `Binding`, so the module's declared max governs for the spec suite.
+pub fn safe_max_pages_is_finite_test() {
+  assert profiles.safe_max_pages() > 0
+  assert profiles.safe_max_pages() <= 65_536
+  assert profiles.safe().safe_max_pages == profiles.safe_max_pages()
+}
+
+/// `safe_capped` can only LOWER the cap (fail-closed): a request ABOVE the hard cap is
+/// clamped DOWN to `safe_max_pages()` — there is no way to lift the cap above the hard
+/// limit. A negative request clamps to 0 (no growth). The posture stays Safe.
+pub fn safe_capped_cannot_lift_cap_test() {
+  // A low request is honoured verbatim (the resource-bound use).
+  assert profiles.safe_capped(1).safe_max_pages == 1
+  // An over-cap request is clamped to the hard cap — never lifted above it.
+  assert profiles.safe_capped(1_000_000).safe_max_pages
+    == profiles.safe_max_pages()
+  // A negative request clamps to 0.
+  assert profiles.safe_capped(-5).safe_max_pages == 0
+  // Every capped Binding remains Safe (fail-closed) and otherwise identical to `safe()`.
+  assert profiles.safe_capped(1).mode == Safe
+  assert profiles.safe_capped(1).num_module == profiles.safe().num_module
+}

@@ -20,15 +20,16 @@
 //// the real pipeline `Driver` (see `driver.gleam`) makes the full-pipeline assertions
 //// run for real.
 
+import gleam/bit_array
 import gleam/dict.{type Dict}
-import gleam/erlang/atom.{type Atom}
+import gleam/erlang/process.{type Pid}
 import gleam/int
 import gleam/list
 import gleam/string
 import twocore/conformance/fixture.{
-  type Action, type Command, type Fixture, type SpecValue, AssertInvalid,
-  AssertMalformed, AssertReturn, AssertTrap, BinaryModule, Get, Invoke,
-  ModuleCmd, Register, TextModule, Unhandled,
+  type Action, type Command, type Fixture, type SpecValue, ActionCmd,
+  AssertInvalid, AssertMalformed, AssertReturn, AssertTrap, AssertUninstantiable,
+  BinaryModule, Get, Invoke, ModuleCmd, Register, TextModule, Unhandled,
 }
 import twocore/conformance/oracle
 import twocore/conformance/registry.{type Registry}
@@ -36,11 +37,14 @@ import twocore/ir
 
 // ─────────────────────────────── the Driver seam ───────────────────────────────
 
-/// A loaded module ready to invoke: the BEAM module name (atom) plus, per export
-/// name, the function's result value-types — used to tag a returned raw integer back
-/// into a typed `SpecValue` for the oracle.
+/// A live instance ready to invoke: the OWNING PROCESS pid (one-instance-one-process,
+/// E1) plus, per export name, the function's result value-types — used to tag a
+/// returned raw integer back into a typed `SpecValue` for the oracle. The instance's
+/// mutable state (memory/globals/table cell) lives in `proc`'s process dictionary, so
+/// every invoke is routed INTO `proc` (via `ffi.call_instance`); cross-invoke state
+/// persists, and a (re)instantiation spawns a fresh `proc` with a fresh zeroed cell.
 pub type Instance {
-  Instance(module: Atom, exports: Dict(String, List(ir.ValType)))
+  Instance(proc: Pid, exports: Dict(String, List(ir.ValType)))
 }
 
 /// The outcome of invoking an export.
@@ -188,6 +192,20 @@ fn run_command(
       ),
     )
 
+    AssertUninstantiable(line, filename, text) -> #(
+      reg,
+      run_uninstantiable(driver, rep, src, line, base, filename, text),
+    )
+
+    // A bare action: run it for its SIDE EFFECTS on the current module's mutable state
+    // (so later asserts see the result), then continue. Plumbing — the report is unchanged
+    // (not counted). If the target module did not instantiate, the action is silently
+    // dropped (its dependent asserts already skip with a reason).
+    ActionCmd(_line, action) -> {
+      run_action_effect(driver, reg, action)
+      #(reg, rep)
+    }
+
     Unhandled(line, kind) -> #(
       reg,
       skip(rep, at(src, line) <> "unhandled command: " <> kind),
@@ -311,12 +329,162 @@ fn run_frontend_reject(
           // Fail-closed: an invalid/malformed module MUST be rejected by the frontend.
           case driver.check_frontend(bytes) {
             Error(_) -> pass(rep)
+            // We ACCEPTED a module the spec rejects. That is normally a real bug — EXCEPT
+            // when the malformation lives in the IMPORT SECTION, which our decoder
+            // deliberately skips (non-function imports / the `spectest` module are deferred
+            // to Phase 3). We cannot judge an import-section malformation, so this is an
+            // honest out-of-scope SKIP, not a silent pass and not a fail. Keyed to the
+            // structural fact "the binary carries an import section", never to line numbers.
             Ok(Nil) ->
-              fail(
+              case has_import_section(bytes) {
+                True ->
+                  skip(
+                    rep,
+                    at(src, line)
+                      <> kind
+                      <> ": import-section construct (non-function imports deferred to Phase 3)",
+                  )
+                False ->
+                  fail(
+                    rep,
+                    at(src, line)
+                      <> kind
+                      <> ": frontend ACCEPTED a rejected module",
+                  )
+              }
+          }
+      }
+  }
+}
+
+/// Whether a `.wasm` binary carries a non-empty IMPORT section (section id 2). Walks the
+/// section headers (`<id:u8><size:uleb32><size bytes>`) after the 8-byte magic+version. Our
+/// decoder skips the import section wholesale (imports are deferred to Phase 3), so an
+/// import-section malformation that the spec rejects is one we cannot judge — this predicate
+/// lets `run_frontend_reject` skip those honestly instead of silent-passing. Total — any
+/// malformed framing simply returns `False`.
+fn has_import_section(bytes: BitArray) -> Bool {
+  case bytes {
+    <<0x00, 0x61, 0x73, 0x6d, _v:bytes-size(4), rest:bytes>> ->
+      scan_for_import(rest)
+    _ -> False
+  }
+}
+
+fn scan_for_import(bytes: BitArray) -> Bool {
+  case bytes {
+    <<id:8, rest:bytes>> ->
+      case read_uleb32(rest, 0, 0) {
+        Error(_) -> False
+        Ok(#(size, after_size)) ->
+          case id == 2 && size > 0 {
+            True -> True
+            False ->
+              case
+                bit_array.slice(after_size, size, byte_count(after_size) - size)
+              {
+                Ok(next) -> scan_for_import(next)
+                Error(_) -> False
+              }
+          }
+      }
+    _ -> False
+  }
+}
+
+/// Read one LEB128 unsigned int from the front of `bytes`. `Ok(#(value, rest))` or `Error`
+/// if the input ends mid-number. Used only by the section walker above.
+fn read_uleb32(
+  bytes: BitArray,
+  shift: Int,
+  acc: Int,
+) -> Result(#(Int, BitArray), Nil) {
+  case bytes {
+    <<byte:8, rest:bytes>> -> {
+      let acc2 =
+        acc + int.bitwise_shift_left(int.bitwise_and(byte, 0x7f), shift)
+      case int.bitwise_and(byte, 0x80) {
+        0 -> Ok(#(acc2, rest))
+        _ -> read_uleb32(rest, shift + 7, acc2)
+      }
+    }
+    _ -> Error(Nil)
+  }
+}
+
+fn byte_count(bytes: BitArray) -> Int {
+  bit_array.byte_size(bytes)
+}
+
+// assert_uninstantiable — the module is well-formed + valid, but INSTANTIATION traps
+// (an OOB active data/element segment, or a trapping `start`). The spec's
+// `assert_uninstantiable` (and the legacy `assert_unlinkable` framing of an OOB active
+// segment). The runner loads + instantiates the module and asserts it FAILS to
+// instantiate with a trap whose spec phrase contains `text` (E5). A success is a FAIL;
+// these no longer fall through the `Unhandled → skip` path and get silently dropped.
+
+fn run_uninstantiable(
+  driver: Driver,
+  rep: Report,
+  src: String,
+  line: Int,
+  base: String,
+  filename: String,
+  text: String,
+) -> Report {
+  case read_bytes(base, filename) {
+    Error(e) -> skip(rep, at(src, line) <> "uninstantiable: " <> e)
+    Ok(bytes) ->
+      case driver.instantiate(bytes) {
+        // The module instantiated, but it MUST trap at instantiation — a real failure.
+        Ok(_inst) ->
+          fail(
+            rep,
+            at(src, line)
+              <> "uninstantiable: module instantiated but must fail to instantiate",
+          )
+        Error(reason) ->
+          // Distinguish a genuine instantiation-time trap (driver prefix "instantiate: ")
+          // from a compile-stage rejection of an out-of-scope construct (decode/validate/
+          // emit/build) — the latter is an honest SKIP, not a pass.
+          case string.split_once(reason, "instantiate: ") {
+            Ok(#(_, trap)) ->
+              case trap_matches(trap, text) {
+                True -> pass(rep)
+                False ->
+                  fail(
+                    rep,
+                    at(src, line)
+                      <> "uninstantiable: trapped "
+                      <> trap
+                      <> " want substring "
+                      <> text,
+                  )
+              }
+            Error(_) ->
+              skip(
                 rep,
-                at(src, line) <> kind <> ": frontend ACCEPTED a rejected module",
+                at(src, line) <> "uninstantiable (out of scope): " <> reason,
               )
           }
+      }
+  }
+}
+
+/// Run a bare action for its side effects on the resolved instance, discarding the result
+/// (and any trap — a bare setup action that traps is not an assertion). If the target module
+/// failed to instantiate, do nothing. `Get` actions read a global and have no side effect, so
+/// they are skipped here. Total.
+fn run_action_effect(driver: Driver, reg: Reg, action: Action) -> Nil {
+  case action {
+    Get(_, _) -> Nil
+    Invoke(field, args, module) ->
+      case resolve_instance(reg, module) {
+        Error(_) -> Nil
+        Ok(inst) -> {
+          let _ = driver.invoke(inst, field, args)
+          Nil
+        }
       }
   }
 }

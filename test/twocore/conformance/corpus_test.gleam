@@ -26,13 +26,17 @@ import gleam/string
 import twocore/backend/build_beam
 import twocore/backend/core_printer
 import twocore/backend/emit_core
-import twocore/conformance/corpus.{type Expect, Rejects, Returns, Traps}
+import twocore/conformance/corpus.{
+  type Expect, InstantiateTraps, Rejects, Returns, Traps,
+}
 import twocore/conformance/driver
 import twocore/conformance/ffi
 import twocore/conformance/oracle
 import twocore/conformance/runner.{type Driver}
 import twocore/ir
+import twocore/pipeline
 import twocore/runtime/instance
+import twocore/runtime/profiles
 
 const corpus_dir = "test/twocore/conformance/corpus"
 
@@ -74,6 +78,115 @@ pub fn floatops_corpus_test() {
 /// the module must not compile to a runnable instance.
 pub fn hostimport_rejected_corpus_test() {
   assert check_program("hostimport") == []
+}
+
+// ─────────────────────────────── Phase-2 acceptance corpus (stateful, real .wat) ───────────────────────────────
+
+/// #1 `mem` — linear memory round-trip (LE), an OOB load, and a partial multi-byte OOB
+/// store that traps with ZERO mutation. Bounds per spec exec/instructions.html.
+pub fn mem_corpus_test() {
+  assert check_program("mem") == []
+}
+
+/// #2 `callind` — `call_indirect`'s three ordered, distinct faults (undefined element /
+/// uninitialized element / indirect call type mismatch) plus a correct dispatch.
+pub fn callind_corpus_test() {
+  assert check_program("callind") == []
+}
+
+/// #3 `gvar` — a mutable global round-trips through `global.set`/`global.get`, with state
+/// persisting across invokes (one-instance-one-process).
+pub fn gvar_corpus_test() {
+  assert check_program("gvar") == []
+}
+
+/// #4 `memgrow` — `memory.grow` returns the old size; a grow past the DECLARED max returns
+/// -1 and allocates nothing; `memory.size` reflects growth.
+pub fn memgrow_corpus_test() {
+  assert check_program("memgrow") == []
+}
+
+/// #5 `trunc` — trapping `i32.trunc_f32_s`: NaN → invalid conversion; ±Inf / out-of-range →
+/// integer overflow; in-range truncates (spec exec/numerics.html).
+pub fn trunc_corpus_test() {
+  assert check_program("trunc") == []
+}
+
+/// #7a `trapstart` — a trapping `start` function makes the module FAIL to instantiate.
+pub fn trapstart_uninstantiable_corpus_test() {
+  assert check_program("trapstart") == []
+}
+
+/// #7b `oobdata` — an out-of-bounds active data segment makes the module FAIL to
+/// instantiate (whole-range bounds check, no partial write).
+pub fn oobdata_uninstantiable_corpus_test() {
+  assert check_program("oobdata") == []
+}
+
+/// #6 Cross-instance ISOLATION: instantiate the SAME module twice (two owned processes →
+/// two independent cells). A `global.set` and an `i32.store` in instance A are INVISIBLE to
+/// instance B, and A still observes its own writes (E1/E3 per-instance isolation).
+pub fn cross_instance_isolation_test() {
+  let mod = compile_load(read("iso.wasm"), profiles.safe())
+  let assert Ok(a) = ffi.start_instance(mod)
+  let assert Ok(b) = ffi.start_instance(mod)
+
+  // Mutate ONLY instance A.
+  let assert Ok(_) = ffi.call_instance(a, atom.create("set_global"), [111])
+  let assert Ok(_) = ffi.call_instance(a, atom.create("store"), [0, 222])
+
+  // Instance B never observes A's writes.
+  assert ffi.call_instance(b, atom.create("get_global"), []) == Ok(0)
+  assert ffi.call_instance(b, atom.create("load"), [0]) == Ok(0)
+  // Instance A still observes its own writes.
+  assert ffi.call_instance(a, atom.create("get_global"), []) == Ok(111)
+  assert ffi.call_instance(a, atom.create("load"), [0]) == Ok(222)
+
+  ffi.stop_instance(a)
+  ffi.stop_instance(b)
+}
+
+/// #4 (Safe cap) The Safe-profile hard max-pages cap fires: `growcap` declares NO max, so
+/// the Binding's cap governs. Compiled with `profiles.safe_capped(1)`, a grow past 1 page
+/// returns -1 and allocates nothing (E3 — untrusted code cannot allocate unboundedly).
+pub fn safe_cap_grow_returns_minus_one_test() {
+  let mod = compile_load(read("growcap.wasm"), profiles.safe_capped(1))
+  let assert Ok(proc) = ffi.start_instance(mod)
+  // Initial size 0; grow by 1 succeeds (within the cap of 1) and returns old size 0.
+  assert ffi.call_instance(proc, atom.create("grow"), [1]) == Ok(0)
+  assert ffi.call_instance(proc, atom.create("size"), []) == Ok(1)
+  // A further grow exceeds the Safe cap of 1 page → the WASM i32 failure value -1, whose
+  // unsigned bit pattern is 0xFFFFFFFF (masked to i32 as the value layer / oracle does), and
+  // NOTHING is allocated (size stays 1).
+  let assert Ok(fail) = ffi.call_instance(proc, atom.create("grow"), [1])
+  assert int.bitwise_and(fail, 0xFFFF_FFFF) == 0xFFFF_FFFF
+  assert ffi.call_instance(proc, atom.create("size"), []) == Ok(1)
+  ffi.stop_instance(proc)
+}
+
+/// The `cell` state strategy preserves the Phase-1 constant-space tail loop for the ACTUAL
+/// memory path: a `memory.store` EVERY iteration for 100k iterations completes and returns
+/// the final value, using memory that does NOT grow proportionally to the iteration count
+/// (100× the iterations must not mean ~100× the live process memory — a per-iteration leak
+/// would). Proven directly, not inferred from `rt_meter`.
+pub fn store_loop_constant_space_test() {
+  let mod = compile_load(read("memloop.wasm"), profiles.safe())
+
+  let assert Ok(small) = ffi.start_instance(mod)
+  assert ffi.call_instance(small, atom.create("store_loop"), [1000]) == Ok(999)
+  let mem_small = ffi.gc_and_memory(small)
+
+  let assert Ok(big) = ffi.start_instance(mod)
+  assert ffi.call_instance(big, atom.create("store_loop"), [100_000])
+    == Ok(99_999)
+  let mem_big = ffi.gc_and_memory(big)
+
+  // Constant space: 100× the iterations must stay well under a small constant factor of the
+  // small run's live memory (a loop-carried / accumulating state would blow this up ~100×).
+  assert mem_big < mem_small * 4
+
+  ffi.stop_instance(small)
+  ffi.stop_instance(big)
 }
 
 // ─────────────────────────────── IR-sourced float arithmetic ───────────────────────────────
@@ -128,6 +241,32 @@ fn check_program(name: String) -> List(String) {
         Error(_) -> []
         Ok(_) -> [name <> ": expected REJECT, but the module instantiated"]
       }
+    [InstantiateTraps(text)] ->
+      // The module compiles, but instantiation must TRAP (OOB active segment / trapping
+      // start). driver.instantiate prefixes an instantiation-time trap with "instantiate: ".
+      case d.instantiate(bytes) {
+        Ok(_) -> [name <> ": expected instantiation TRAP, but it instantiated"]
+        Error(reason) ->
+          case string.split_once(reason, "instantiate: ") {
+            Ok(#(_, trap)) ->
+              case runner.trap_matches(trap, text) {
+                True -> []
+                False -> [
+                  name
+                  <> ": instantiation trapped "
+                  <> trap
+                  <> " want substring '"
+                  <> text
+                  <> "'",
+                ]
+              }
+            Error(_) -> [
+              name
+              <> ": expected an instantiation trap, got a compile-stage rejection: "
+              <> reason,
+            ]
+          }
+      }
     _ ->
       case d.instantiate(bytes) {
         Error(e) -> [name <> ": module failed to instantiate: " <> e]
@@ -145,6 +284,8 @@ fn check_program(name: String) -> List(String) {
 fn run_expect(d: Driver, inst, ex: Expect) -> Result(Nil, String) {
   case ex {
     Rejects -> Error("unexpected 'reject' among value expectations")
+    InstantiateTraps(_) ->
+      Error("unexpected 'instantiate' among value expectations")
     Returns(field, args, results) ->
       case d.invoke(inst, field, args) {
         runner.Returned(actual) ->
@@ -187,6 +328,25 @@ fn run_expect(d: Driver, inst, ex: Expect) -> Result(Nil, String) {
 
 fn read_bytes(file: String) -> Result(BitArray, String) {
   ffi.read_file(corpus_dir <> "/" <> file)
+}
+
+/// Read a corpus `.wasm` file, asserting success (a missing fixture is a test bug).
+fn read(file: String) -> BitArray {
+  let assert Ok(bytes) = read_bytes(file)
+  bytes
+}
+
+/// Compile `bytes` through the full pipeline under `binding` and LOAD the module, returning
+/// its atom (a unique name per call, so repeated instantiations don't clobber). Used by the
+/// dedicated Phase-2 tests that need a custom `Binding` (the Safe cap) or a raw owning pid
+/// (isolation / constant-space) — they then drive it via `ffi.start_instance`.
+fn compile_load(bytes: BitArray, binding: instance.Binding) -> Atom {
+  let assert Ok(m0) = pipeline.source_to_ir(bytes)
+  let m =
+    ir.Module(..m0, name: m0.name <> "_" <> int.to_string(ffi.unique_int()))
+  let assert Ok(core) = pipeline.ir_to_core(m, binding)
+  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  mod
 }
 
 fn read_text(file: String) -> Result(String, String) {

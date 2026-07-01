@@ -136,9 +136,11 @@ fn check_program(name: String) -> List(String) {
   }
 }
 
-/// Decode → validate → lower → **ir_lower(Safe)** → emit_core → build → load `bytes` into a
-/// runnable `Instance` (D10). Each module gets a unique name so loads do not clobber. Returns
-/// `Error(reason)` — never a panic — for any stage that rejects.
+/// Decode → validate → lower → **ir_lower(Safe)** → emit_core → build → load `bytes`, then
+/// **instantiate** it in its own owned process (E5, one-instance-one-process): `start_instance`
+/// runs the generated `instantiate/0` in that process, seeding its cell. Each module gets a
+/// unique name so loads do not clobber. Returns `Error(reason)` — never a panic — for any
+/// stage that rejects, or `Error("instantiate: …")` for an instantiation-time trap.
 fn instantiate_safe(bytes: BitArray) -> Result(Instance, String) {
   use m0 <- result.try(
     pipeline.source_to_ir(bytes)
@@ -154,13 +156,19 @@ fn instantiate_safe(bytes: BitArray) -> Result(Instance, String) {
     build_beam.compile_and_load(bit_array.from_string(core))
     |> result.map_error(fn(e) { "build: " <> string.inspect(e) }),
   )
-  Ok(runner.Instance(module: mod_atom, exports: export_types(m)))
+  use proc <- result.try(
+    ffi.start_instance(mod_atom)
+    |> result.map_error(fn(t) { "instantiate: " <> t }),
+  )
+  Ok(runner.Instance(proc: proc, exports: export_types(m)))
 }
 
 /// Check one `.expected` line against the running instance via 07's oracle / trap matcher.
 fn run_expect(inst: Instance, ex: Expect) -> Result(Nil, String) {
   case ex {
     Rejects -> Error("unexpected 'reject' among value expectations")
+    corpus.InstantiateTraps(_) ->
+      Error("unexpected 'instantiate' among value expectations")
     Returns(field, args, results) ->
       case invoke(inst, field, args) {
         runner.Returned(actual) ->
@@ -213,14 +221,15 @@ fn invoke(
     Error(_) -> runner.DriverError("no such export: " <> field)
     Ok(results) -> {
       let arg_ints = list.map(args, spec_to_raw)
+      // Route the invoke INTO the instance's owned process so it reads that instance's cell.
       case results {
         [ty] ->
-          case ffi.catch_apply(inst.module, atom.create(field), arg_ints) {
+          case ffi.call_instance(inst.proc, atom.create(field), arg_ints) {
             Ok(raw) -> runner.Returned([tag(ty, raw)])
             Error(t) -> runner.Trapped(t)
           }
         [] ->
-          case ffi.catch_apply(inst.module, atom.create(field), arg_ints) {
+          case ffi.call_instance(inst.proc, atom.create(field), arg_ints) {
             Ok(_) -> runner.Returned([])
             Error(t) -> runner.Trapped(t)
           }

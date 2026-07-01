@@ -13,6 +13,10 @@
 ////                                                       message contains <text>
 ////     reject                                         ; the module must NOT compile to
 ////                                                       a runnable instance (fail-closed)
+////     instantiate => trap <text…>                    ; INSTANTIATING the module must trap
+////                                                       (OOB active segment / trapping
+////                                                       start) with a spec message
+////                                                       containing <text> (E5)
 ////
 //// A `<value>` is `<ty>:<n>` where `<ty>` ∈ {i32,i64,f32,f64} and `<n>` is the RAW
 //// UNSIGNED bit pattern in decimal (floats included — D5), or `<ty>:nan:canonical` /
@@ -33,11 +37,16 @@ import twocore/conformance/fixture.{
 ///   matching `results` (compared by the oracle).
 /// - `Traps(field, args, text)`: invoking `field` with `args` must trap with a spec
 ///   message containing `text`.
-/// - `Rejects`: the program's module must FAIL to instantiate end-to-end (fail-closed).
+/// - `Rejects`: the program's module must FAIL to compile to a runnable instance
+///   (fail-closed at BUILD time — a decode/validate/emit rejection).
+/// - `InstantiateTraps(text)`: the module compiles, but INSTANTIATING it must trap (an OOB
+///   active data/element segment, or a trapping `start`) with a spec message containing
+///   `text` (a RUNTIME instantiation-time trap, distinct from `Rejects`).
 pub type Expect {
   Returns(field: String, args: List(SpecValue), results: List(SpecValue))
   Traps(field: String, args: List(SpecValue), text: String)
   Rejects
+  InstantiateTraps(text: String)
 }
 
 /// Parse the textual `.expected` content into a list of `Expect`s (in file order).
@@ -45,9 +54,20 @@ pub type Expect {
 pub fn parse(text: String) -> Result(List(Expect), String) {
   text
   |> string.split("\n")
+  |> list.map(strip_comment)
   |> list.map(string.trim)
-  |> list.filter(fn(l) { l != "" && !string.starts_with(l, "#") })
+  |> list.filter(fn(l) { l != "" })
   |> list.try_map(parse_line)
+}
+
+/// Drop an inline `# …` comment (everything from the first `#`). WASM trap phrases and raw
+/// bit-pattern values never contain `#`, so this is unambiguous; it lets `.expected` files
+/// annotate individual lines inline (e.g. `… => return i32:3   # 3.5 → 3`).
+fn strip_comment(line: String) -> String {
+  case string.split_once(line, "#") {
+    Ok(#(before, _)) -> before
+    Error(_) -> line
+  }
 }
 
 fn parse_line(line: String) -> Result(Expect, String) {
@@ -55,9 +75,26 @@ fn parse_line(line: String) -> Result(Expect, String) {
     "reject" -> Ok(Rejects)
     _ ->
       case string.starts_with(line, "invoke ") {
-        False -> Error("unrecognised statement: " <> line)
         True -> parse_invoke(line)
+        False ->
+          case string.starts_with(line, "instantiate") {
+            True -> parse_instantiate(line)
+            False -> Error("unrecognised statement: " <> line)
+          }
       }
+  }
+}
+
+/// Parse `instantiate => trap <text…>` into `InstantiateTraps(text)`.
+fn parse_instantiate(line: String) -> Result(Expect, String) {
+  use #(_left, right) <- result.try(
+    string.split_once(line, " => ")
+    |> result.replace_error("missing ' => ' in: " <> line),
+  )
+  case string.starts_with(right, "trap ") {
+    True -> Ok(InstantiateTraps(string.trim(string.drop_start(right, 5))))
+    False ->
+      Error("expected 'trap <text>' after 'instantiate =>', got: " <> right)
   }
 }
 

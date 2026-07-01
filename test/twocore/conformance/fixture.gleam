@@ -89,7 +89,11 @@ pub type Action {
 ///   validation. Frontend only — never instantiated.
 /// - `AssertMalformed(line, filename, module_type, text)`: `filename` must FAIL
 ///   decoding. Frontend only — never instantiated.
-/// - `Unhandled(line, kind)`: a command outside the Phase-1 model (e.g.
+/// - `AssertUninstantiable(line, filename, text)`: `filename` decodes + validates,
+///   but INSTANTIATING it must trap (an OOB active data/element segment, or a
+///   trapping `start`) with a message containing `text` (E5). Full pipeline —
+///   instantiated, and asserted to fail to instantiate.
+/// - `Unhandled(line, kind)`: a command outside the modelled set (e.g.
 ///   `assert_exhaustion`, `assert_unlinkable`) — reported as a skip.
 pub type Command {
   ModuleCmd(line: Int, name: Option(String), filename: String)
@@ -108,6 +112,13 @@ pub type Command {
     module_type: ModuleType,
     text: String,
   )
+  AssertUninstantiable(line: Int, filename: String, text: String)
+  /// A bare `(invoke …)` / `(get …)` script action with NO assertion — run purely for
+  /// its SIDE EFFECTS on the current module's mutable state (e.g. a `reset`/`init`/`run`
+  /// that stores into memory before later asserts read it). Phase-1's pure modules made
+  /// these no-ops, but with persistent per-instance memory they must EXECUTE, or later
+  /// asserts read stale/zero state. Plumbing — never counted as pass/fail/skip.
+  ActionCmd(line: Int, action: Action)
   Unhandled(line: Int, kind: String)
 }
 
@@ -186,6 +197,15 @@ fn command_decoder() -> decode.Decoder(Command) {
       use mt <- decode.optional_field("module_type", "binary", decode.string)
       use text <- decode.optional_field("text", "", decode.string)
       decode.success(AssertMalformed(line, filename, module_type(mt), text))
+    }
+    "assert_uninstantiable" -> {
+      use filename <- decode.field("filename", decode.string)
+      use text <- decode.optional_field("text", "", decode.string)
+      decode.success(AssertUninstantiable(line, filename, text))
+    }
+    "action" -> {
+      use action <- decode.field("action", action_decoder())
+      decode.success(ActionCmd(line, action))
     }
     other -> decode.success(Unhandled(line, other))
   }

@@ -1,0 +1,3 @@
+# Acceptance #7a — a trapping `start` makes the module fail to instantiate (spec
+# exec/modules.html: start runs last; a trap there aborts instantiation).
+instantiate => trap unreachable

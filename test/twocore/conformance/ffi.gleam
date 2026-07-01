@@ -8,6 +8,7 @@
 
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
+import gleam/erlang/process.{type Pid}
 
 /// Apply `module:function(args)` on the freshly-loaded generated BEAM module and
 /// capture the outcome. `Ok(raw)` is a normal return whose `raw` is the function's
@@ -50,6 +51,37 @@ pub fn run(program: String, args: List(String)) -> #(Int, String)
 /// unique so multi-module fixtures don't clobber one another on load.
 @external(erlang, "twocore_conformance_ffi", "unique_int")
 pub fn unique_int() -> Int
+
+/// Start an OWNED process for a generated instance and run its `instantiate/0` IN
+/// that process (one-instance-one-process, E1). `module` is the loaded BEAM module
+/// atom. `Ok(pid)` means instantiation succeeded and the process is holding the
+/// seeded cell, ready for `call_instance`; `Error(reason)` is an instantiation-time
+/// trap (OOB active segment / trapping start), the reason rendered as text. The
+/// cell is private to this process, so a (re)instantiation always starts fresh.
+@external(erlang, "twocore_conformance_ffi", "start_instance")
+pub fn start_instance(module: Atom) -> Result(Pid, String)
+
+/// Invoke export `function` with raw integer `args` INSIDE the instance's owned
+/// process (so it reads that instance's cell). `Ok(raw)` is a normal single result
+/// (raw value / IEEE-754 bit pattern, D5); `Error(reason)` is a trap rendered as
+/// text. Cross-invoke state persists because successive calls hit the same process.
+@external(erlang, "twocore_conformance_ffi", "call_instance")
+pub fn call_instance(
+  proc: Pid,
+  function: Atom,
+  args: List(Int),
+) -> Result(Int, String)
+
+/// Stop an instance's owned process; its process-dictionary cell is GC'd with it.
+@external(erlang, "twocore_conformance_ffi", "stop_instance")
+pub fn stop_instance(proc: Pid) -> Nil
+
+/// Force a garbage collection on `proc`, then return its total memory in bytes. Used by the
+/// constant-space store-loop test to assert the `cell` strategy does not accumulate memory
+/// per iteration (after GC, a constant-space loop's live memory is bounded by the page-map,
+/// independent of the iteration count).
+@external(erlang, "twocore_conformance_ffi", "gc_and_memory")
+pub fn gc_and_memory(proc: Pid) -> Int
 
 /// Reset the routing-partition spy flag (per process).
 @external(erlang, "twocore_conformance_ffi", "spy_reset")

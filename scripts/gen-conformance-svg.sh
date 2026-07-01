@@ -162,7 +162,7 @@ END {
   }
 
   # ---- footnotes ----
-  print "  <text x='24' y='" fn1Y "' font-size='9.5' fill='" muted "'>Skipped = constructs beyond the current Phase-1 slice (linear memory, tables, call_indirect, most float ops). " commas(tF) " failing across the suite.</text>"
+  print "  <text x='24' y='" fn1Y "' font-size='9.5' fill='" muted "'>Skipped = constructs beyond the Phase-2 slice (reference types, bulk memory, multi-memory, non-function imports, multi-value, extended-const, memory64, text-format asserts). " commas(tF) " failing across the suite.</text>"
   print "  <text x='24' y='" fn2Y "' font-size='9' fill='" faint "'>Source: WebAssembly/testsuite @ " sha "  ·  wabt " wabt "  ·  " n " of " allow " allowlisted .wast files convertible at pin  ·  regenerate with scripts/gen-conformance-svg.sh</text>"
 
   print "</svg>"

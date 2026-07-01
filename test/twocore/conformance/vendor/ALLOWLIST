@@ -1,14 +1,21 @@
-# Phase-1 conformance allowlist (unit 07).
+# Phase-2 conformance allowlist (units 07 + 11).
 #
-# The exact set of WebAssembly spec-suite `.wast` files that 2core's Phase-1 slice
-# (i32/i64 integer + control-flow + locals + direct calls) is expected to drive.
-# One file name per line (no `.wast` extension); `#` starts a comment.
+# The set of WebAssembly spec-suite `.wast` files that 2core's compiled slice is
+# expected to drive. One entry per line; `#` starts a comment.
 #
-# DEFERRED (NOT here — need rt_mem / rt_table / call_indirect, Phase 1.5/2; D9):
-#   memory* table* call_indirect float_* f32* f64* address* align* start
-#   linking imports global elem data unreached-* — and every post-MVP proposal file.
+# FORMAT (Phase-2): `<name>` optionally followed by a whitespace-separated trailing
+# FLAG COLUMN passed verbatim to `wast2json` (e.g. `align<TAB>--enable-memory64`).
+# Tier-A/Phase-1 entries are flagless. The `.wast` extension is implied.
 #
-# These 24 are VERIFIED present in the testsuite root at the pinned SHA (vendor/PIN).
+# All counts were measured by running `wast2json` at the pinned testsuite SHA
+# (vendor/PIN) with wabt 1.0.41 — a WASM-3.0-era testsuite, so "root file name == MVP"
+# is FALSE. Several files carry WITHIN-FILE skips (reftype/extended-const/memory64/
+# text-format asserts the IR/decoder/validator deliberately lack); those fall out of
+# the runner's fail-closed paths (a rejected module skips its dependent asserts; an
+# unhandled command skips; a text module_type skips) and are counted as honest skips,
+# never silent passes. See specs/phase-2/11-capstone.md §C.
+
+# ── Phase-1 slice (i32/i64 integer + control-flow + locals + direct calls + convert)
 i32
 i64
 int_exprs
@@ -28,7 +35,44 @@ labels
 select
 nop
 call
-conversions
+conversions          # ALSO Phase-2: its 67 float→int trapping converts now PASS (rt_num floats)
 traps
 func
 fac
+
+# ── Phase-2 Tier A — linear memory (bounds-check → trap), plain wast2json (no flags)
+memory_trap          # 180: 170 assert_trap OOB load/store — the bounds-check workhorse
+address              # 256: 206 ret + 49 trap — i32/i64/f32/f64 load/store w/ static offset
+endianness           # 68:  little-endian load/store of every width
+float_memory         # 84:  f32/f64 load/store incl NaN-bit preservation (D5)
+memory_size          # 38:  memory.size + MVP memory.grow growth semantics
+memory_redundancy    # 7:   load/store aliasing / no-spurious-reorder
+
+# ── Phase-2 Tier A — tables / call_indirect (runtime type-check → trap)
+call_indirect        # 169: SKIP 2 assert_exhaustion + the reftype multi-table module
+
+# ── Phase-2 Tier A — globals (mutable/immutable get/set)
+global               # 114: SKIP ~6 externref/funcref asserts + 2 extended-const inits ($z3,$z5)
+
+# ── Phase-2 Tier A — full scalar floats (abs/neg/sqrt/ceil/floor/trunc/nearest/copysign,
+#    the 6 comparisons, convert/promote/demote) — pure-MVP, plain-convert
+f32
+f64
+f32_cmp
+f64_cmp
+f32_bitwise
+f64_bitwise
+float_misc
+float_exprs
+float_literals       # 99 binary assert_return in scope; SKIP its 78 text-format assert_malformed
+
+# ── Phase-2 Tier B — MVP memarg alignment validation (per-file feature flag)
+align	--enable-memory64   # SKIP the 2 memory64 assert_invalid (64-bit offset) — the flag makes them VALID
+
+# ── DEFERRED to Phase 3 (NOT here — record as honest file-level gaps, do NOT add):
+#   memory.wast / table.wast  — un-convertible at pin ((module definition …) + 2^32 literals / typed-ref)
+#   memory_grow.wast          — 100% multi-memory at pin (MVP grow coverage is in memory_size.wast)
+#   elem.wast                 — function-references; table_get/set/copy/fill.wast — reference-types runtime
+#   memory_fill/copy/init.wast — bulk-memory (memory.fill/copy/init + data.drop)
+#   table_init.wast           — un-convertible (GC array/arrayref)
+#   linking / imports / global-import — non-function imports + the spectest module

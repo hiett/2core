@@ -1,0 +1,13 @@
+# Acceptance #2 — call_indirect's three ordered, distinct faults (spec exec/instructions.html).
+# Check order: index-in-bounds, then slot-non-null, then exact structural type match.
+# Trap phrases per rt_trap.spec_trap_message, cross-checked against call_indirect.wast.
+
+# Right type runs: slot 0 = $inc, slot 1 = $dbl.
+invoke call_unary i32:0 i32:10 => return i32:11
+invoke call_unary i32:1 i32:10 => return i32:20
+# Slot 2 is a null slot → "uninitialized element".
+invoke call_unary i32:2 i32:10 => trap uninitialized element
+# Index 5 ≥ table size 3 → "undefined element" (bounds checked FIRST).
+invoke call_unary i32:5 i32:10 => trap undefined element
+# Slot 0 is unary but called as binary → "indirect call type mismatch".
+invoke call_binary i32:0 i32:10 => trap indirect call type mismatch
