@@ -48,7 +48,7 @@ start_instance(Module) ->
             try Module:instantiate() of
                 _ -> ok
             catch
-                _Class:Reason -> {error, render_reason(Reason)}
+                _Class:Reason:Stack -> {error, render_reason(Reason, Stack)}
             end,
         case Outcome of
             ok ->
@@ -94,3 +94,6 @@ instance_loop(Module) ->
 
 render_reason(Reason) ->
     unicode:characters_to_binary(io_lib:format("~0p", [Reason])).
+render_reason(Reason, Stack) ->
+    Top = case Stack of [F|_] -> F; _ -> none end,
+    unicode:characters_to_binary(io_lib:format("~0p @ ~0p", [Reason, Top])).
