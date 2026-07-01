@@ -9,7 +9,9 @@
 //// Its public surface is one entry point (`optimize/2`) plus the ordered pass list per level
 //// (`pipeline/1`), the single point units 03/04 register real passes into.
 
+import gleam/list
 import twocore/ir.{type Module}
+import twocore/middle/ir_opt/aggressive
 import twocore/middle/ir_opt/baseline
 import twocore/middle/ir_opt/pass.{type Pass, run_pipeline}
 
@@ -58,13 +60,16 @@ pub fn optimize(module: Module, level: OptLevel) -> Module {
 ///
 /// `OptNone` stays `[]` forever (F1) — the exact identity, the F2 differential baseline.
 /// `Baseline` runs the trust-neutral pass set (unit 03, `baseline.baseline_passes()`). Those
-/// same passes ALSO run at `Aggressive`, which is kept a superset of `Baseline` (keystone A.2);
-/// unit 04 replaces the `Aggressive` arm with `baseline.baseline_passes() ++
-/// aggressive.aggressive_passes()`, appending its Unsafe-only passes. Total.
+/// same passes ALSO run at `Aggressive`, which is kept a superset of `Baseline` (keystone A.2):
+/// the `Aggressive` arm is `baseline.baseline_passes() ++ aggressive.aggressive_passes()`, the
+/// baseline set followed by unit 04's Unsafe-only passes (`charge_elide`, `inline`). The
+/// `run_pipeline` fixpoint re-runs the whole arm over the enlarged bodies, so baseline cleans up
+/// after inlining for free — no separate post-inline pass is registered. Total.
 fn pipeline(level: OptLevel) -> List(Pass) {
   case level {
     OptNone -> []
     Baseline -> baseline.baseline_passes()
-    Aggressive -> baseline.baseline_passes()
+    Aggressive ->
+      list.append(baseline.baseline_passes(), aggressive.aggressive_passes())
   }
 }
