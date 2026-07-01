@@ -112,13 +112,10 @@ pub type StateDecl {
 ///   `Dict` keyed by name.
 /// - Returns `Nil`. The body installs the cell with a single `erlang:put/2`, so the reset
 ///   is atomic: the old record (if any) is discarded wholesale and becomes garbage. Total;
-///   never raises.
+///   never raises. Routes through the shared `build` constructor so a `Cell` build (this
+///   `seed`) and a `Threaded` build (`fresh`) materialise BYTE-IDENTICAL state (G7).
 pub fn seed(decl: StateDecl) -> Nil {
-  put_cell(InstanceState(
-    mem: decl.mem,
-    globals: dict.from_list(decl.globals),
-    table: decl.table,
-  ))
+  put_cell(build(decl))
 }
 
 /// Drop this process's cell (used between instances when a process is reused). After
@@ -196,7 +193,129 @@ pub fn global_set(name: String, value: Int) -> Nil {
   )
 }
 
+// ── tier-P: the threaded instance-state surface (unit 03; NO process dictionary) ──
+//
+// The purely-functional twin of the cell surface above. Under `state_strategy: Threaded`
+// (Phase-4 keystone §A), generated code threads the SAME `InstanceState` record as an
+// ordinary value — every state-reaching function takes it as a leading parameter and returns
+// the (possibly updated) record. There is NO ambient location the state lives in: it is a
+// Gleam value on the stack. This surface reaches NONE of the module's three pdict externals
+// (`erlang_put`/`erlang_erase`/`read_cell`) — it is pure `dict.*` + record construction, so
+// it links no process dictionary, no OTP-native state (atomics/ets/persistent_term), and no
+// NIF (the "runs-anywhere" posture, G6). The cell surface above stays untouched and parallel.
+
+/// Build the initial threaded instance-state record from the SAME `StateDecl` the cell
+/// strategy passes to `seed` — but RETURN it as a value (no pdict write). Called once by the
+/// threaded `instantiate/0` (unit 02) before any element/data segment is written or the start
+/// function runs.
+///
+/// - `decl`: the fresh per-layer values to install. `decl.globals` is materialised into the
+///   `globals` `Dict` (keyed by name; duplicate names keep the LAST, per `dict.from_list`);
+///   `mem`/`table` are stored opaquely as-is (already built by `rt_mem.fresh`/`rt_table.new`,
+///   never inspected here).
+/// - Returns the fresh `InstanceState`. Total; never raises; touches NO process dictionary.
+///   Shares the `build` constructor with `seed`, so a `Threaded` build and a `Cell` build
+///   start from BYTE-IDENTICAL state (G7).
+pub fn fresh(decl: StateDecl) -> InstanceState {
+  build(decl)
+}
+
+/// Read mutable global `name`'s raw bit pattern from the threaded record. READ-ONLY: `st` is
+/// unchanged (the caller keeps threading the same record forward).
+///
+/// - `st`: the threaded instance-state record.
+/// - `name`: the global's name.
+/// - Returns the global's value as a raw bit pattern (`Int`) — bit-exact, never coerced to a
+///   BEAM double (D5). Fail-closed: an undeclared `name` `panic`s a distinct internal error
+///   (a node-safe internal-invariant violation, NOT a WASM `TrapReason`); it is unreachable
+///   post-validation (global existence is a validation property, unit P2-08), so this is a
+///   defensive guard, never a normal path — it never fabricates a value.
+///   (<https://webassembly.github.io/spec/core/exec/instructions.html#variable-instructions>)
+pub fn t_global_get(st: InstanceState, name: String) -> Int {
+  case dict.get(st.globals, name) {
+    Ok(value) -> value
+    Error(Nil) ->
+      panic as "rt_state.t_global_get: undeclared global (internal invariant violation)"
+  }
+}
+
+/// Rebind mutable global `name` to `value`, RETURNING the updated record.
+///
+/// - `st`: the threaded instance-state record.
+/// - `name`: the global's name.
+/// - `value`: the new raw bit pattern (stored verbatim; `rt_state` does no float math, so a
+///   NaN payload / signalling bit / `-0.0` round-trips exactly — D5).
+/// - Returns a NEW `InstanceState` whose `globals` is `dict.insert`ed (only the named global
+///   changes) and whose `mem`/`table` fields are shared by reference — NOT a deep copy (the
+///   §10 uniform-threading rule for a mutating op). Total; never raises; touches NO process
+///   dictionary. Immutability of `const` globals is a validation property (unit P2-08), not
+///   enforced here — this is a mechanical write.
+///   (<https://webassembly.github.io/spec/core/exec/instructions.html#variable-instructions>)
+pub fn t_global_set(
+  st: InstanceState,
+  name: String,
+  value: Int,
+) -> InstanceState {
+  InstanceState(..st, globals: dict.insert(st.globals, name, value))
+}
+
+/// Project the opaque memory value out of the threaded record (the field seam `rt_mem`'s
+/// tier-P wrappers, unit 04, project → drive the pure core → re-inject). READ-ONLY.
+///
+/// - `st`: the threaded instance-state record.
+/// - Returns the `mem` field unchanged — a `Dynamic` `rt_state` never inspects (`rt_mem` owns
+///   its shape). Total; never raises.
+pub fn mem(st: InstanceState) -> Dynamic {
+  st.mem
+}
+
+/// Rebind the memory field, RETURNING the updated record (for `rt_mem`'s `t_store`/`t_grow`/
+/// `t_init_data`, which inject a new opaque `mem` after driving the pure core).
+///
+/// - `st`: the threaded instance-state record.
+/// - `mem`: the new opaque memory value (`rt_mem` produces it; `rt_state` stores it as-is).
+/// - Returns a NEW `InstanceState` sharing `globals`/`table` by reference — NOT a copy. Total;
+///   never raises; touches NO process dictionary.
+pub fn with_mem(st: InstanceState, mem: Dynamic) -> InstanceState {
+  InstanceState(..st, mem: mem)
+}
+
+/// Project the opaque table value out of the threaded record (the field seam `rt_table`'s
+/// tier-P wrappers, unit 06, project). READ-ONLY.
+///
+/// - `st`: the threaded instance-state record.
+/// - Returns the `table` field unchanged — a `Dynamic` `rt_state` never inspects (`rt_table`
+///   owns its shape). Total; never raises.
+pub fn table(st: InstanceState) -> Dynamic {
+  st.table
+}
+
+/// Rebind the table field, RETURNING the updated record (for `rt_table`'s `t_init_elem`/
+/// `t_call_indirect`, which inject a new opaque `table`).
+///
+/// - `st`: the threaded instance-state record.
+/// - `table`: the new opaque table value (`rt_table` produces it; `rt_state` stores it as-is).
+/// - Returns a NEW `InstanceState` sharing `mem`/`globals` by reference — NOT a copy. Total;
+///   never raises; touches NO process dictionary.
+pub fn with_table(st: InstanceState, table: Dynamic) -> InstanceState {
+  InstanceState(..st, table: table)
+}
+
 // ── internal helpers ──────────────────────────────────────────────────────────
+
+/// The single record builder shared by `seed` (cell path — installs it in the pdict) and
+/// `fresh` (threaded path — returns it). Sharing ONE constructor guarantees the two strategies
+/// materialise BYTE-IDENTICAL state (G7 — a `Threaded` build and a `Cell` build compute
+/// identical results). `decl.globals` becomes the `globals` `Dict`; `mem`/`table` are stored
+/// opaquely. Total; never raises; touches NO process dictionary (the pdict write, if any, is
+/// the caller's — only `seed` does it). (Private: the shared materialisation seam.)
+fn build(decl: StateDecl) -> InstanceState {
+  InstanceState(
+    mem: decl.mem,
+    globals: dict.from_list(decl.globals),
+    table: decl.table,
+  )
+}
 
 /// Install `state` as this process's cell under the fixed key. The superseded record (if
 /// any) becomes garbage. Total; never raises. (Private: the seam between rt_state's public

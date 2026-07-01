@@ -266,3 +266,246 @@ pub fn opaque_field_round_trip_test() {
   rt_state.mem_get() |> should.equal(mem1)
   rt_state.global_get("g") |> should.equal(7)
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tier-P (threaded) surface — pure, value-threaded, NO process dictionary (unit 03).
+//
+// These assert the SAME WebAssembly global/instantiation semantics as the cell suite
+// above, but against the purely-functional record threaded call-to-call (keystone §A):
+//
+// - **`fresh` builds the declared record** — instantiation installs fresh state
+//   (<https://webassembly.github.io/spec/core/exec/modules.html#instantiation>).
+// - **`fresh` ≡ `seed` (G7 parity)** — a `Threaded` build and a `Cell` build start from
+//   byte-identical state, so they compute identical results.
+// - **Globals exec, purely** — `global.set` writes exactly the named global and
+//   `global.get` reads it, with value semantics: the ORIGINAL record is never mutated
+//   (<https://webassembly.github.io/spec/core/exec/instructions.html#variable-instructions>).
+// - **Floats are raw bits (D5)** — bit-exact through the record, never a BEAM double.
+// - **No ambient state (E3/G6)** — two records in one process never share, and the
+//   tier-P surface writes NOTHING to the process dictionary (runs-anywhere).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── P1. `fresh` builds the record from the decl (thread round-trip) ────────────
+
+/// `fresh(StateDecl(...))` yields a record holding exactly the declared inits: the declared
+/// global reads back through `t_global_get`, and the opaque `mem`/`table` sentinels project
+/// back verbatim through the field seam. (The threaded box holds the declared state.)
+pub fn fresh_builds_declared_record_test() {
+  let sentinel_m = dynamic.string("mem-sentinel")
+  let sentinel_t = dynamic.list([dynamic.int(1), dynamic.int(2)])
+
+  let st =
+    rt_state.fresh(StateDecl(
+      mem: sentinel_m,
+      globals: [#("g", 7)],
+      table: sentinel_t,
+    ))
+
+  rt_state.t_global_get(st, "g") |> should.equal(7)
+  rt_state.mem(st) |> should.equal(sentinel_m)
+  rt_state.table(st) |> should.equal(sentinel_t)
+}
+
+// ── P2. `fresh` ≡ `seed` materialisation (G7 parity) ───────────────────────────
+
+/// For ONE `StateDecl`, the record `fresh` returns is field-by-field identical to the record
+/// the cell path (`seed`) installs: every declared global matches (`t_global_get` over the
+/// threaded record == `global_get` over the seeded cell), and the `mem`/`table` sentinels
+/// match. Pins that a `Threaded` build and a `Cell` build start from BYTE-IDENTICAL state
+/// (G7 — the shared `build` constructor), so they cannot diverge.
+pub fn fresh_matches_seed_materialisation_test() {
+  let sentinel_m = dynamic.string("mem-parity")
+  let sentinel_t = dynamic.string("table-parity")
+  let decl =
+    StateDecl(
+      mem: sentinel_m,
+      globals: [#("g", 7), #("h", 9)],
+      table: sentinel_t,
+    )
+
+  // Threaded materialisation.
+  let st = rt_state.fresh(decl)
+
+  // Cell materialisation of the SAME decl.
+  rt_state.seed(decl)
+
+  // Field-by-field parity.
+  rt_state.t_global_get(st, "g")
+  |> should.equal(rt_state.global_get("g"))
+  rt_state.t_global_get(st, "h")
+  |> should.equal(rt_state.global_get("h"))
+  rt_state.mem(st) |> should.equal(rt_state.mem_get())
+  rt_state.table(st) |> should.equal(rt_state.table_get())
+}
+
+// ── P3. Threaded global get/set — value semantics (the original is never mutated) ─
+
+/// `t_global_set` returns a NEW record with only the named global rebound; the ORIGINAL
+/// record is unchanged (value semantics / purity). After `st2 = t_global_set(st1, "g", 42)`:
+/// `st2` sees `g == 42` and the untouched `h == 9`, while `st1` STILL sees `g == 7`. This is
+/// the property the cell strategy cannot have (its write mutates the one shared cell).
+pub fn threaded_global_set_is_pure_test() {
+  let st1 =
+    rt_state.fresh(StateDecl(
+      mem: dynamic.nil(),
+      globals: [#("g", 7), #("h", 9)],
+      table: dynamic.nil(),
+    ))
+
+  let st2 = rt_state.t_global_set(st1, "g", 42)
+
+  // The updated record: only `g` changed.
+  rt_state.t_global_get(st2, "g") |> should.equal(42)
+  rt_state.t_global_get(st2, "h") |> should.equal(9)
+
+  // The ORIGINAL record is untouched (immutability / value semantics).
+  rt_state.t_global_get(st1, "g") |> should.equal(7)
+  rt_state.t_global_get(st1, "h") |> should.equal(9)
+}
+
+/// A threaded write to an UNDECLARED global fails closed: `t_global_get` of a name that was
+/// never in the decl `panic`s (an internal invariant violation, NOT a WASM trap; unreachable
+/// post-validation) rather than fabricating a value.
+pub fn threaded_global_get_fails_closed_on_undeclared_test() {
+  let st =
+    rt_state.fresh(StateDecl(
+      mem: dynamic.nil(),
+      globals: [#("g", 1)],
+      table: dynamic.nil(),
+    ))
+  catch_thunk(fn() { rt_state.t_global_get(st, "does_not_exist") })
+  |> result.is_error
+  |> should.be_true
+}
+
+// ── P4. Float globals are bit-exact through the record (D5) ────────────────────
+
+/// f32/f64 globals carrying NaN-payload, `-0.0`, and `±Inf` bit patterns (as `Int`) survive
+/// `fresh` and `t_global_set`/`t_global_get` IDENTICALLY — a BEAM-double round-trip would
+/// mangle a NaN payload / signalling bit or collapse `-0.0`. The threaded record stores the
+/// `Int` verbatim, exactly like the cell path.
+pub fn threaded_float_globals_are_bit_exact_test() {
+  let f32_nan_payload = 0x7FC00001
+  let f32_neg_zero = 0x80000000
+  let f32_pos_inf = 0x7F800000
+  let f32_neg_inf = 0xFF800000
+  let f64_nan_payload = 0x7FF8000000000001
+  let f64_neg_zero = 0x8000000000000000
+  let f64_pos_inf = 0x7FF0000000000000
+
+  let st =
+    rt_state.fresh(StateDecl(
+      mem: dynamic.nil(),
+      globals: [
+        #("f32_nan", f32_nan_payload),
+        #("f32_nz", f32_neg_zero),
+        #("f32_pinf", f32_pos_inf),
+        #("f32_ninf", f32_neg_inf),
+        #("f64_nan", f64_nan_payload),
+        #("f64_nz", f64_neg_zero),
+        #("f64_pinf", f64_pos_inf),
+      ],
+      table: dynamic.nil(),
+    ))
+
+  rt_state.t_global_get(st, "f32_nan") |> should.equal(f32_nan_payload)
+  rt_state.t_global_get(st, "f32_nz") |> should.equal(f32_neg_zero)
+  rt_state.t_global_get(st, "f32_pinf") |> should.equal(f32_pos_inf)
+  rt_state.t_global_get(st, "f32_ninf") |> should.equal(f32_neg_inf)
+  rt_state.t_global_get(st, "f64_nan") |> should.equal(f64_nan_payload)
+  rt_state.t_global_get(st, "f64_nz") |> should.equal(f64_neg_zero)
+  rt_state.t_global_get(st, "f64_pinf") |> should.equal(f64_pos_inf)
+
+  // A SET of a NaN payload is equally bit-exact (write path, not just the fresh path).
+  let st2 = rt_state.t_global_set(st, "f64_nz", f64_nan_payload)
+  rt_state.t_global_get(st2, "f64_nz") |> should.equal(f64_nan_payload)
+}
+
+// ── P5. Two threaded instances in ONE process never share (E3/G6) ──────────────
+
+/// Because the state is a VALUE, one process can hold two independent instances with no
+/// cross-talk and no pdict. Build `a` (`g=1`) and `b` (`g=2`); set `a2 = t_global_set(a, "g",
+/// 99)`. Then `b` is untouched (`2`), the original `a` is untouched (`1`), and only `a2`
+/// reflects `99`. There is NO ambient state to isolate — the strongest per-instance isolation.
+pub fn two_threaded_instances_never_share_test() {
+  let a =
+    rt_state.fresh(StateDecl(
+      mem: dynamic.nil(),
+      globals: [#("g", 1)],
+      table: dynamic.nil(),
+    ))
+  let b =
+    rt_state.fresh(StateDecl(
+      mem: dynamic.nil(),
+      globals: [#("g", 2)],
+      table: dynamic.nil(),
+    ))
+
+  let a2 = rt_state.t_global_set(a, "g", 99)
+
+  rt_state.t_global_get(b, "g") |> should.equal(2)
+  rt_state.t_global_get(a, "g") |> should.equal(1)
+  rt_state.t_global_get(a2, "g") |> should.equal(99)
+}
+
+// ── P6. Tier-P links no pdict — runs-anywhere, behavioural (G6) ─────────────────
+
+/// After a sequence of tier-P ops (`fresh`, `t_global_set`, `with_mem`) in a freshly-cleared
+/// process, the process-dictionary cell is STILL un-seeded: the cell accessor (`mem_get`)
+/// still fails closed. This proves the tier-P surface wrote NOTHING to the process dictionary
+/// — the runs-anywhere property (the tier-P sub-graph reaches none of the module's three
+/// pdict externals). (G6.)
+pub fn tier_p_surface_writes_no_pdict_test() {
+  // Start from a guaranteed-un-seeded cell.
+  rt_state.clear()
+
+  // A full tier-P working set — none of these may touch the pdict.
+  let st =
+    rt_state.fresh(StateDecl(
+      mem: dynamic.string("m"),
+      globals: [#("g", 1)],
+      table: dynamic.string("t"),
+    ))
+  let st = rt_state.t_global_set(st, "g", 2)
+  let st = rt_state.with_mem(st, dynamic.string("m2"))
+  let st = rt_state.with_table(st, dynamic.string("t2"))
+
+  // The threaded record carries the effects...
+  rt_state.t_global_get(st, "g") |> should.equal(2)
+  rt_state.mem(st) |> should.equal(dynamic.string("m2"))
+
+  // ...but the cell was never seeded: the cell accessor still fails closed.
+  catch_thunk(fn() { rt_state.mem_get() })
+  |> result.is_error
+  |> should.be_true
+}
+
+// ── P7. Record field seam round-trip (opacity — rt_state never inspects mem/table) ─
+
+/// `with_mem`/`mem` and `with_table`/`table` round-trip an OPAQUE `Dynamic` unchanged, and
+/// rebinding one field leaves the others intact: `with_mem(st, m)` changes `mem` but not
+/// `table` or the globals; `with_table(st, t)` changes `table` but not `mem`. Sentinel
+/// `Dynamic`s stand in for 04/06's real mem/table shapes — proving `rt_state` never inspects
+/// them (the opacity seam the tier-P `rt_mem`/`rt_table` wrappers sit on).
+pub fn record_field_seam_round_trip_test() {
+  let st =
+    rt_state.fresh(StateDecl(
+      mem: dynamic.string("m0"),
+      globals: [#("g", 7)],
+      table: dynamic.string("t0"),
+    ))
+
+  // Rebind mem: mem changes, table + globals untouched.
+  let m1 = dynamic.int(123_456)
+  let st_m = rt_state.with_mem(st, m1)
+  rt_state.mem(st_m) |> should.equal(m1)
+  rt_state.table(st_m) |> should.equal(rt_state.table(st))
+  rt_state.t_global_get(st_m, "g") |> should.equal(7)
+
+  // Rebind table: table changes, mem + globals untouched.
+  let t1 = dynamic.list([dynamic.int(9)])
+  let st_t = rt_state.with_table(st, t1)
+  rt_state.table(st_t) |> should.equal(t1)
+  rt_state.mem(st_t) |> should.equal(rt_state.mem(st))
+  rt_state.t_global_get(st_t, "g") |> should.equal(7)
+}
