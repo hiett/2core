@@ -143,8 +143,99 @@ enforcement (still observe-only); the Porffor JS→WASM bridge.
 
 ---
 
+## Phase 3 — "Fast": the shared optimizer + the Unsafe profile + real CPU metering
+
+Goal & honest scope: see [`specs/phase-3/00-overview.md`](phase-3/00-overview.md) (decisions
+**F1–F8**). Phases 1–2 proved the platform *correct & sandboxed*; Phase 3 builds the *speed &
+second-mode* half. The load-bearing new thing is the **shared IR-level optimizer** (`ir_opt`,
+high-level §4 M2) plus the **Unsafe** profile (§6) and **enforcing** CPU fuel. **No new frontend
+surface, no new IR node types** — a middle-end + runtime + linker phase whose correctness bar is
+that **both profiles stay green** on the existing corpus + spec suite. The keystone (`ir_opt`
+interface + the Unsafe `Binding` policy extension + the enforcing `rt_meter` contract) is P3-01.
+Coexistence is **B3 monomorphization** (Safe.beam ≠ Unsafe.beam — metering compiled in/out,
+optimizer at build time; identical `twocore@runtime@rt_*` names) + **per-instance seeded runtime
+policy** (fuel budget + host policy seeded by the generated `instantiate/0`); the single-`.beam`
+runtime-dispatch B1 is **Phase 4**.
+
+### Phase-3 freeze milestones (planned)
+
+| Milestone | Produced by | Status | Unblocks |
+|---|---|---|---|
+| `«IROPT-IFACE-FROZEN»` — `middle/ir_opt.gleam` (`OptLevel`, `optimize/2`) + `middle/ir_opt/pass.gleam` (leaf `Pass` combinators, imports `ir` only → no cycle) + `ir/effect.gleam` signatures | P3-01 | planned | 02, 03, 04, 09 |
+| `«UNSAFE-PROFILE-FROZEN»` — `Binding` policy fields (`opt_level`/`meter`/`bif_gate`/`stdlib`/`host_policy`/`fuel_budget`) + 5 policy enums + `profiles.unsafe()` green + the `Aggressive ⟹ MeterOff` coupling test | P3-01 | planned | 06, 07, 08, 09, 10 |
+| `«METER-ENFORCE-FROZEN»` — `FuelExhausted` TrapReason (+`spec_trap_message`) + `rt_meter.seed_fuel/1` + enforcing `charge/1` (ABI unchanged) | P3-01 | planned | 05, 09, 11 |
+
+### Phase-3 units (specs authored + critiqued + reconciled; implementation `unclaimed`)
+
+| Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
+|---|---|---|---|---|
+| **P3-01** Interface freeze (keystone) | [`01`](phase-3/01-interface-freeze.md) | unclaimed | — | `ir_opt`/`pass`/`effect` sigs + `Binding` policy ext (incl. `fuel_budget`) + `profiles.unsafe()` + `FuelExhausted`/`seed_fuel` frozen; leaf `pass.gleam` (no import cycle); `Aggressive⟹MeterOff` coupling; 509 tests stay green, zero warnings. |
+| **P3-02** IR effect & purity analysis | [`02`](phase-3/02-effect-analysis.md) | unclaimed | `«IROPT-IFACE-FROZEN»` | `ir/effect.gleam` conservative classifier (trapping Num/Convert + Trap are barriers); the soundness foundation 03/04 rest on; adversarial "must-not" fixtures. |
+| **P3-03** `ir_opt` baseline passes | [`03`](phase-3/03-ir-opt-baseline.md) | unclaimed | `«IROPT»`, 02 | 7 trust-neutral passes (const-fold bit-exact via `rt_num`, copy/const-prop, dead-let, DCE, algebraic, block/label, const-`if`); μ=(n_loops,n_ops,n_nodes,n_vars) fixpoint; runs in both modes. |
+| **P3-04** `ir_opt` aggressive passes | [`04`](phase-3/04-ir-opt-aggressive.md) | unclaimed | `«IROPT»`, 03 | Unsafe-only inlining (B_remaining termination) + charge-elision; each documents its trust assumption; sound only under `Aggressive⟹MeterOff`. |
+| **P3-05** `rt_meter` enforce + cost model | [`05`](phase-3/05-rt-meter-enforce.md) | unclaimed | `«METER-ENFORCE-FROZEN»` | Per-instance fuel budget (cell), enforcing `charge` (FuelExhausted, constant-space), cost model; seed owned by emit_core (09); fail-closed-armed; bounds CPU-time (not stack/heap). |
+| **P3-06** passthrough stdlib + widened BIF gate | [`06`](phase-3/06-passthrough-stdlib-open-bif.md) | unclaimed | `«UNSAFE-PROFILE-FROZEN»` | `rt_stdlib` passthrough as a shim **behind `stdlib_module`** (emit target invariant) + `rt_bif` `BifOpen` (widens the build-fixed set, not arbitrary BIFs); zero active routes (mechanism + non-vacuity self-test). |
+| **P3-07** `rt_host` whitelist / open | [`07`](phase-3/07-rt-host-whitelist-open.md) | unclaimed | `«UNSAFE-PROFILE-FROZEN»` | Per-instance seeded host policy (deny/whitelist/open), fail-closed default (unseeded → deny-all); build-fixed handler registry (no ambient authority). |
+| **P3-08** `ir_lower` Unsafe policy | [`08`](phase-3/08-ir-lower-unsafe.md) | unclaimed | `«UNSAFE-PROFILE-FROZEN»` | Posture-aware lowering: `MeterOff` inserts zero Charge; passthrough resolves to `stdlib_module` shim; `BifOpen` admits; Safe held byte-identical to Phase-2. |
+| **P3-09** emit_core Unsafe + pipeline opt + CLI | [`09`](phase-3/09-emit-pipeline-opt.md) | unclaimed | `«IROPT»`, `«UNSAFE»`, `«METER»` | emit_core hot-body posture-agnostic; `instantiate/0` seeds fuel (MeterFuel) + host policy (documented exception); `ir_opt.optimize` wired at `binding.opt_level`; CLI `opt` verb + `--unsafe`; extended D3a security test. |
+| **P3-10** linker: `profiles.unsafe()` + coexistence | [`10`](phase-3/10-linker-unsafe-profile.md) | unclaimed | `«UNSAFE-PROFILE-FROZEN»` | `profiles.unsafe()` + `safe_metered(budget)` first-class; B3 coexistence proof (Safe+Unsafe of one source on one node, isolated); owns `profiles.gleam` only (instance.gleam is keystone's). |
+| **P3-11** capstone | [`11`](phase-3/11-capstone.md) | unclaimed | all above | Optimizer-soundness differential (OptNone/Baseline/Aggressive byte-identical) + Safe-vs-Unsafe (B3) differential + real-metering trap (tail spin + non-tail recurse under `safe_metered`) + coexistence proof + honest benchmark + refreshed conformance image. |
+
+### High-level spec coverage this phase takes
+
+| High-level item | Taken by | Notes |
+|---|---|---|
+| §4 M2 optimizer (`ir_opt`) | P3-02/03/04 | `baseline` (both modes) + `aggressive` (Unsafe-only); breadth bounded (no LICM/BCE/SIMD). |
+| §6 Unsafe mode | P3-06/07/08/09/10 | Aggressive opt + passthrough stdlib + widened BIF + no metering + host whitelist/open; B3 coexistence. |
+| §6 Safe-mode CPU resource bound | P3-05 | Enforcing fuel (FuelExhausted), fail-closed-armed; closes the CPU-time gap (memory was Phase-2). |
+| §4 R-std `passthrough` / R-bif `open` | P3-06 | Mechanism shipped (zero active routes; gcd in-house); passthrough behind `stdlib_module`. |
+| §4 R-host `whitelist`/`open` | P3-07 | Per-instance seeded; deny-all default preserved. |
+| §10 binding models B1/B3 | P3-10 | Phase-3 realizes **B3** (per-profile builds) + per-instance seeded policy; single-`.beam` B1 deferred. |
+
+### Deferred to Phase 4+ (explicit)
+
+**Phase 4** (trust-tier ladder & runs-anywhere): tier-P `threaded` state; tier-O/N `rt_mem`
+(`atomics`/`nif`); `rt_table` tiers; single-`.beam` runtime-dispatch B1. **Phase 5** (complete
+WASM engine): reference types; bulk memory; multi-memory; `memory64`; the WAT text parser;
+non-function imports + `spectest`. **Phase 6+**: the Porffor JS→WASM bridge; Arc/Gleam frontends;
+exception-handling / GC / stack-switching / component model. *(Also deferred within Phase 3: LICM,
+range-based bounds-check elimination, SIMD vectorization, pure-call CSE.)*
+
+---
+
 ## Change log
 
+- **Phase-3 plan authored + adversarially critiqued + reconciled.** Scope decision (EM):
+  **Phase 3 = "Fast" — the shared optimizer (`ir_opt`) + the Unsafe profile + real CPU metering**
+  (the speed/second-mode half of the high-level thesis), leaving the trust-tier ladder for Phase 4,
+  WASM-surface completion for Phase 5, and the Porffor JS bridge for Phase 6. Authored
+  `phase-3/00-overview.md` (decisions **F1–F8**) + 11 unit docs (`01`–`11`) via an 11-agent scoping
+  fan-out, then a 4-lens adversarial critique (+ a security re-run) refuted the drafts. The
+  critique caught **3 blockers** and several majors, all folded in via a 6-agent reconciliation
+  against a canonical decisions block:
+  - **Safe metering was never actually wired** (no unit owned emitting the fuel seed, and emit_core
+    was locked posture-agnostic) → **emit_core (09) owns the `instantiate/0` seeds** (`seed_fuel`
+    under `MeterFuel` + `seed_policy` always) as a documented exception; hot function bodies stay
+    posture-agnostic (F5 zero-overhead intact).
+  - **No fuel-budget channel** (the runaway-loop trap proof was unconstructible) → added
+    **`fuel_budget: Int` on `Binding`** (mirrors `safe_max_pages`) + **`profiles.safe_metered(budget)`**;
+    single channel, no fallback.
+  - **Import cycle** (`ir_opt` ↔ `aggressive`) → keystone hosts the `Pass` combinators in a **leaf
+    `middle/ir_opt/pass.gleam`** (imports `ir` only).
+  - **F4 corrected**: Safe/Unsafe are **different B3-monomorphized builds** (metering compiled
+    in/out; optimizer at build time) sharing identical `rt_*` names, + per-instance seeded runtime
+    policy — not "same code, swapped runtime" (that single-`.beam` B1 is Phase 4).
+  - **Fail-open metering closed** (D4): a `MeterFuel` artifact is bounded by default (always seeds;
+    run-ABI instantiates before invoke); unseeded-accumulate is an explicit legacy/test posture.
+  - **06/08-vs-09 passthrough contradiction resolved**: passthrough is a shim **behind
+    `stdlib_module`** so the emit target is invariant — preserving the D3a structural test *and* the
+    F5 differential permanently. **Honesty**: Phase-3 speed comes from the **optimizer alone**
+    (passthrough/widened-BIF ship as a zero-active-route mechanism); "faster than hand-written
+    Erlang" is a *measured* question (hand-written baseline is CRC-32-only). Termination measures
+    fixed (baseline μ=(n_loops,…); inlining on `B_remaining`); `Aggressive ⟹ MeterOff` coupling +
+    test added. The security lens verified D3a (no ambient authority) and per-instance isolation
+    **hold** under Unsafe. Plan is now internally consistent (seams grepped); implementation next,
+    keystone-first.
 - **Phase-2 plan authored + reconciled.** Grounded (5 topics) + adversarially critiqued (4
   lenses); the keystone decision (mutable state = tier-O **pdict `cell`**) was verified to
   preserve constant-space loops + preemption. Foundation docs (`phase-2/00-overview.md`,
