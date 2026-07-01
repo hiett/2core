@@ -237,7 +237,7 @@ runs-anywhere build) and the tier-O/N **memory & table backends** (`atomics` O(1
 | **P4-08** pipeline + CLI tier select | [`08`](phase-4/08-pipeline-cli-tier-select.md) | **done** | `«STATE»`,`«MEM-TIER»` | Run-ABI/CLI route EVERY binding→Instance through `link/1`; CLI flags (`--portable`/`--tier`/`--threaded`, default Safe/Cell/Paged fail-closed) run `resolve_tiers` so `--tier atomics` actually links atomics; threaded run-ABI threads the record across invokes. |
 | **P4-09** tier differential | [`09`](phase-4/09-tier-differential.md) | **done** | 02–08 | Every shipped `(state_strategy × mem_tier)` gives byte-identical corpus results + spec-expected; **constant-space-under-threaded** proof; **memory.grow trap-parity** across strategies (proves `t_grow` fuel); the runs-anywhere grep (0 native + 0 rt_state cell seam; fuel/host pdict exempt). |
 | **P4-10** benchmark revisit | [`10`](phase-4/10-benchmark-revisit.md) | **done** | 04, 08 | Honest re-measure of CRC-32/SHA-256/DEFLATE with tier-O `atomics` (capped so it engages) vs paged/hand-written/native; real numbers + methodology; `docs/phase-4-benchmark.md`. |
-| **P4-11** capstone | [`11`](phase-4/11-capstone.md) | unclaimed | all above | Full-matrix conformance `fail=0` for every shipped combination; the **runs-anywhere headline** (tier-P portable runs the suite on a bare BEAM, grep-verified + executed); refreshed image; honest statement of what shipped (atomics; the C NIF deferred). |
+| **P4-11** capstone | [`11`](phase-4/11-capstone.md) | **done** | all above | **PHASE 4 PROVEN.** Full-matrix conformance `fail=0` under every shipped `(state_strategy × mem_tier)` combo (15747/411/0 each); the **runs-anywhere headline** (tier-P `portable` grep-verified 0 native + 0 instance-cell seam AND executed byte-identical to the cell/paged oracle); tier differential (09) + benchmark (10) confirmed green; SVG refreshed to Phase-4 scope; honest close (atomics shipped; C NIF deferred). **906 tests (was 894), 0 warnings, format clean.** |
 
 ### High-level spec coverage this phase takes
 
@@ -261,6 +261,63 @@ single-`.beam` runtime-dispatch **B1**; tier-N numerics; a production C NIF for 
 
 ## Change log
 
+- **P4-11 landed (capstone) — PHASE 4 PROVEN.** The trust-tier ladder is real and the
+  runs-anywhere headline is concrete + true. Two capstone deliverables:
+  `test/twocore/conformance/conformance_test.gleam` (extended — the full-matrix run) and
+  `test/twocore/conformance/runs_anywhere_test.gleam` (new — the headline). Plus the refreshed
+  `docs/wasm-conformance.svg` (footnote → Phase-4 scope) and generator.
+  - **Proof 2 — full-matrix conformance (G2/G7).** The pinned spec suite is `fail == 0 && pass > 0`
+    under EVERY shipped `(state_strategy × mem_tier[× table_tier])` binding — `cell×paged`,
+    `threaded×paged`, `cell×atomics`, `threaded×atomics`, and the `cell×nif` skeleton — each
+    reporting the identical 15747 / 411 / 0 as the two Phase-3 profiles. Byte-identical because
+    WebAssembly is deterministic (D5 pins NaN payloads as raw bits). Each binding is built through
+    `combos.binding_for` (the unit-07 linker surface) with `safe_max_pages` widened to a dedicated
+    `matrix_cap_pages = 512`: the `combos.cap_pages` (16) sized for the small acceptance corpus is
+    too tight for the whole suite — `call`/`call_indirect`'s `as-memory.grow-value` grows a no-max
+    `(memory 1)` by **306 pages** and expects SUCCESS (old size 1), so 16 forced a spurious `-1` on
+    exactly 2 assertions. `512` sits in `[307, 4096]`: above every in-scope footprint (so no spec
+    result moves, conformance-neutral) and below the `atomics` reserve cap (so every atomics combo
+    links). (Deviation, justified — the tighter corpus cap was surfaced as insufficient for the full
+    suite; the fix is a local, documented conformance cap that leaves unit 09's `combos.cap_pages`
+    untouched.)
+  - **Proof 1 — the runs-anywhere HEADLINE (G1/G3/G6), grep-verified AND executed.** Over the REAL,
+    shipped `profiles.portable()` (not a test-capped variant): (a) **grep** — the emitted `.core` of
+    every state-heavy module (`mem`/`gvar`/`callind`/`memgrow`) links **zero**
+    `atomics`/`ets`/`persistent_term`/NIF and emits **zero** `rt_state` pdict instance-cell seam
+    (`'seed'`/`'mem_get'`/`'global_get'`/…), while genuinely routing state through the threaded
+    record (`'t_load'`/`'t_store'`/`'t_global_get'` present — non-vacuous); the node-safe tier-O
+    `rt_meter` fuel counter + `rt_host` policy cell are asserted PRESENT (the documented, exempt
+    pdict overlays Safe mandates — `MeterOff`-under-Safe is rejected). (b) **executed** — the whole
+    acceptance corpus runs through `load → instantiate → invoke` on a bare BEAM byte-identical to the
+    `cell`/`paged` oracle (`sum_to(100000)` and the memory/global/table programs included, so unit
+    09's constant-space-under-`threaded` property is re-confirmed in the real `portable`
+    composition).
+  - **Proofs 3/4/5 confirmed (not re-derived).** Unit 09's tier differential + constant-space +
+    memory.grow trap-parity suites and unit 10's `docs/phase-4-benchmark.md` (+`smoke/bench.sh`) are
+    green and committed; the fail-closed composition (`validate_binding(Safe+Nif) == SafeForbidsNif`,
+    uncapped `ceiling()` == `AtomicsCapRequired`, `portable()` == `Ok`) is exhaustively owned by unit
+    07's `profiles_test` — the capstone adds one end-to-end headline checkpoint over the two named
+    profiles rather than duplicating it. (Deviation, justified — the unit-doc §E example
+    `is_ok(validate_binding(ceiling()))` is superseded by the frozen unit-07 rule that an UNCAPPED
+    `ceiling()` fails closed `AtomicsCapRequired`; the capstone asserts the true frozen behaviour.)
+  - **Image + counts.** `docs/wasm-conformance.svg` regenerated — one-line footnote change ("Phase 4:
+    green under every shipped tier … conformance-neutral"); counts unchanged (15747 / 411 / 0, G7).
+  - **The honest close of Phase 4.** *Proved:* runs-anywhere — the tier-P `portable` build runs the
+    corpus + suite on a bare BEAM with **no native code and no crashable instance state**
+    (grep-verified + executed), byte-identical to the tier-O oracle; every shipped
+    `state_strategy × mem_tier` combination is spec-correct and conformance-neutral; constant-space
+    loops survive state threading (G4); tier-O `atomics` gives a **measured** O(1) memory win
+    (~2.3–2.9× over `paged`) with threading essentially free (unit 10). *Did NOT prove / deferred:* a
+    **production C NIF** — tier-N ships as an interface + Safe-forbidden status + node-safe skeleton
+    (the C impl is documented-deferred where a native toolchain is required, G8); 2core is **not yet
+    faster than hand-written Erlang** on every kernel — `atomics` closes most of the ~76× `paged` gap
+    but the residual is tier-P `bif` numerics + the state-seam call, reported as the measured number,
+    not asserted. Threads / shared memory stay a hard non-goal (`atomics` process-local); the
+    single-`.beam` runtime-dispatch **B1** stays deferred (`state_strategy`/`mem_tier` are
+    compile-time, B3). SIMD / reference types / bulk memory / multi-memory / `memory64` / the WAT
+    parser / non-function imports are **Phase 5**; the Porffor JS→WASM bridge is **Phase 6**.
+  - **906 tests (was 894), 0 warnings, `gleam format --check src test` clean, conformance `fail == 0`
+    under every shipped combination.**
 - **P4-03 landed (rt_state tier-P threaded surface).** `rt_state.gleam` gains its purely-
   functional tier-P surface (additive; the Phase-2 pdict cell surface untouched and parallel):
   `fresh(decl: StateDecl) -> InstanceState` (the threaded analogue of `seed` — returns the

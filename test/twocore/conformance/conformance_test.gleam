@@ -14,6 +14,25 @@
 //// generous enough that no in-scope program trips `FuelExhausted` (the runaway proof 4 uses a
 //// tiny `safe_metered` budget instead).
 ////
+//// ## Phase 4 — the full-matrix conformance proof (capstone P4-11 proof 2, G2/G7)
+////
+//// Phase 4 adds NO IR nodes and NO spec files either (G7), so the counts STILL do not move
+//// (15747 / 411 / 0). The Phase-4 proof is that the identical green holds under EVERY shipped
+//// `(state_strategy × mem_tier[× table_tier])` binding (`combos.shipped`) — not a subset:
+////   - `cell × paged`      — the Phase-2/3 tier-O/tier-P oracle posture, Safe;
+////   - `threaded × paged`  — tier-P instance state (== the `portable` core), Safe;
+////   - `cell × atomics`    — tier-O O(1) memory under the pdict calling convention, Safe;
+////   - `threaded × atomics`— tier-O O(1) memory under record-threading, Safe;
+////   - `cell × nif`        — the tier-N ceiling skeleton (Unsafe-only, delegates to paged).
+//// WebAssembly is deterministic (the only non-determinism is NaN payload bits, which D5 pins as
+//// raw patterns), so a correct `atomics` store and a correct `paged` store produce byte-identical
+//// memory images ⇒ identical `Outcome`s (spec §4.4 — every ill-defined op traps; no undefined
+//// behaviour to diverge on). A single tier/strategy regression on any allowlisted assertion (a
+//// mis-endianned `atomics` load, a threaded record dropped across a call, an `ets` table miss)
+//// goes red on that file. Each binding is built via `combos.binding_for` (D1 — the unit-07
+//// profile/linker surface, bounded `cap_pages` so an atomics combo links), then driven through the
+//// SAME `run_suite` gate. The two Phase-3 profiles stay as two more matrix points.
+////
 //// Tier-A needs NO engine at run time: the expected values are baked into the vendored `.wast`
 //// (now JSON). The committed curated fixture subset makes this run in a fresh checkout;
 //// `vendor/vendor.sh` regenerates the FULL allowlist (gitignored) for a wider local run — the
@@ -33,9 +52,24 @@ import twocore/conformance/driver
 import twocore/conformance/ffi
 import twocore/conformance/fixture
 import twocore/conformance/runner.{type Driver, type Report}
+import twocore/runtime/instance.{Binding}
 import twocore/runtime/profiles
+import twocore/tier/combos.{type Combo}
 
 const fixtures_dir = "test/twocore/conformance/fixtures"
+
+/// The Safe max-pages cap the full-matrix run bakes into EVERY combination. It must be (1) LARGE
+/// ENOUGH that no in-scope spec assertion is changed by the cap — the widest is `call`/
+/// `call_indirect`'s `as-memory.grow-value`, which grows a no-max `(memory 1)` by 306 pages and
+/// expects the grow to SUCCEED (old size `1`), so the cap must be ≥ 307 — and (2) SMALL ENOUGH that
+/// an `atomics` combo LINKS: `atomics` `fresh` pre-allocates to the effective max, so the cap must
+/// be ≤ `rt_mem_atomics.atomics_reserve_cap_pages` (4096) or `validate_binding` fail-closes the
+/// binding. `512` sits comfortably in `[307, 4096]`: above every in-scope memory footprint (so the
+/// counts stay 15747 / 411 / 0, conformance-neutral, G7) and below the atomics reserve cap (so
+/// every atomics combo reserves ≤ 512 pages and links). Unlike `combos.cap_pages` (16, sized for
+/// the small acceptance corpus), this is sized for the whole spec suite; it is applied here — over
+/// `combos.binding_for` — so unit 09's corpus differential keeps its own tighter cap unchanged.
+const matrix_cap_pages: Int = 512
 
 /// The spec suite under the fail-closed **Safe** profile (Baseline optimizer + enforcing fuel):
 /// `fail == 0 && pass > 0`. This is the Phase-1/2 green re-run through the Phase-3 full chain
@@ -56,6 +90,60 @@ pub fn spec_suite_unsafe_test() {
     driver.pipeline_with(profiles.unsafe()),
     "Unsafe (Aggressive optimizer + open runtime)",
   )
+}
+
+// ─────────────────────────── Phase-4: the full-matrix conformance run (proof 2, G2/G7) ───────────────────────────
+
+/// The pinned suite under the `cell × paged` baseline (the Phase-2/3 tier-O/tier-P oracle posture
+/// as a matrix point): `fail == 0 && pass > 0`. This is the `combos`-bound restatement of the Safe
+/// run above (bounded `cap_pages` so it shares one code path with the atomics combos); the two must
+/// report identical counts (conformance-neutral, G7).
+pub fn spec_suite_matrix_cell_paged_test() {
+  run_combo(combos.cell_paged)
+}
+
+/// The pinned suite under `threaded × paged` — tier-P instance state (the `portable` core): the
+/// purely-functional record threaded through generated code produces byte-identical spec results to
+/// `cell × paged` (`fail == 0 && pass > 0`). A threaded record dropped across a call would go red
+/// here on the exact file that reads state after the call.
+pub fn spec_suite_matrix_threaded_paged_test() {
+  run_combo(combos.threaded_paged)
+}
+
+/// The pinned suite under `cell × atomics` — tier-O O(1) linear memory under the pdict calling
+/// convention: `fail == 0 && pass > 0`. A mis-endianned or off-by-one `atomics` load/store would go
+/// red on `endianness`/`address`/`memory_trap`. `cap_pages` keeps the atomics reservation bounded
+/// while staying above every in-scope program's footprint (max 8 pages), so no spec result moves.
+pub fn spec_suite_matrix_cell_atomics_test() {
+  run_combo(combos.cell_atomics)
+}
+
+/// The pinned suite under `threaded × atomics` — the combination most likely to surface a threading
+/// bug (a mutable `atomics` ref threaded through the record under record-returning code): `fail == 0
+/// && pass > 0`, byte-identical to the paged oracle.
+pub fn spec_suite_matrix_threaded_atomics_test() {
+  run_combo(combos.threaded_atomics)
+}
+
+/// The pinned suite under `cell × nif` — the tier-N ceiling WHERE IT SHIPS (G8): a node-safe
+/// skeleton delegating to the paged core (the production C NIF is documented-deferred), Unsafe-only
+/// (G6). It LINKS and runs on a bare BEAM, so it must reach `fail == 0 && pass > 0` like the rest.
+/// If a real C NIF were built and loaded, the same run would exercise it unchanged.
+pub fn spec_suite_matrix_cell_nif_test() {
+  run_combo(combos.cell_nif)
+}
+
+/// Drive the whole pinned suite under one shipped matrix `Combo` and assert the `run_suite` gate
+/// (`fail == 0 && pass > 0`). The `Combo`'s coherent binding comes from `combos.binding_for` (the
+/// unit-07 linker surface — never re-spelling a `rt_mem_*` module name), with only `safe_max_pages`
+/// widened to `matrix_cap_pages` (a policy field `resolve_tiers` never rewrites, so the tier
+/// coupling stays coherent) so the whole spec suite fits — and `validate_binding` re-confirms the
+/// widened binding is still policy-legal (an `Atomics` combo stays within the reserve cap). Total.
+fn run_combo(c: Combo) -> Nil {
+  let binding =
+    Binding(..combos.binding_for(c), safe_max_pages: matrix_cap_pages)
+  let assert Ok(validated) = profiles.validate_binding(binding)
+  run_suite(driver.pipeline_with(validated), "Phase-4 matrix: " <> c.label)
 }
 
 /// Run every `*.json` fixture present through `d`, print a per-file + total report tagged with

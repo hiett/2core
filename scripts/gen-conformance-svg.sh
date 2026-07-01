@@ -77,8 +77,9 @@ function commas(x,   s, out) {
   }
   if (name == "TOTAL") { tP = p; tS = s; tF = f; next }
   sub(/\.json$/, "", name)
-  # The suite now runs under BOTH profiles (Safe + Unsafe), so each file report line appears
-  # twice with identical counts (conformance is profile-neutral, F7). Keep the first occurrence
+  # The suite now runs under every shipped Phase-4 tier combination (cell/threaded × paged/atomics,
+  # + the nif skeleton) AND both Phase-3 profiles, so each file report line appears once per run
+  # with identical counts (conformance is tier-/profile-neutral, G7/F7). Keep the first occurrence
   # per file so the chart shows each file once.
   if (name in seen) next
   seen[name] = 1
@@ -167,7 +168,7 @@ END {
   }
 
   # ---- footnotes ----
-  print "  <text x='24' y='" fn1Y "' font-size='9.5' fill='" muted "'>Phase 3: green under BOTH profiles (Safe + Unsafe, optimizer on) — conformance-neutral. Skipped = constructs beyond the slice (reference types, bulk memory, multi-memory, non-function imports, multi-value, extended-const, memory64, text-format asserts). " commas(tF) " failing.</text>"
+  print "  <text x='24' y='" fn1Y "' font-size='9.5' fill='" muted "'>Phase 4: green under every shipped tier (cell/threaded &#215; paged/atomics, plus the ets/atomics table tiers) — conformance-neutral. Skipped = constructs beyond the slice (reference types, bulk memory, multi-memory, non-function imports, multi-value, extended-const, memory64, text-format asserts). " commas(tF) " failing.</text>"
   print "  <text x='24' y='" fn2Y "' font-size='9' fill='" faint "'>Source: WebAssembly/testsuite @ " sha "  ·  wabt " wabt "  ·  " n " of " allow " allowlisted .wast files convertible at pin  ·  regenerate with scripts/gen-conformance-svg.sh</text>"
 
   print "</svg>"
