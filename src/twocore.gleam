@@ -79,6 +79,10 @@ pub fn run(args: List(String)) -> Result(String, String) {
     ["to-beam", input, output] | ["build", input, output] ->
       cmd_to_beam(input, output)
     ["run", path, export, ..arg_strs] -> cmd_run(path, export, arg_strs)
+    ["exec", "-n", n, path, export, ..arg_strs]
+    | ["exec", "--repeat", n, path, export, ..arg_strs] ->
+      cmd_exec(path, export, arg_strs, n)
+    ["exec", path, export, ..arg_strs] -> cmd_exec(path, export, arg_strs, "1")
     _ -> Error(usage())
   }
 }
@@ -192,7 +196,47 @@ fn cmd_run(
   }
 }
 
+/// `exec [-n COUNT] <in.beam> <export> <args…>` — load a PREBUILT `.beam` (no compile step)
+/// and invoke `export` on the BEAM `COUNT` times (default 1), timing only the invocations. For
+/// benchmarking the emitted code in isolation. Prints the (last) result value(s) then a timing
+/// line; a trap prints `trap: <reason>` (exit non-zero).
+fn cmd_exec(
+  path: String,
+  export: String,
+  arg_strs: List(String),
+  count_str: String,
+) -> Result(String, String) {
+  use beam <- result.try(read_bits(path))
+  use args <- result.try(parse_args(arg_strs))
+  use repeat <- result.try(parse_count(count_str))
+  case pipeline.exec_beam(beam, export, args, repeat) {
+    Error(e) -> Error(e)
+    Ok(#(_micros, pipeline.Trapped(reason))) -> Error("trap: " <> reason)
+    Ok(#(micros, pipeline.Returned(values))) ->
+      Ok(format_values(values) <> "\n" <> timing_line(repeat, micros))
+  }
+}
+
 // ─────────────────────────────── helpers ───────────────────────────────
+
+/// Render the `exec` benchmark timing: total microseconds and nanoseconds-per-call.
+fn timing_line(repeat: Int, micros: Int) -> String {
+  let ns_per = micros * 1000 / repeat
+  int.to_string(repeat)
+  <> " call(s) · "
+  <> int.to_string(micros)
+  <> " us total · "
+  <> int.to_string(ns_per)
+  <> " ns/call"
+}
+
+/// Parse the `exec -n` repeat count — a positive integer.
+fn parse_count(s: String) -> Result(Int, String) {
+  case int.parse(s) {
+    Ok(n) if n >= 1 -> Ok(n)
+    _ -> Error("-n expects a positive integer, got: " <> s)
+  }
+}
 
 /// Parse each `run` argument string as a decimal integer (a raw unsigned bit pattern).
 /// Returns `Error` naming the first non-integer token.
@@ -245,6 +289,7 @@ fn usage() -> String {
       "  gleam run -- to-core  <in.ir>                   ir_lower(Safe) + emit_core → .core",
       "  gleam run -- to-beam  <in.core> [out.beam]      compile → .beam (alias: build)",
       "  gleam run -- run      <in.wasm> <export> <args…>  compile + invoke on the BEAM",
+      "  gleam run -- exec     [-n N] <in.beam> <export> <args…>  invoke a prebuilt .beam (bench, no compile)",
       "",
       "Values are raw unsigned bit patterns in decimal (i32 -1 is 4294967295).",
     ],

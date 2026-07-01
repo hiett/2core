@@ -189,6 +189,43 @@ pub fn stop_instance(proc: InstanceProc) -> Nil {
   ffi_stop_instance(pid)
 }
 
+/// **Exec** a PREBUILT `.beam` (the run-ABI on an already-compiled module — NO compile step).
+/// Reads the module name baked into `beam`, loads + instantiates it in an owned process, then
+/// invokes `export(args)` `repeat` times in that process, timing ONLY the invocations
+/// (excludes compile, load, and instantiate — for benchmarking the emitted BEAM code).
+///
+/// - `beam`: a compiled `.beam` binary (e.g. from `to-beam`).
+/// - `export`/`args`: as `run` (raw bit-pattern integer args).
+/// - `repeat`: number of invocations (>= 1); the timing covers all of them.
+/// - Returns `Ok(#(micros, RunResult))` — `micros` is the total wall time for the calls,
+///   `RunResult` the LAST call's outcome. `Error(reason)` if the `.beam` is unreadable / won't
+///   load; an instantiation/runtime trap is `Ok(#(0, Trapped(reason)))`. Total — never panics.
+pub fn exec_beam(
+  beam: BitArray,
+  export: String,
+  args: List(Int),
+  repeat: Int,
+) -> Result(#(Int, RunResult), String) {
+  case ffi_module_name(beam) {
+    Error(reason) -> Error("not a .beam: " <> reason)
+    Ok(mod) ->
+      case instantiate(beam, mod) {
+        Error(reason) -> Ok(#(0, Trapped(reason)))
+        Ok(proc) -> {
+          let InstanceProc(pid) = proc
+          let out = case
+            ffi_bench_instance(pid, atom.create(export), args, repeat)
+          {
+            Ok(#(micros, value)) -> #(micros, Returned([value]))
+            Error(reason) -> #(0, Trapped(reason))
+          }
+          stop_instance(proc)
+          Ok(out)
+        }
+      }
+  }
+}
+
 /// Apply `module:function(args)` IN THE CALLING PROCESS, capturing a trap as `Error(text)`
 /// (the same-process catching-apply seam). See `src/twocore_cli_ffi.erl`.
 @external(erlang, "twocore_cli_ffi", "catch_apply")
@@ -215,6 +252,21 @@ fn ffi_call_instance(
 /// Ask an instance's owned process to exit (cell GC'd with it).
 @external(erlang, "twocore_cli_ffi", "stop_instance")
 fn ffi_stop_instance(proc: Pid) -> Nil
+
+/// Read the module name baked into a `.beam` binary (so a prebuilt `.beam` can be loaded even
+/// when its filename differs from its module name). `Ok(name)` / `Error(reason)`.
+@external(erlang, "twocore_cli_ffi", "module_name")
+fn ffi_module_name(beam: BitArray) -> Result(String, String)
+
+/// Invoke `function(args)` `repeat` times inside an instance's owned process, returning
+/// `Ok(#(total_micros, last_value))` / `Error(reason)`. Times only the invocations.
+@external(erlang, "twocore_cli_ffi", "bench_instance")
+fn ffi_bench_instance(
+  proc: Pid,
+  function: Atom,
+  args: List(Int),
+  repeat: Int,
+) -> Result(#(Int, Int), String)
 
 // ─────────────────────────────── composable stage drivers ───────────────────────────────
 

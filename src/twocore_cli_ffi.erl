@@ -10,7 +10,8 @@
 %% shim; that seam was not present and 04's file is single-owned (D1, must not be edited),
 %% so the seam is provided here instead. It touches no unit-owned source file.
 -module(twocore_cli_ffi).
--export([catch_apply/3, start_instance/1, call_instance/3, stop_instance/1]).
+-export([catch_apply/3, start_instance/1, call_instance/3, stop_instance/1,
+         module_name/1, bench_instance/4]).
 
 %% Apply Mod:Fun(Args) on the loaded generated module. On a normal return yield
 %% `{ok, V}` (a Gleam `Ok(Int)`) where V is the result rendered as an integer (the raw
@@ -72,6 +73,28 @@ call_instance(Pid, Fun, Args) ->
         {result, Ref, Result} -> Result
     end.
 
+%% Read the module name baked into a .beam binary (needed to load a prebuilt .beam whose
+%% filename need not match its module name). Returns {ok, BinaryName} | {error, Binary}.
+module_name(Bin) ->
+    try beam_lib:version(Bin) of
+        {ok, {Mod, _}} -> {ok, atom_to_binary(Mod, utf8)};
+        {error, beam_lib, R} ->
+            {error, unicode:characters_to_binary(io_lib:format("~0p", [R]))}
+    catch
+        _:_ -> {error, <<"not a .beam file">>}
+    end.
+
+%% Benchmark: run Fun(Args) N times INSIDE the instance's process (so the process-local
+%% memory/global cell is live) and time only the N calls. Returns {ok, {Micros, LastResult}}
+%% | {error, RenderedReason}. Micros is the wall time (microseconds) for all N invocations,
+%% excluding load/instantiate and the message round-trip (which happens once).
+bench_instance(Pid, Fun, Args, N) ->
+    Ref = make_ref(),
+    Pid ! {bench, Fun, Args, N, self(), Ref},
+    receive
+        {result, Ref, Result} -> Result
+    end.
+
 %% Ask the instance process to exit (its pdict cell is GC'd with it).
 stop_instance(Pid) ->
     Pid ! stop,
@@ -88,9 +111,26 @@ instance_loop(Module) ->
                 end,
             From ! {result, Ref, Result},
             instance_loop(Module);
+        {bench, Fun, Args, N, From, Ref} ->
+            Result =
+                try
+                    T0 = erlang:monotonic_time(microsecond),
+                    Last = bench_loop(Module, Fun, Args, N, undefined),
+                    T1 = erlang:monotonic_time(microsecond),
+                    {ok, {T1 - T0, Last}}
+                catch
+                    _Class:Reason -> {error, render_reason(Reason)}
+                end,
+            From ! {result, Ref, Result},
+            instance_loop(Module);
         stop ->
             ok
     end.
+
+bench_loop(_M, _F, _A, 0, Last) -> Last;
+bench_loop(M, F, A, N, _) ->
+    R = erlang:apply(M, F, A),
+    bench_loop(M, F, A, N - 1, R).
 
 render_reason(Reason) ->
     unicode:characters_to_binary(io_lib:format("~0p", [Reason])).
