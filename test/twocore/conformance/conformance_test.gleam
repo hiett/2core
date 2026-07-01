@@ -71,6 +71,21 @@ const fixtures_dir = "test/twocore/conformance/fixtures"
 /// `combos.binding_for` — so unit 09's corpus differential keeps its own tighter cap unchanged.
 const matrix_cap_pages: Int = 512
 
+/// Bulk pure-numeric spec files that are **tier-invariant by construction**: they exercise no
+/// memory / table / global / `call_indirect`, so under any `(state_strategy × mem_tier)` their
+/// functions are never state-reaching and emit byte-identical code to `cell × paged` (the
+/// threaded record threads through nothing; the memory tier is never linked). The FULL suite runs
+/// them once under each Phase-3 profile (`spec_suite_safe`/`unsafe`), which is where a numeric
+/// regression would surface. Re-running their ~13.5k assertions under all FIVE matrix combos
+/// proves nothing about the tier axis and exhausts the CI runner (OOM). So the matrix runs every
+/// OTHER file — memory / table / global / calls / control flow: everything the tier axis touches.
+const matrix_skip_numeric: List(String) = [
+  "const.json", "conversions.json", "f32.json", "f32_bitwise.json",
+  "f32_cmp.json", "f64.json", "f64_bitwise.json", "f64_cmp.json",
+  "float_exprs.json", "float_literals.json", "float_misc.json", "i32.json",
+  "i64.json", "int_exprs.json", "int_literals.json",
+]
+
 /// The spec suite under the fail-closed **Safe** profile (Baseline optimizer + enforcing fuel):
 /// `fail == 0 && pass > 0`. This is the Phase-1/2 green re-run through the Phase-3 full chain
 /// (`ir_lower → optimize → emit_core`), confirming the Baseline optimizer is conformance-neutral.
@@ -143,17 +158,30 @@ fn run_combo(c: Combo) -> Nil {
   let binding =
     Binding(..combos.binding_for(c), safe_max_pages: matrix_cap_pages)
   let assert Ok(validated) = profiles.validate_binding(binding)
-  run_suite(driver.pipeline_with(validated), "Phase-4 matrix: " <> c.label)
+  // Skip the tier-invariant bulk-numeric files (see `matrix_skip_numeric`) — they cannot
+  // differ across tiers and re-running them ×5 OOMs CI. The two full-profile runs cover them.
+  run_suite_keep(
+    driver.pipeline_with(validated),
+    "Phase-4 matrix: " <> c.label,
+    fn(name) { !list.contains(matrix_skip_numeric, name) },
+  )
 }
 
 /// Run every `*.json` fixture present through `d`, print a per-file + total report tagged with
 /// `label`, and assert zero genuine failures with at least one pass. Total — every command
 /// passes/fails/skips; the runner never panics.
 fn run_suite(d: Driver, label: String) -> Nil {
+  run_suite_keep(d, label, fn(_) { True })
+}
+
+/// Like `run_suite`, but runs only the fixtures for which `keep(name)` is `True` (the matrix
+/// combos skip the tier-invariant bulk-numeric files). Same zero-fail / non-vacuous gate.
+fn run_suite_keep(d: Driver, label: String, keep: fn(String) -> Bool) -> Nil {
   let jsons = case ffi.list_dir(fixtures_dir) {
     Ok(entries) ->
       entries
       |> list.filter(string.ends_with(_, ".json"))
+      |> list.filter(keep)
       |> list.sort(string.compare)
     Error(_) -> []
   }
