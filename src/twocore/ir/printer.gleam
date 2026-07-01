@@ -40,8 +40,8 @@ import twocore/ir.{
   Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue, Convert, ConvertS,
   ConvertU, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil, FCopysign, FDiv, FEq,
   FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe, FNearest, FNeg, FSqrt, FSub,
-  FTrunc, FW32, FW64, FuncType, Function, GlobalGet, GlobalSet, I32Extend16S,
-  I32Extend8S, I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S,
+  FTrunc, FW32, FW64, FuelExhausted, FuncType, Function, GlobalGet, GlobalSet,
+  I32Extend16S, I32Extend8S, I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S,
   I64ExtendI32S, I64ExtendI32U, IAdd, IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz,
   IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS,
   IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If,
@@ -605,6 +605,8 @@ fn trapreason_to_string(r: TrapReason) -> String {
     UndefinedElement -> "undefined_element"
     UninitializedElement -> "uninitialized_element"
     TableOutOfBounds -> "table_out_of_bounds"
+    // Runtime-only policy reason (F5); never emitted by lowering, but the match is exhaustive.
+    FuelExhausted -> "fuel_exhausted"
   }
 }
 

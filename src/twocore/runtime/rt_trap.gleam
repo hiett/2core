@@ -24,8 +24,8 @@
 //// distinguish a *WASM trap* from any incidental BEAM error.
 
 import twocore/ir.{
-  type TrapReason, IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
-  InvalidConversionToInteger, MemoryOutOfBounds, TableOutOfBounds,
+  type TrapReason, FuelExhausted, IndirectCallTypeMismatch, IntDivByZero,
+  IntOverflow, InvalidConversionToInteger, MemoryOutOfBounds, TableOutOfBounds,
   UndefinedElement, UninitializedElement, Unreachable,
 }
 
@@ -79,5 +79,10 @@ pub fn spec_trap_message(reason: TrapReason) -> String {
     UndefinedElement -> "undefined element"
     UninitializedElement -> "uninitialized element"
     TableOutOfBounds -> "out of bounds table access"
+    // POLICY message (F5), present only for our own audit/diagnostics — NOT a WASM spec
+    // trap. Deliberately DISTINCT from every WASM spec trap-message substring, including the
+    // spec's "call stack exhausted" (`assert_exhaustion`), so the conformance harness can
+    // never mis-map a real WASM trap to it or vice versa.
+    FuelExhausted -> "fuel exhausted"
   }
 }

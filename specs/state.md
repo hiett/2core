@@ -161,15 +161,15 @@ runtime-dispatch B1 is **Phase 4**.
 
 | Milestone | Produced by | Status | Unblocks |
 |---|---|---|---|
-| `«IROPT-IFACE-FROZEN»` — `middle/ir_opt.gleam` (`OptLevel`, `optimize/2`) + `middle/ir_opt/pass.gleam` (leaf `Pass` combinators, imports `ir` only → no cycle) + `ir/effect.gleam` signatures | P3-01 | planned | 02, 03, 04, 09 |
-| `«UNSAFE-PROFILE-FROZEN»` — `Binding` policy fields (`opt_level`/`meter`/`bif_gate`/`stdlib`/`host_policy`/`fuel_budget`) + 5 policy enums + `profiles.unsafe()` green + the `Aggressive ⟹ MeterOff` coupling test | P3-01 | planned | 06, 07, 08, 09, 10 |
-| `«METER-ENFORCE-FROZEN»` — `FuelExhausted` TrapReason (+`spec_trap_message`) + `rt_meter.seed_fuel/1` + enforcing `charge/1` (ABI unchanged) | P3-01 | planned | 05, 09, 11 |
+| `«IROPT-IFACE-FROZEN»` — `middle/ir_opt.gleam` (`OptLevel`, `optimize/2`) + `middle/ir_opt/pass.gleam` (leaf `Pass` combinators, imports `ir` only → no cycle) + `ir/effect.gleam` signatures | P3-01 | **FROZEN ✓** | 02, 03, 04, 09 |
+| `«UNSAFE-PROFILE-FROZEN»` — `Binding` policy fields (`opt_level`/`meter`/`bif_gate`/`stdlib`/`host_policy`/`fuel_budget`) + 5 policy enums + `profiles.unsafe()` green + the `Aggressive ⟹ MeterOff` coupling test | P3-01 | **FROZEN ✓** | 06, 07, 08, 09, 10 |
+| `«METER-ENFORCE-FROZEN»` — `FuelExhausted` TrapReason (+`spec_trap_message`) + `rt_meter.seed_fuel/1` + enforcing `charge/1` (ABI unchanged) | P3-01 | **FROZEN ✓** | 05, 09, 11 |
 
 ### Phase-3 units (specs authored + critiqued + reconciled; implementation `unclaimed`)
 
 | Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
 |---|---|---|---|---|
-| **P3-01** Interface freeze (keystone) | [`01`](phase-3/01-interface-freeze.md) | unclaimed | — | `ir_opt`/`pass`/`effect` sigs + `Binding` policy ext (incl. `fuel_budget`) + `profiles.unsafe()` + `FuelExhausted`/`seed_fuel` frozen; leaf `pass.gleam` (no import cycle); `Aggressive⟹MeterOff` coupling; 509 tests stay green, zero warnings. |
+| **P3-01** Interface freeze (keystone) | [`01`](phase-3/01-interface-freeze.md) | **done** | — | `ir_opt`/`pass`/`effect` sigs + `Binding` policy ext (incl. `fuel_budget`) + `profiles.unsafe()` + `FuelExhausted`/`seed_fuel` frozen; leaf `pass.gleam` (no import cycle); `Aggressive⟹MeterOff` coupling. **Landed GREEN: 525 tests (was 509), 0 warnings, conformance fail=0.** Reaches: `ir.TrapReason`+`FuelExhausted`; `rt_trap.spec_trap_message`; printer/parser/emit_core exhaustive `TrapReason` arms; `instance.safe_default` Safe posture; `rt_meter.default_fuel_budget`+`seed_fuel/1`; `rt_host.seed_policy/1` stub. Freeze bodies conservative-sound (effect→Effectful/False/True/False; empty pipeline = identity), never `todo`. |
 | **P3-02** IR effect & purity analysis | [`02`](phase-3/02-effect-analysis.md) | unclaimed | `«IROPT-IFACE-FROZEN»` | `ir/effect.gleam` conservative classifier (trapping Num/Convert + Trap are barriers); the soundness foundation 03/04 rest on; adversarial "must-not" fixtures. |
 | **P3-03** `ir_opt` baseline passes | [`03`](phase-3/03-ir-opt-baseline.md) | unclaimed | `«IROPT»`, 02 | 7 trust-neutral passes (const-fold bit-exact via `rt_num`, copy/const-prop, dead-let, DCE, algebraic, block/label, const-`if`); μ=(n_loops,n_ops,n_nodes,n_vars) fixpoint; runs in both modes. |
 | **P3-04** `ir_opt` aggressive passes | [`04`](phase-3/04-ir-opt-aggressive.md) | unclaimed | `«IROPT»`, 03 | Unsafe-only inlining (B_remaining termination) + charge-elision; each documents its trust assumption; sound only under `Aggressive⟹MeterOff`. |

@@ -16,13 +16,29 @@
 //// can assert `fuel_consumed()` equals the summed cost, proving the charge path executed.
 //// A strict-tier-P no-op is the alternative but cannot be observed.
 ////
-//// ## What is *not* here (Phase 2, D9)
+//// ## Phase-3 enforcing metering (F5) — the freeze seam
 ////
-//// No budget, no trap-on-exhaustion, no per-op accounting. `charge` only ever increments
-//// a counter and returns `Nil`. The counter is per-process and unbounded.
+//// Phase 3 turns CPU fuel into a real bound. This freeze (unit 01) adds the `seed_fuel/1`
+//// seam and the `default_fuel_budget` constant (the finite Safe seed), and documents the
+//// enforcing contract on `charge`; the enforcement itself (budget check + `FuelExhausted`
+//// raise) lands in unit 05, and the ABI `charge/1` codegen calls is UNCHANGED (arity 1,
+//// returns `Nil`), so no generated code changes when metering becomes enforcing. The budget
+//// is process-dictionary state (like the Phase-2 cell), seeded once at instantiation and
+//// read/written only by `charge` — never threaded through generated function signatures — so
+//// a tail-iterating loop stays constant-space and preemptible.
 
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
+
+/// The finite default CPU-fuel budget a Safe profile seeds (F5) — the SINGLE source of the
+/// budget magnitude. `instance.safe_default()` reads this into `binding.fuel_budget`, and
+/// `emit_core`'s `instantiate/0` bakes `seed_fuel(binding.fuel_budget)` under `MeterFuel`.
+///
+/// It is FINITE (so no metered artifact runs unbounded — fail-closed, D4) yet large enough
+/// that the acceptance corpus + spec suite complete without tripping it. Unit 05 tunes the
+/// magnitude against the real suite; a metered profile (`profiles.safe_metered(budget)`,
+/// unit 10) may LOWER it, exactly as `safe_max_pages` bounds memory.
+pub const default_fuel_budget: Int = 1_000_000_000
 
 /// `erlang:put/2` — store `value` under `key` in the current process dictionary; returns
 /// the previous value (or the atom `undefined` if unset), which callers here discard.
@@ -36,22 +52,56 @@ fn erlang_put(key: k, value: v) -> Dynamic
 @external(erlang, "erlang", "get")
 fn erlang_get(key: k) -> Dynamic
 
-/// The process-dictionary key holding this process's running fuel total. As a 0-field
-/// Gleam constructor it compiles to the unique, namespace-hygienic atom
-/// `twocore_rt_meter_fuel`, so it cannot clash with another library's pdict keys.
+/// The process-dictionary keys `rt_meter` uses. Each 0-field Gleam constructor compiles to a
+/// unique, namespace-hygienic atom, so neither can clash with another library's pdict keys.
+///
+/// - `TwocoreRtMeterFuel` (`twocore_rt_meter_fuel`): the running fuel total charged so far.
+/// - `TwocoreRtMeterBudget` (`twocore_rt_meter_budget`): the seeded CPU budget (`seed_fuel`),
+///   the finite bound `charge` will enforce against (unit 05).
 type MeterKey {
   TwocoreRtMeterFuel
+  TwocoreRtMeterBudget
+}
+
+/// Seed this instance's CPU-fuel BUDGET (F5), then reset the consumed total to 0.
+///
+/// Called once by the generated `instantiate/0` (synthesized by `emit_core`, unit 09), which
+/// — as a documented exception to emit_core's posture-agnosticism — emits
+/// `seed_fuel(binding.fuel_budget)` as `instantiate/0`'s FIRST effect under `MeterFuel`. It
+/// runs inside the instance's OWNED process, so the budget lives in that process's dictionary
+/// alongside the Phase-2 cell (one-instance-one-process, E1) — isolated per instance and GC'd
+/// with the process.
+///
+/// - `budget`: the finite reduction-style fuel bound — `instantiate/0` passes
+///   `binding.fuel_budget` (which `safe_default()` seeds from `default_fuel_budget`). The
+///   numeric bound is a seed value on the `Binding`, NOT a field of `MeterMode`.
+/// - Return: always `Nil`. Total; never raises.
+/// - Effect: stores `budget` in the per-process budget cell and zeroes the consumed counter.
+///
+/// FREEZE body: store the budget + reset consumed (real, trivial). Unit 05 makes `charge`
+/// enforce this budget (budget check + `FuelExhausted` raise).
+pub fn seed_fuel(budget: Int) -> Nil {
+  let _ = erlang_put(TwocoreRtMeterBudget, budget)
+  reset_fuel()
 }
 
 /// Charge `cost` fuel against the current process's running total, then return `Nil`.
 ///
 /// - `cost`: a non-negative reduction-style estimate of the work about to run. (Negative
-///   values are added as-is; the contract assumes `cost >= 0` and Phase-1 codegen only
-///   ever passes non-negative costs.)
+///   values are added as-is; the contract assumes `cost >= 0` and codegen only ever passes
+///   non-negative costs.)
 /// - Return: always `Nil` — the emitter discards it and proceeds to evaluate the charged
-///   expression. Total; never raises.
+///   expression. At the freeze, total; never raises.
 /// - Effect: increments the process-local counter by `cost` (read-add-write into the
 ///   process dictionary). Process-local, so concurrent processes meter independently.
+///
+/// ENFORCING CONTRACT (unit 05): advance the consumed total by `cost`; if a budget was
+/// seeded and the total exceeds it, **raise `FuelExhausted`** (via `rt_trap.raise`, surfacing
+/// as `{wasm_trap, fuel_exhausted}`). Fail-closed (D4): a `MeterFuel` artifact must never run
+/// silently unbounded — its `instantiate/0` ALWAYS seeds the budget and the run-ABI
+/// instantiates before every invoke, so the production CPU bound is always armed. The ABI is
+/// UNCHANGED (arity 1, returns `Nil`), so no generated code changes when enforcement lands.
+/// FREEZE body: the existing accumulate-only body (kept green); unit 05 adds the check + raise.
 pub fn charge(cost: Int) -> Nil {
   let _ = erlang_put(TwocoreRtMeterFuel, fuel_consumed() + cost)
   Nil

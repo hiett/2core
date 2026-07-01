@@ -591,6 +591,13 @@ pub type MemAccess {
 /// - `UndefinedElement`: a `CallIndirect` whose table index is out of bounds (runtime).
 /// - `UninitializedElement`: a `CallIndirect` to a null / unfilled table slot.
 /// - `TableOutOfBounds`: an active ELEMENT segment is out of bounds at instantiation.
+/// - `FuelExhausted`: the 2core CPU-fuel resource bound was exhausted (Phase-3, F5). This is
+///   OUR policy trap, NOT a WebAssembly spec trap — no `.wasm` operation raises it and no
+///   `assert_trap` expects it. It is a **runtime** reason raised only by `rt_meter.charge`
+///   when a seeded budget is spent, and is **never emitted as an IR `Trap` node** (no lowering
+///   produces `Trap(FuelExhausted)`); it lives in `TrapReason` only so it rides the existing
+///   catchable `{wasm_trap, Kind}` channel and surfaces through the run-ABI as an ordinary
+///   `Trapped(reason)`.
 pub type TrapReason {
   IntDivByZero
   IntOverflow
@@ -601,4 +608,5 @@ pub type TrapReason {
   UndefinedElement
   UninitializedElement
   TableOutOfBounds
+  FuelExhausted
 }

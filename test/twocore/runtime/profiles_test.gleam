@@ -2,7 +2,12 @@
 //// profile is Safe, it carries exactly the vetted `twocore@runtime@rt_*` modules, and there
 //// is no API here that yields an unsafe posture.
 
-import twocore/runtime/instance.{Safe}
+import gleam/list
+import twocore/middle/ir_opt.{Aggressive, Baseline}
+import twocore/runtime/instance.{
+  BifAllowlist, BifOpen, HostDenyAll, HostOpen, MeterFuel, MeterOff, Safe,
+  StdlibOwn, StdlibPassthrough, Unsafe,
+}
 import twocore/runtime/profiles
 
 /// The Safe profile is in `Safe` mode — the fail-closed posture (D9).
@@ -77,4 +82,60 @@ pub fn safe_capped_cannot_lift_cap_test() {
   // Every capped Binding remains Safe (fail-closed) and otherwise identical to `safe()`.
   assert profiles.safe_capped(1).mode == Safe
   assert profiles.safe_capped(1).num_module == profiles.safe().num_module
+}
+
+// ───────────────────────────── Phase-3 fail-closed opt-in (F4/§B.4) ─────────────────────────────
+
+/// Every Safe-family constructor (`safe`, `safe_capped`, `safe_default`, `safe_instance`) is
+/// the FULL fail-closed Safe posture across the Phase-3 policy fields (D4/D9): mode `Safe`,
+/// `Baseline` optimizer, `MeterFuel`, `BifAllowlist`, `StdlibOwn`, `HostDenyAll`. There is no
+/// path to an Unsafe field by omission.
+pub fn safe_family_is_full_safe_posture_test() {
+  let bindings = [
+    profiles.safe(),
+    profiles.safe_capped(3),
+    instance.safe_default(),
+    profiles.safe_instance().binding,
+  ]
+  list.each(bindings, fn(b) {
+    assert b.mode == Safe
+    assert b.opt_level == Baseline
+    assert b.meter == MeterFuel
+    assert b.bif_gate == BifAllowlist
+    assert b.stdlib == StdlibOwn
+    assert b.host_policy == HostDenyAll
+  })
+}
+
+/// `unsafe()` is the ONLY constructor that yields `mode: Unsafe`, and it is the full aggressive
+/// posture (`Aggressive`/`MeterOff`/`BifOpen`/`StdlibPassthrough`/`HostOpen`). Unsafe-by-
+/// accident is impossible — it is an explicit, tested opt-in (F4).
+pub fn unsafe_is_the_only_unsafe_opt_in_test() {
+  // The Safe family is never Unsafe.
+  assert profiles.safe().mode != Unsafe
+  assert profiles.safe_capped(3).mode != Unsafe
+  assert profiles.safe_instance().binding.mode != Unsafe
+  // `unsafe()` is Unsafe with the full aggressive posture.
+  let u = profiles.unsafe()
+  assert u.mode == Unsafe
+  assert u.opt_level == Aggressive
+  assert u.meter == MeterOff
+  assert u.bif_gate == BifOpen
+  assert u.stdlib == StdlibPassthrough
+  assert u.host_policy == HostOpen
+}
+
+/// The `Aggressive ⟹ MeterOff` coupling (§B.5): no shipped constructor pairs `Aggressive`
+/// with `MeterFuel` — the illegal pairing is unrepresentable in a profile.
+pub fn no_constructor_pairs_aggressive_with_meter_fuel_test() {
+  let shipped = [
+    profiles.safe(),
+    profiles.safe_capped(3),
+    instance.safe_default(),
+    profiles.safe_instance().binding,
+    profiles.unsafe(),
+  ]
+  list.each(shipped, fn(b) {
+    assert !{ b.opt_level == Aggressive && b.meter == MeterFuel }
+  })
 }

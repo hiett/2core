@@ -353,7 +353,10 @@ fn all_convops() -> List(ir.ConvOp) {
   ]
 }
 
-/// Every `TrapReason` constructor (Phase-1 five + the four Phase-2 additions, `«IR2-FROZEN»`).
+/// Every `TrapReason` constructor (Phase-1 five + the four Phase-2 additions, `«IR2-FROZEN»`,
+/// + the Phase-3 runtime-only `FuelExhausted`). Including `FuelExhausted` here proves the new
+/// printer/parser arms round-trip; a real lowering never emits `Trap(FuelExhausted)`, but the
+/// printer/parser handle every `TrapReason` exhaustively.
 fn all_trapreasons() -> List(ir.TrapReason) {
   [
     ir.IntDivByZero,
@@ -365,6 +368,7 @@ fn all_trapreasons() -> List(ir.TrapReason) {
     ir.UndefinedElement,
     ir.UninitializedElement,
     ir.TableOutOfBounds,
+    ir.FuelExhausted,
   ]
 }
 

@@ -488,6 +488,8 @@ pub fn trap_reason_atom_golden_test() {
     == "indirect_call_type_mismatch"
   assert emit_core.trap_reason_atom(ir.MemoryOutOfBounds)
     == "memory_out_of_bounds"
+  // Phase-3 runtime-only policy reason (F5): its atom is `fuel_exhausted`.
+  assert emit_core.trap_reason_atom(ir.FuelExhausted) == "fuel_exhausted"
 }
 
 // ───────────────────────────── NumOp → rt_num name table (tied to rt_num) ─────────────────────────────

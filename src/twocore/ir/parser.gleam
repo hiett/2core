@@ -47,19 +47,19 @@ import twocore/ir.{
   ConstI32, ConstI64, Continue, Convert, ConvertS, ConvertU, DataSegment,
   ElementSegment, ExportFn, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil,
   FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe,
-  FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64, FuncType, Function,
-  GlobalDecl, GlobalGet, GlobalSet, I32Extend16S, I32Extend8S, I32WrapI64,
-  I64Extend16S, I64Extend32S, I64Extend8S, I64ExtendI32S, I64ExtendI32U, IAdd,
-  IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU,
-  ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS,
-  IShrU, ISub, IXor, If, ImportFn, IndirectCallTypeMismatch, IntDivByZero,
-  IntOverflow, InvalidConversionToInteger, Let, Local, Loop, LoopParam, MakeCons,
-  MakeTuple, MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryDecl,
-  MemoryOutOfBounds, Module, Num, ReinterpretFToI, ReinterpretIToF, Return,
-  Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableDecl, TableOutOfBounds,
-  TermOp, Trap, TruncS, TruncSatS, TruncSatU, TruncU, TupleGet, UnboxFloat,
-  UnboxInt, UndefinedElement, UninitializedElement, Unreachable, Values, Var,
-  W32, W64,
+  FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64, FuelExhausted, FuncType,
+  Function, GlobalDecl, GlobalGet, GlobalSet, I32Extend16S, I32Extend8S,
+  I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S, I64ExtendI32S,
+  I64ExtendI32U, IAdd, IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU,
+  IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS, IRemU,
+  IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If, ImportFn,
+  IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
+  InvalidConversionToInteger, Let, Local, Loop, LoopParam, MakeCons, MakeTuple,
+  MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryDecl, MemoryOutOfBounds,
+  Module, Num, ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32,
+  TF64, TI32, TI64, TTerm, TableDecl, TableOutOfBounds, TermOp, Trap, TruncS,
+  TruncSatS, TruncSatU, TruncU, TupleGet, UnboxFloat, UnboxInt, UndefinedElement,
+  UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
 
 // ───────────────────────────── error type (D4 — this stage's own) ────────────────
@@ -1476,6 +1476,7 @@ fn string_to_trapreason(w: String) -> Result(TrapReason, Nil) {
     "undefined_element" -> Ok(UndefinedElement)
     "uninitialized_element" -> Ok(UninitializedElement)
     "table_out_of_bounds" -> Ok(TableOutOfBounds)
+    "fuel_exhausted" -> Ok(FuelExhausted)
     _ -> Error(Nil)
   }
 }

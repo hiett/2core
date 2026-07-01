@@ -22,6 +22,16 @@
 //// echoing which capability/name was rejected so the harness can confirm the denial
 //// identifies what was denied. Error class (not `throw`/`exit`) so it is catchable the
 //// same way traps are.
+////
+//// ## Phase-3 per-instance host policy (F4) — the freeze seam
+////
+//// The instance's `HostPolicy` (deny-all / whitelist / open) is **seeded at instantiation**:
+//// `emit_core`'s `instantiate/0` always emits `rt_host:seed_policy(binding.host_policy)`, so
+//// the policy lives in the instance's owned process alongside the fuel budget. This freeze
+//// (unit 01) lands the `seed_policy/1` seam (a no-op stub) so unit 09's `instantiate/0` seed
+//// emission can bind in parallel; unit 07 fills the real store + whitelist/open dispatch.
+
+import twocore/runtime/instance.{type HostPolicy}
 
 /// `erlang:error/1` — raises an error-class exception with the given reason and never
 /// returns (catchable via `try … catch error:Reason`). Direct BIF reference (tier-P;
@@ -48,4 +58,21 @@ type Tag {
 /// - Failure mode: *always* raises. This is the fail-closed contract, not an error path.
 pub fn call_host(capability: String, name: String, _args: List(x)) -> a {
   erlang_error(#(CapabilityDenied, capability, name))
+}
+
+/// Seed this instance's host/capability policy (F4) — the per-instance dispatch posture
+/// (`HostDenyAll` / `HostWhitelist` / `HostOpen`) `call_host` will consult.
+///
+/// Called once by the generated `instantiate/0` (`emit_core`, unit 09), which ALWAYS emits
+/// `rt_host:seed_policy(binding.host_policy)`, inside the instance's owned process — so the
+/// policy is per-instance state alongside the fuel budget, GC'd with the process.
+///
+/// - `_policy`: the instance's `HostPolicy`. Ignored at the freeze (the deny-all `call_host`
+///   above needs no seeded state); unit 07 stores it and dispatches whitelist/open against it.
+/// - Return: always `Nil`. Total; never raises.
+///
+/// FREEZE body: a no-op stub (deny-all is fail-closed without any seeded state). Unit 07 fills
+/// the real store + whitelist/open dispatch.
+pub fn seed_policy(_policy: HostPolicy) -> Nil {
+  Nil
 }

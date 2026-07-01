@@ -1,8 +1,9 @@
 //// Unit 11b — named runtime **profiles** + the thin `rt_instance` linker (high-level
-//// §6/§13). Phase 1 ships exactly ONE profile, **Safe**, and it is fail-closed: there is
-//// no constructor in this file that yields an `Unsafe` binding or relaxes the host/BIF
-//// posture (the Unsafe profile — aggressive optimizer, passthrough stdlib, open BIFs — is
-//// Phase 2, D9).
+//// §6/§13). The **Safe** profile is the fail-closed default; Phase 3 adds the **Unsafe**
+//// profile (`unsafe()`) as an EXPLICIT, TESTED opt-in (F4). There is no path to an Unsafe
+//// posture by omission (D4/D9): `safe()`/`safe_capped()`/`safe_default()`/`safe_instance()`
+//// all stay Safe, and only `unsafe()` yields `mode: Unsafe` (the aggressive optimizer, no
+//// metering, open BIF gate, passthrough stdlib, open host).
 ////
 //// A *profile* is a build-time `Binding` (the calling convention, `runtime/instance.gleam`)
 //// carrying the vetted `twocore@runtime@rt_*` impl module names. A *linker* assembles a
@@ -24,8 +25,10 @@
 //// claim a full sandbox — it wires and exercises the Safe-mode seams end-to-end.
 
 import gleam/int
+import twocore/middle/ir_opt.{Aggressive}
 import twocore/runtime/instance.{
-  type Binding, type Mode, Binding, Safe, safe_default,
+  type Binding, type Mode, BifOpen, Binding, HostOpen, MeterOff, Safe,
+  StdlibPassthrough, Unsafe, safe_default,
 }
 
 /// The Safe-profile **hard cap** on linear-memory pages (E3) — the single source of the
@@ -66,6 +69,32 @@ pub fn safe() -> Binding {
 pub fn safe_capped(max_pages: Int) -> Binding {
   let capped = int.max(0, int.min(max_pages, safe_max_pages()))
   Binding(..safe_default(), safe_max_pages: capped)
+}
+
+/// The named **Unsafe** profile (F4): the aggressive optimizer + no metering + open BIF gate +
+/// passthrough stdlib + open host, keeping the vetted `twocore@runtime@rt_*` module names.
+///
+/// It is an EXPLICIT, TESTED opt-in — there is no path to an Unsafe posture by omission
+/// (D4/D9): the default (`safe()`/`safe_default()`/`safe_capped`) stays Safe, and only this
+/// constructor yields `mode: Unsafe`. The `Aggressive` optimizer is paired with `MeterOff` as
+/// required by the `Aggressive ⟹ MeterOff` coupling (only `Baseline`/`OptNone` may pair with
+/// `MeterFuel`), so the Unsafe-only passes (unit 04) run over a provably metering-free module.
+///
+/// `fuel_budget` is left **inherited** from `safe_default()` (the spread carries it) — harmless
+/// under `MeterOff`, which inserts no `Charge` and emits no `seed_fuel`. Safe and Unsafe are
+/// **different builds** (B3 monomorphization): the posture fields drive different build-time
+/// codegen, so the emitted OUTPUT module differs while the shared runtime module atoms are the
+/// same. Total — never fails.
+pub fn unsafe() -> Binding {
+  Binding(
+    ..safe_default(),
+    mode: Unsafe,
+    opt_level: Aggressive,
+    meter: MeterOff,
+    bif_gate: BifOpen,
+    stdlib: StdlibPassthrough,
+    host_policy: HostOpen,
+  )
 }
 
 /// A runnable instance assembled by the linker (`rt_instance`, high-level §13).
