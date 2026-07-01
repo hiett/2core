@@ -49,19 +49,38 @@ gc_and_memory(Pid) ->
 
 %% Spawn the instance process and run instantiate/0 in it, blocking until the
 %% process reports whether instantiation succeeded or trapped.
+%%
+%% Strategy-aware (unit P4-08 §C.2 / unit P4-09), mirroring the CLI shim
+%% `twocore_cli_ffi`: the state strategy is self-detected from `instantiate/0`'s
+%% RETURN value, so the conformance driver drives BOTH calling conventions with no
+%% per-strategy code in Gleam and no `Binding` parameter on the run-ABI. The atom
+%% `'ok'` → the `Cell` loop (state in the pdict cell); the `{instance_state,_,_,_}`
+%% record → the `Threaded` loop carrying that record as a value (the tier-P
+%% runs-anywhere build, no pdict instance cell). Any other shape is a fail-closed
+%% error (never assumed Cell). The `Cell` path is byte-identical to the previous
+%% Cell-only shim, so the Phase-1/2/3 corpus + spec suite are unaffected; the
+%% `Threaded` branch is purely additive (unit P4-09 is the first to drive the whole
+%% corpus under `Threaded` through this driver, and unit 11 reuses it).
 start_instance(Module) ->
     Parent = self(),
     Pid = spawn(fun() ->
         Outcome =
             try Module:instantiate() of
-                _ -> ok
+                Ret -> {ok, Ret}
             catch
                 _Class:Reason -> {error, render_reason(Reason)}
             end,
         case Outcome of
-            ok ->
+            {ok, ok} ->
                 Parent ! {started, self(), ok},
                 instance_loop(Module);
+            {ok, {instance_state, _, _, _} = St} ->
+                Parent ! {started, self(), ok},
+                threaded_loop(Module, St);
+            {ok, Other} ->
+                Parent ! {started, self(),
+                    {error, unicode:characters_to_binary(io_lib:format(
+                        "unexpected instantiate/0 return: ~0p", [Other]))}};
             {error, _} = Err ->
                 Parent ! {started, self(), Err}
         end
@@ -85,8 +104,9 @@ stop_instance(Pid) ->
     Pid ! stop,
     nil.
 
-%% The instance process's receive loop: it owns the seeded cell and runs every
-%% invoke in-process so each one reads ITS state.
+%% The `Cell` instance process's receive loop: it owns the seeded pdict cell and
+%% runs every invoke in-process so each one reads ITS state (arity-stable
+%% `Module:Fun(Args)`).
 instance_loop(Module) ->
     receive
         {invoke, Fun, Args, From, Ref} ->
@@ -98,6 +118,36 @@ instance_loop(Module) ->
                 end,
             From ! {result, Ref, Result},
             instance_loop(Module);
+        stop ->
+            ok
+    end.
+
+%% The `Threaded` instance loop (unit P4-08 §C / unit P4-09), mirroring the CLI shim
+%% `twocore_cli_ffi:threaded_loop/2`. Holds the purely-functional `InstanceState`
+%% record `St` as a loop variable — no pdict instance cell. Every export presents the
+%% uniform threaded ABI `Module:Fun(St, Args…) -> {Package, St'}`: apply with `St`
+%% LEADING, extract the `{Package, St'}` pair, reply with `Package` (the SAME value
+%% shape the Cell loop returns, so the Gleam driver reads both identically), and
+%% RECURSE carrying `St'` — so cross-invoke state persists as a value. A trap /
+%% capability-denial replies `{error, Reason}` and recurses with the UNCHANGED `St`
+%% (trap-before-write — the failed op mutated nothing).
+threaded_loop(Module, St) ->
+    receive
+        {invoke, Fun, Args, From, Ref} ->
+            Outcome =
+                try erlang:apply(Module, Fun, [St | Args]) of
+                    {Pkg, St2} -> {ok, Pkg, St2}
+                catch
+                    _Class:Reason -> {error, render_reason(Reason)}
+                end,
+            case Outcome of
+                {ok, Result, NextSt} ->
+                    From ! {result, Ref, {ok, Result}},
+                    threaded_loop(Module, NextSt);
+                {error, _} = Err ->
+                    From ! {result, Ref, Err},
+                    threaded_loop(Module, St)
+            end;
         stop ->
             ok
     end.
