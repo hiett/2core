@@ -1,17 +1,29 @@
-//// gleeunit entry for the spec-suite runner (Tier-A) — drives the PINNED Phase-2
-//// allowlist fixtures present in `fixtures/` through the REAL pipeline and reports
-//// honest pass/skip/fail counts (D9: skips are visible, never silent).
+//// gleeunit entry for the spec-suite runner (Tier-A) — drives the PINNED allowlist fixtures
+//// present in `fixtures/` through the REAL pipeline and reports honest pass/skip/fail counts
+//// (D9: skips are visible, never silent).
 ////
-//// Tier-A needs NO engine at run time: the expected values are baked into the vendored
-//// `.wast` (now JSON). The committed curated fixture subset makes this run in a fresh
-//// checkout; `vendor/vendor.sh` regenerates the FULL allowlist (gitignored) for a wider
-//// local run — the runner adapts to whatever `*.json` are present.
+//// ## Phase 3: conformance-neutral under BOTH profiles (F7, capstone §G)
 ////
-//// Gate: zero genuine FAILS (a fail is a real spec mismatch in the pipeline); SKIPS are
-//// expected and printed (constructs beyond the Phase-2 slice — reference types, bulk
-//// memory, multi-memory, non-function imports, multi-value, extended-const, memory64,
-//// text-format asserts, and the allowlist files un-convertible at the pin). At least one
-//// PASS is required so the suite is not vacuously green.
+//// Phase 3 adds no IR nodes and no spec files, so the counts do not move; the proof is that the
+//// SAME green holds under BOTH derived profiles — which also delivers the spec-suite half of the
+//// F2 optimizer-soundness claim (capstone §B). The suite runs twice:
+////   - `driver.pipeline_with(profiles.safe())`   — Baseline optimizer + enforcing fuel;
+////   - `driver.pipeline_with(profiles.unsafe())` — Aggressive optimizer + open runtime.
+//// Both must reach `fail == 0 && pass > 0`. A single optimizer or mode regression on ANY
+//// allowlisted assertion goes red. The Safe fuel budget for the suite (`default_fuel_budget`) is
+//// generous enough that no in-scope program trips `FuelExhausted` (the runaway proof 4 uses a
+//// tiny `safe_metered` budget instead).
+////
+//// Tier-A needs NO engine at run time: the expected values are baked into the vendored `.wast`
+//// (now JSON). The committed curated fixture subset makes this run in a fresh checkout;
+//// `vendor/vendor.sh` regenerates the FULL allowlist (gitignored) for a wider local run — the
+//// runner adapts to whatever `*.json` are present.
+////
+//// Gate: zero genuine FAILS (a fail is a real spec mismatch in the pipeline); SKIPS are expected
+//// and printed (constructs beyond the slice — reference types, bulk memory, multi-memory,
+//// non-function imports, multi-value, extended-const, memory64, text-format asserts, and the
+//// allowlist files un-convertible at the pin). At least one PASS is required so the suite is not
+//// vacuously green.
 
 import gleam/int
 import gleam/io
@@ -20,13 +32,36 @@ import gleam/string
 import twocore/conformance/driver
 import twocore/conformance/ffi
 import twocore/conformance/fixture
-import twocore/conformance/runner.{type Report}
+import twocore/conformance/runner.{type Driver, type Report}
+import twocore/runtime/profiles
 
 const fixtures_dir = "test/twocore/conformance/fixtures"
 
-/// Run every `*.json` fixture present through the real pipeline, print a per-file +
-/// total report, and assert zero genuine failures with at least one pass.
-pub fn spec_suite_allowlist_test() {
+/// The spec suite under the fail-closed **Safe** profile (Baseline optimizer + enforcing fuel):
+/// `fail == 0 && pass > 0`. This is the Phase-1/2 green re-run through the Phase-3 full chain
+/// (`ir_lower → optimize → emit_core`), confirming the Baseline optimizer is conformance-neutral.
+pub fn spec_suite_safe_test() {
+  run_suite(
+    driver.pipeline_with(profiles.safe()),
+    "Safe (Baseline optimizer + enforcing fuel)",
+  )
+}
+
+/// The spec suite under the **Unsafe** profile (Aggressive optimizer + `MeterOff` + open
+/// BIF/host + passthrough stdlib): `fail == 0 && pass > 0`. Same fixtures, same expected values —
+/// the Aggressive optimizer and the whole Unsafe posture change NO spec-observable answer (F2/F4).
+/// This is the spec-suite half of the optimizer-soundness differential.
+pub fn spec_suite_unsafe_test() {
+  run_suite(
+    driver.pipeline_with(profiles.unsafe()),
+    "Unsafe (Aggressive optimizer + open runtime)",
+  )
+}
+
+/// Run every `*.json` fixture present through `d`, print a per-file + total report tagged with
+/// `label`, and assert zero genuine failures with at least one pass. Total — every command
+/// passes/fails/skips; the runner never panics.
+fn run_suite(d: Driver, label: String) -> Nil {
   let jsons = case ffi.list_dir(fixtures_dir) {
     Ok(entries) ->
       entries
@@ -44,11 +79,13 @@ pub fn spec_suite_allowlist_test() {
     }
     _ -> {
       io.println(
-        "\n=== Phase-2 spec-suite conformance (Tier-A, pinned allowlist) ===",
+        "\n=== Phase-3 spec-suite conformance (Tier-A, pinned allowlist) — "
+        <> label
+        <> " ===",
       )
       let total =
         list.fold(jsons, runner.empty_report(), fn(acc, name) {
-          let rep = run_one(name)
+          let rep = run_one(d, name)
           io.println("  " <> pad(name, 22) <> line(rep))
           runner.merge(acc, rep)
         })
@@ -63,13 +100,13 @@ pub fn spec_suite_allowlist_test() {
   }
 }
 
-fn run_one(name: String) -> Report {
+fn run_one(d: Driver, name: String) -> Report {
   case fixture.load(fixtures_dir <> "/" <> name) {
     Error(e) -> {
       io.println("  " <> pad(name, 22) <> "parse error: " <> e)
       runner.empty_report()
     }
-    Ok(fix) -> runner.run_fixture(driver.pipeline(), fix, fixtures_dir)
+    Ok(fix) -> runner.run_fixture(d, fix, fixtures_dir)
   }
 }
 

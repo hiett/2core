@@ -21,8 +21,6 @@ import gleam/list
 import gleam/result
 import gleam/string
 import twocore/backend/build_beam
-import twocore/backend/core_printer
-import twocore/backend/emit_core
 import twocore/conformance/ffi
 import twocore/conformance/fixture.{
   type SpecValue, F32Bits, F32Nan, F64Bits, F64Nan, I32Val, I64Val,
@@ -32,13 +30,37 @@ import twocore/frontend/wasm/decode
 import twocore/frontend/wasm/lower
 import twocore/frontend/wasm/validate
 import twocore/ir
+import twocore/pipeline
+import twocore/runtime/instance.{type Binding}
 import twocore/runtime/profiles
 
-/// The real pipeline driver: the full Phase-1 vertical slice behind the runner seam.
+/// The real pipeline driver in the default fail-closed **Safe** posture — exactly
+/// `pipeline_with(profiles.safe())`. The historical entry point the Phase-1/2 corpus and
+/// conformance suites drive.
 pub fn pipeline() -> Driver {
+  pipeline_with(profiles.safe())
+}
+
+/// Build a `runner.Driver` that compiles + instantiates every module under `binding` (E5,
+/// one-instance-one-process), so the capstone can drive the SAME corpus/spec-suite under any
+/// policy posture from ONE code path: the three optimizer levels (spread `opt_level` over
+/// `profiles.safe()`) and the two named modes (`profiles.safe()` / `profiles.unsafe()`).
+///
+/// It reuses `pipeline.ir_to_core(_, binding)` — which composes `ir_lower →
+/// ir_opt.optimize(_, binding.opt_level) → emit_core` (unit 09) — so the driver never
+/// re-implements compiler logic; the frontend (decode/validate/lower), the instantiate seam
+/// (`ffi.start_instance`), and `invoke` are all unchanged. ONLY the linked `Binding` differs,
+/// which is the whole point of a differential: hold the program fixed, vary the policy.
+///
+/// - `binding`: the build-time profile the module is compiled + linked under. `profiles.safe()`
+///   reproduces `pipeline()`; `profiles.unsafe()` gives the Aggressive/open build; a
+///   `Binding(..profiles.safe(), opt_level: …)` isolates the optimizer level (F2, proof 1).
+/// - Return: a `Driver` whose `instantiate` runs the full compile chain under `binding` and
+///   `invoke` routes into the instance's owned process. Total — never fails to construct.
+pub fn pipeline_with(binding: Binding) -> Driver {
   runner.Driver(
     check_frontend: check_frontend,
-    instantiate: instantiate,
+    instantiate: fn(bytes) { instantiate_under(binding, bytes) },
     invoke: invoke,
   )
 }
@@ -77,23 +99,37 @@ pub fn check_frontend(bytes: BitArray) -> Result(Nil, String) {
 
 // ─────────────────────────────── instantiate ───────────────────────────────
 
-/// Compile `.wasm` bytes to a loaded BEAM module (D10), then **instantiate** it in its
-/// own OWNED PROCESS (E5: `load → instantiate → invoke`, one-instance-one-process). Each
-/// module gets a UNIQUE name so loading many modules from one fixture cannot clobber one
-/// another.
+/// Compile `.wasm` bytes to a loaded BEAM module (D10) under the Safe posture, then
+/// instantiate it in its own owned process — `instantiate_under(profiles.safe(), _)`.
+/// Retained for callers that want the default-Safe seam directly.
+pub fn instantiate(bytes: BitArray) -> Result(Instance, String) {
+  instantiate_under(profiles.safe(), bytes)
+}
+
+/// Compile `.wasm` bytes to a loaded BEAM module under `binding` (D10), then **instantiate**
+/// it in its own OWNED PROCESS (E5: `load → instantiate → invoke`, one-instance-one-process).
+/// Each module gets a UNIQUE name so loading many modules from one fixture cannot clobber one
+/// another (and so the Safe/Unsafe builds of one source get distinct atoms).
 ///
-/// `ffi.start_instance` spawns a process and runs the generated `instantiate/0` IN it,
-/// seeding that process's per-instance cell (fresh memory/table/globals + active
-/// element/data segments + `start`) before any export is invoked. The returned
-/// `Instance` carries the OWNING PID; every later `invoke` is routed into it so it reads
-/// that instance's state, and a (re)instantiation spawns a fresh process → a fresh zeroed
-/// cell (isolation + reset are automatic).
+/// The compile chain is the REAL pipeline under `binding`: decode → validate → frontend-lower
+/// → `pipeline.ir_to_core(_, binding)` (= `ir_lower → optimize(binding.opt_level) → emit_core`)
+/// → build. So the optimizer level and the whole Safe/Unsafe policy posture come entirely from
+/// `binding`; nothing here re-derives them.
+///
+/// `ffi.start_instance` spawns a process and runs the generated `instantiate/0` IN it, seeding
+/// that process's per-instance cell (fresh memory/table/globals + active element/data segments +
+/// `start`) and per-instance runtime policy (fuel budget under `MeterFuel`, host policy) before
+/// any export is invoked. The returned `Instance` carries the OWNING PID; every later `invoke`
+/// is routed into it, and a (re)instantiation spawns a fresh process → a fresh zeroed cell.
 ///
 /// Returns `Error(reason)` — never a panic — for any stage that rejects: a compile-stage
-/// rejection (`decode:`/`validate:`/`lower:`/`emit:`/`build:`, an out-of-scope construct →
-/// a graceful skip) or, prefixed `instantiate: `, an INSTANTIATION-TIME TRAP (OOB active
-/// segment / trapping `start`). The runner uses the prefix to tell the two apart.
-pub fn instantiate(bytes: BitArray) -> Result(Instance, String) {
+/// rejection (`decode:`/`validate:`/`lower:`/`ir-lower:`/`emit:`/`build:`, an out-of-scope
+/// construct → a graceful skip / `Rejected`) or, prefixed `instantiate: `, an INSTANTIATION-TIME
+/// TRAP (OOB active segment / trapping `start`). The runner uses the prefix to tell them apart.
+pub fn instantiate_under(
+  binding: Binding,
+  bytes: BitArray,
+) -> Result(Instance, String) {
   use m <- result.try(
     decode.decode(bytes)
     |> result.map_error(fn(e) { "decode: " <> string.inspect(e) }),
@@ -107,11 +143,11 @@ pub fn instantiate(bytes: BitArray) -> Result(Instance, String) {
     |> result.map_error(fn(e) { "lower: " <> string.inspect(e) }),
   )
   let irmod = ir.Module(..irmod0, name: uniquify(irmod0.name))
-  use cmod <- result.try(
-    emit_core.emit_module(irmod, profiles.safe())
-    |> result.map_error(fn(e) { "emit: " <> string.inspect(e) }),
+  // ir_lower (policy/metering) → ir_opt.optimize(binding.opt_level) → emit_core → `.core` text.
+  use core_text <- result.try(
+    pipeline.ir_to_core(irmod, binding)
+    |> result.map_error(pipeline.describe),
   )
-  let core_text = core_printer.print_module(cmod)
   use mod_atom <- result.try(
     build_beam.compile_and_load(bit_array.from_string(core_text))
     |> result.map_error(fn(e) { "build: " <> string.inspect(e) }),
@@ -119,7 +155,10 @@ pub fn instantiate(bytes: BitArray) -> Result(Instance, String) {
   // Spawn the instance's owned process and run `instantiate/0` in it (E5). An
   // instantiation-time trap surfaces here as `Error("instantiate: " <> reason)`, turning
   // the module's dependent assertions into skips — except `assert_uninstantiable`, which
-  // the runner asserts MUST land here with the expected trap phrase.
+  // the runner asserts MUST land here with the expected trap phrase. The export→result-type
+  // table is read from the pre-optimize `irmod`: the optimizer preserves every exported
+  // function's name and result arity (exports are protected from orphan-deletion), so the
+  // tag widths are invariant across `binding.opt_level`.
   case ffi.start_instance(mod_atom) {
     Ok(proc) -> Ok(runner.Instance(proc: proc, exports: export_types(irmod)))
     Error(trap) -> Error("instantiate: " <> trap)

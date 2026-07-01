@@ -781,8 +781,12 @@ fn emit_call_direct(
 /// SEAM (for unit 11's `ir_lower`, the allowlist enforcer): `resolve_stdlib` here mirrors
 /// the pinned own-stdlib mapping. `ir_lower` is the canonical place the resolution +
 /// `rt_bif` allowlist is enforced; this table must stay aligned with it. `Cap`/`Name` are
-/// emitted as atoms — the deny-all host only echoes them in `{capability_denied, Cap,
-/// Name}` and inspects nothing, so this is faithful for the rejection path.
+/// emitted as BINARY STRINGS — the exact type `rt_host.call_host` consumes, so its
+/// `resolve_handler`/`HostWhitelist` string matching actually fires under a permissive
+/// (`HostOpen`/`HostWhitelist`) posture (F4), and the deny-all `{capability_denied, Cap,
+/// Name}` echoes them as binaries (consistent with a direct Gleam-side call). Emitting them
+/// as atoms — faithful only for deny-all, which inspects nothing — would make an admitting
+/// host silently deny every handler (an atom never matches the `String` patterns).
 fn emit_call_host(
   capability: String,
   name: String,
@@ -803,11 +807,13 @@ fn emit_call_host(
         ctx,
       )
     None -> {
-      // The deny-all host yields a single value or raises (`{capability_denied,…}`).
+      // The host yields a single value or raises (`{capability_denied,…}`). `capability`/`name`
+      // are emitted as BINARY STRINGS so `rt_host`'s handler/whitelist matching (which pattern-
+      // matches Gleam `String`s) fires under a permissive posture, not just deny-all.
       let call =
         CCall(CAtom(ctx.binding.host_module), CAtom("call_host"), [
-          CAtom(capability),
-          CAtom(name),
+          core_binary_string(capability),
+          core_binary_string(name),
           core_list(cargs),
         ])
       apply_cont_call(cont, call, 1, state, ctx)

@@ -313,8 +313,12 @@ fn host_import_fn() -> ir.Function {
   )
 }
 
-/// A genuine host import → the deny-all `call '<host_module>':'call_host'(Cap, Name,
-/// [Args…])` (Cap/Name as atoms; args as a proper Core list).
+/// A genuine host import → `call '<host_module>':'call_host'(Cap, Name, [Args…])`. `Cap`/`Name`
+/// are emitted as BINARY STRINGS — the exact type `rt_host.call_host` consumes — so its
+/// `resolve_handler`/`HostWhitelist` `String` pattern-matching actually fires under a permissive
+/// posture (F4). Emitting them as atoms would silently deny every handler (an atom never matches
+/// a `String` pattern), so this asserts the representation, not just the call shape. Args are a
+/// proper Core list.
 pub fn call_host_import_is_deny_all_test() {
   let b = binding()
   let assert CLet(
@@ -322,7 +326,7 @@ pub fn call_host_import_is_deny_all_test() {
     CCall(
       CAtom(host),
       CAtom("call_host"),
-      [CAtom("env"), CAtom("log"), CCons(CVar("p0"), CNil)],
+      [CBinary(_), CBinary(_), CCons(CVar("p0"), CNil)],
     ),
     CVar("r"),
   ) = body_of(module_with(host_import_fn()), "useimport")

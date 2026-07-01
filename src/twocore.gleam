@@ -84,6 +84,10 @@ pub fn run(args: List(String)) -> Result(String, String) {
       cmd_to_beam(input, default_beam(input))
     ["to-beam", input, output] | ["build", input, output] ->
       cmd_to_beam(input, output)
+    ["to-beam-wasm", "--unsafe", input, output] ->
+      cmd_to_beam_wasm(input, output, profiles.unsafe())
+    ["to-beam-wasm", input, output] ->
+      cmd_to_beam_wasm(input, output, profiles.safe())
     ["run", "--unsafe", path, export, ..arg_strs] ->
       cmd_run(path, export, arg_strs, profiles.unsafe())
     ["run", path, export, ..arg_strs] ->
@@ -205,6 +209,39 @@ fn cmd_to_beam(input: String, output: String) -> Result(String, String) {
   }
 }
 
+/// `to-beam-wasm [--unsafe] <in.wasm> <out.beam>` — compile a `.wasm` all the way to a `.beam`
+/// under the selected profile (Safe = Baseline optimizer + enforcing fuel; `--unsafe` = Aggressive
+/// optimizer + `MeterOff` + open runtime), and write it. This is the profile-selecting
+/// compile-to-`.beam`-from-`.wasm` path the Phase-3 benchmark (`smoke/bench.sh`) needs: `run`
+/// re-compiles every call and `to-beam` takes only `.core`, so neither can produce a persisted,
+/// profile-specific `.beam` to hand to `exec`. Prints a confirmation line.
+fn cmd_to_beam_wasm(
+  input: String,
+  output: String,
+  binding: Binding,
+) -> Result(String, String) {
+  use bytes <- result.try(read_bits(input))
+  case pipeline.source_to_ir(bytes) {
+    Error(e) -> Error(pipeline.describe(e))
+    Ok(m) ->
+      case pipeline.ir_to_core(m, binding) {
+        Error(e) -> Error(pipeline.describe(e))
+        Ok(core) ->
+          case pipeline.core_to_beam(core, m.name) {
+            Error(e) -> Error(pipeline.describe(e))
+            Ok(beam) ->
+              case simplifile.write_bits(output, beam) {
+                Error(fe) ->
+                  Error(
+                    "write " <> output <> ": " <> simplifile.describe_error(fe),
+                  )
+                Ok(Nil) -> Ok("wrote " <> output)
+              }
+          }
+      }
+  }
+}
+
 /// `run [--unsafe] <in.wasm> <export> <args…>` — compile through the selected profile's
 /// pipeline and invoke `export` on the BEAM (D10). Prints the result value(s) (raw bit
 /// patterns, space-separated); a trap prints `trap: <reason>` as an error (exit non-zero).
@@ -317,6 +354,7 @@ fn usage() -> String {
       "  gleam run -- emit     <in.ir> [--unsafe]        emit_core only → .core",
       "  gleam run -- to-core  <in.ir> [--unsafe]        ir_lower + optimize + emit_core → .core",
       "  gleam run -- to-beam  <in.core> [out.beam]      compile → .beam (alias: build; no profile)",
+      "  gleam run -- to-beam-wasm [--unsafe] <in.wasm> <out.beam>  .wasm → .beam under a profile (bench)",
       "  gleam run -- run      [--unsafe] <in.wasm> <export> <args…>  compile + invoke on the BEAM",
       "  gleam run -- exec     [-n N] <in.beam> <export> <args…>  invoke a prebuilt .beam (bench, no compile)",
       "",

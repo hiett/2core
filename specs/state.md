@@ -179,7 +179,7 @@ runtime-dispatch B1 is **Phase 4**.
 | **P3-08** `ir_lower` Unsafe policy | [`08`](phase-3/08-ir-lower-unsafe.md) | **done** | `«UNSAFE-PROFILE-FROZEN»`, 06 | Posture-aware `lower/2` reads `meter`/`stdlib`/`bif_gate` (retires the `mode` dispatch). `MeterOff`→zero `Charge` (absence, not `Charge(0)`); `MeterFuel`→Phase-2 insertion (`fn_cost`/`loop_cost`=1 here). Adopts `rt_stdlib.shared_surface`/`resolve` (single source; name-then-arity mapping preserves `UnknownStdlibFn` vs `BifNotAllowed`); `rt_bif.check_gated`. **Safe byte-identical** (conformance 15747/0). Seam for 09: `pub resolve_stdlib_fn(name, arity, binding) -> Result(BifTarget, Nil)`. 643 tests. |
 | **P3-09** emit_core Unsafe + pipeline opt + CLI | [`09`](phase-3/09-emit-pipeline-opt.md) | **done** | `«IROPT»`, `«UNSAFE»`, `«METER»`, 08 | Pipeline is now `source_to_ir → lower_ir → optimize_ir → emit_core` (`ir_opt.optimize` at `binding.opt_level`; `OptNone` bypass). **Optimizer runs the baseline passes over the whole corpus end-to-end — conformance `fail=0`, no discrepancy.** `emit_instantiate` prepends the seed exception (`seed_fuel` first under MeterFuel, `seed_policy` always; fixed atoms → D3a-safe); hot bodies posture-agnostic. CLI `opt` verb + `--unsafe` (default Safe). D3a-under-`open` security test added. Safe/Unsafe `.core` differs by exactly charge + seed lines. 654 tests (+11). |
 | **P3-10** linker: `profiles.unsafe()` + coexistence | [`10`](phase-3/10-linker-unsafe-profile.md) | **done** | `«UNSAFE-PROFILE-FROZEN»`, 08, 09 | `unsafe()` first-class (field-by-field F4) + `unsafe_instance()` + `safe_metered(budget)` (Safe-only budget channel) + `coexist_name/2` (Safe→base, Unsafe→base_unsafe, distinct atoms). **B3 coexistence proof**: one stateful source compiled twice → distinct `.beam` atoms sharing `rt_*` → both on one node, each in its own process → byte-identical results + memory/global isolation both directions. `instance.gleam` untouched (D1). 659 tests (+5). |
-| **P3-11** capstone | [`11`](phase-3/11-capstone.md) | unclaimed | all above | Optimizer-soundness differential (OptNone/Baseline/Aggressive byte-identical) + Safe-vs-Unsafe (B3) differential + real-metering trap (tail spin + non-tail recurse under `safe_metered`) + coexistence proof + honest benchmark + refreshed conformance image. **Inbound from P3-05 (need the full run-ABI + unit 09's seeded `instantiate/0`):** (1) **constant-space-with-enforcement** — `sum_to(100000)` under Safe (`MeterFuel`, `default_fuel_budget`) runs to completion in constant process memory (the budget cell did not move the loop back-edge out of tail position, E1); (2) **`FuelExhausted`-through-the-run-ABI** — a runaway-loop module `load → instantiate → invoke` returns `Trapped("{wasm_trap,fuel_exhausted}")`. Also: two-live-instances-on-one-node independence; **calibrate `default_fuel_budget`** so the whole Safe corpus/spec suite completes. |
+| **P3-11** capstone | [`11`](phase-3/11-capstone.md) | **done** | all above | **PHASE 3 PROVEN.** Optimizer-soundness differential (`OptNone`≡`Baseline`≡`Aggressive`, byte-identical + spec-correct across the whole corpus — **no discrepancy**), Safe≡Unsafe (B3) differential, zero-overhead-Unsafe (0 `charge`/`rt_meter` in the Unsafe `.core`), real-metering trap (tail `spin` constant-space + non-tail `recurse` under `safe_metered`, deterministic `fuel_exhausted`), Safe+Unsafe coexistence (real `iso.wasm` state isolation **and** host capability isolation), conformance `fail=0` **under both profiles** (15747/411/0), SVG refreshed. Honest benchmark committed (`smoke/bench.sh`, `docs/phase-3-benchmark.md`). **673 tests (was 659), 0 warnings, format clean.** Deviations (all justified, flagged): (a) `emit_core` now emits `call_host` cap/name as BINARY strings (was atoms) so `HostOpen`/`HostWhitelist` dispatch actually fires — a documented-deferred gap the F4 capability proof surfaced; the one structural `emit_core_test` arm updated. (b) `driver.pipeline()` now = `pipeline_with(profiles.safe())` (full `ir_lower→optimize→emit` chain), conformance still 15747/0. (c) CLI `to-beam-wasm [--unsafe]` verb added (the bench compile path unit 09 flagged). **Benchmark findings (honest, F8):** 2core-Safe is currently SLOWER than hand-written Erlang (CRC-32, ~76×) and the native NIF ceiling (SHA-256/DEFLATE, 100s-1000s×) on the tier-O memory model — "faster than hand-written Erlang" is measured as NOT-YET, motivating the Phase-4 tier ladder; and the **Aggressive inliner does not scale** to the 80-function smoke module (compile-time code explosion, Unsafe numbers N/A for the smoke crates) — a compile-time-only limitation, NOT a soundness bug (proofs 1/2 confirm the optimizer is sound on the corpus). |
 
 ### High-level spec coverage this phase takes
 
@@ -205,6 +205,29 @@ range-based bounds-check elimination, SIMD vectorization, pure-call CSE.)*
 
 ## Change log
 
+- **P3-11 landed (capstone) — PHASE 3 PROVEN.** The five differentials + benchmark all green.
+  **Headline finding: the optimizer changes nothing observable** — `OptNone`≡`Baseline`≡
+  `Aggressive` produce byte-identical results/traps AND each equals the spec-sourced `.expected`
+  across the whole Phase-1+2 acceptance corpus; Safe≡Unsafe likewise; the spec suite is
+  `fail=0` under BOTH profiles (15747/411/0, conformance-neutral, F7). Real CPU fuel now BITES:
+  a tail `spin` traps `fuel_exhausted` deterministically in constant space, a non-tail `recurse`
+  bounds recursion depth (node memory `O(budget)`, documented). Safe+Unsafe coexistence proven at
+  corpus scale (real `iso.wasm` state isolation + host capability isolation). New tests under
+  `test/twocore/optimize/**` (+`corpus/spin,recurse`); `driver.pipeline_with(binding)` seam;
+  conformance runs both profiles; `smoke/bench.sh` + `docs/phase-3-benchmark.md`; SVG refreshed
+  (Phase-3 footnote). **673 tests (was 659), 0 warnings, format clean.** Deviations (justified):
+  (1) **`emit_core` fix** — `call_host` cap/name now emitted as BINARY strings (were atoms) so
+  `rt_host`'s `HostOpen`/`HostWhitelist` `String` matching fires (deny-all was faithful; a
+  permissive host silently denied every handler). Surfaced by the F4 capability-coexistence proof;
+  the one structural `emit_core_test` arm updated to assert the binary form. (2) `driver.pipeline()`
+  = `pipeline_with(profiles.safe())` (full chain). (3) CLI `to-beam-wasm [--unsafe]` verb (the
+  bench compile path). **Benchmark (F8, honest):** on the tier-O runtime 2core-Safe is SLOWER than
+  hand-written Erlang for CRC-32 (~76×, bit-identical head-to-head) and far below the native NIF
+  ceiling for SHA-256/DEFLATE — so "faster than hand-written Erlang" is *measured as not-yet*,
+  motivating Phase-4's `rt_mem`/threaded tiers. The **Aggressive inliner does not scale** to the
+  80-function smoke module (compile-time code explosion → Unsafe smoke numbers N/A) — a
+  compile-time-only, NON-soundness limitation (the corpus differentials prove the optimizer sound),
+  motivating a real inliner cost model. Both written up as limitations, not hidden.
 - **Phase-3 plan authored + adversarially critiqued + reconciled.** Scope decision (EM):
   **Phase 3 = "Fast" — the shared optimizer (`ir_opt`) + the Unsafe profile + real CPU metering**
   (the speed/second-mode half of the high-level thesis), leaving the trust-tier ladder for Phase 4,

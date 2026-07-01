@@ -93,6 +93,32 @@ pub fn cli_to_beam_writes_beam_test() {
   let _ = simplifile.delete(tmp_beam)
 }
 
+/// `to-beam-wasm [--unsafe] <in.wasm> <out.beam>` compiles a `.wasm` to a `.beam` under EACH
+/// profile (the profile-selecting compile the benchmark needs), and `exec` runs the prebuilt
+/// `.beam` — both profiles compute the same spec-correct result (`add(2,3) == 5`), proving the
+/// Safe and Unsafe builds agree end-to-end through the CLI's benchmark path.
+pub fn cli_to_beam_wasm_both_profiles_exec_test() {
+  let wasm = corpus <> "/add.wasm"
+  let safe_beam = "build/cli_bench_add_safe.beam"
+  let unsafe_beam = "build/cli_bench_add_unsafe.beam"
+
+  let assert Ok(m1) = twocore.run(["to-beam-wasm", wasm, safe_beam])
+  assert string.contains(m1, "wrote")
+  let assert Ok(m2) =
+    twocore.run(["to-beam-wasm", "--unsafe", wasm, unsafe_beam])
+  assert string.contains(m2, "wrote")
+
+  // `exec` prints "<result>\n<timing>"; both profiles compute add(2,3) == 5.
+  let assert Ok(safe_out) = twocore.run(["exec", safe_beam, "add", "2", "3"])
+  assert string.starts_with(safe_out, "5")
+  let assert Ok(unsafe_out) =
+    twocore.run(["exec", unsafe_beam, "add", "2", "3"])
+  assert string.starts_with(unsafe_out, "5")
+
+  let _ = simplifile.delete(safe_beam)
+  let _ = simplifile.delete(unsafe_beam)
+}
+
 // ─────────────────────────────── the `opt` stage + `--unsafe` profile flag ───────────────────────────────
 
 /// `opt <in.ir>` round-trips (decision #5): its printed `.ir` re-parses to a well-formed
