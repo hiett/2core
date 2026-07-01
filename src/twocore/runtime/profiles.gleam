@@ -71,20 +71,59 @@ pub fn safe_capped(max_pages: Int) -> Binding {
   Binding(..safe_default(), safe_max_pages: capped)
 }
 
-/// The named **Unsafe** profile (F4): the aggressive optimizer + no metering + open BIF gate +
-/// passthrough stdlib + open host, keeping the vetted `twocore@runtime@rt_*` module names.
+/// A Safe profile with a LOWERED per-instance CPU-fuel budget (F5) — the CPU analogue of
+/// `safe_capped(max_pages)`. `instantiate/0` bakes `seed_fuel(binding.fuel_budget)` (unit 09
+/// §A.4), so a smaller `budget` traps a runaway loop sooner with `FuelExhausted`. This is the
+/// single per-instance channel for the CPU bound (unit 11's runaway-loop trap proof passes a
+/// SMALL budget through here).
 ///
-/// It is an EXPLICIT, TESTED opt-in — there is no path to an Unsafe posture by omission
-/// (D4/D9): the default (`safe()`/`safe_default()`/`safe_capped`) stays Safe, and only this
-/// constructor yields `mode: Unsafe`. The `Aggressive` optimizer is paired with `MeterOff` as
-/// required by the `Aggressive ⟹ MeterOff` coupling (only `Baseline`/`OptNone` may pair with
-/// `MeterFuel`), so the Unsafe-only passes (unit 04) run over a provably metering-free module.
+/// - `budget`: the per-instance CPU-fuel seed, in `charge` units. Any `Int`; a smaller value
+///   exhausts sooner. Passed VERBATIM (no clamping) — it is a resource bound the caller
+///   chooses, never a way to WIDEN the posture. A non-positive budget seeds an already-
+///   exhausted instance (it traps on the first `charge`); that is a caller choice, not a
+///   posture change.
+/// - Returns a `Safe`-mode `Binding` identical to `safe()` except for the lowered
+///   `fuel_budget` field — `mode: Safe` and all five Safe policy fields
+///   (`Baseline`/`MeterFuel`/`BifAllowlist`/`StdlibOwn`/`HostDenyAll`) are unchanged.
 ///
-/// `fuel_budget` is left **inherited** from `safe_default()` (the spread carries it) — harmless
-/// under `MeterOff`, which inserts no `Charge` and emits no `seed_fuel`. Safe and Unsafe are
-/// **different builds** (B3 monomorphization): the posture fields drive different build-time
-/// codegen, so the emitted OUTPUT module differs while the shared runtime module atoms are the
-/// same. Total — never fails.
+/// Fail-closed (D4/D9): it can only set the budget on a Safe posture. There is deliberately no
+/// `unsafe_metered` — `MeterOff` seeds no budget, so there is nothing to lower. Total — never
+/// fails.
+pub fn safe_metered(budget: Int) -> Binding {
+  Binding(..safe(), fuel_budget: budget)
+}
+
+/// The named **Unsafe** profile (F4) — the platform's second named mode, the aggressive
+/// posture in one value: the aggressive optimizer, no CPU metering, the open BIF gate,
+/// passthrough stdlib, and the open host, while keeping the **identical**
+/// `twocore@runtime@rt_*` runtime module names as `safe()` (the runtime CODE is shared; the two
+/// profiles are distinct B3 builds and the instance is the unit of policy).
+///
+/// Posture, field by field (asserted against F4, not against this body):
+/// - `mode: Unsafe` — the ONLY constructor here that yields it.
+/// - `opt_level: Aggressive` — baseline + Unsafe-only passes (unit 04).
+/// - `meter: MeterOff` — `ir_lower` inserts NO `Charge` nodes (F5 zero-overhead), so
+///   `FuelExhausted` is unreachable in an Unsafe instance.
+/// - `bif_gate: BifOpen` — admits the resolver's build-controlled targets (never arbitrary
+///   ambient BIFs, D3a).
+/// - `stdlib: StdlibPassthrough` — routes shared functions to BEAM stdlib where trusted;
+///   observably identical to `own` (unit 06).
+/// - `host_policy: HostOpen` — all host imports permitted (still no data-driven `apply`, D3a).
+///
+/// The `Aggressive ⟹ MeterOff` coupling holds (only `Baseline`/`OptNone` may pair with
+/// `MeterFuel`), so the Unsafe-only passes run over a provably metering-free module.
+///
+/// **Inherited unchanged from `safe_default()` (the spread carries them):**
+/// - `safe_max_pages: 65536` — the i32 4 GiB address-space bound (2¹⁶ pages) is a **WASM
+///   invariant** (spec §2.5.4 / §4.2.8), NOT a sandbox lever. Unsafe keeps it: there is
+///   deliberately no `unsafe_capped`, and `memory.grow` past 2¹⁶ pages still returns `-1`.
+///   Unsafe does not grant unbounded memory (that is the deferred Phase-4 `rt_mem` tier).
+/// - `fuel_budget` — harmless under `MeterOff` (no `Charge`, no `seed_fuel` emitted).
+///
+/// **Fail-closed (D4/D9):** this is the ONLY constructor in `profiles` yielding `mode: Unsafe`.
+/// `safe()`/`safe_capped(_)`/`safe_metered(_)`/`safe_default()`/`safe_instance()` are all fully
+/// Safe; Gleam has no default field values, so an Unsafe posture requires NAMING this
+/// constructor. Total — never fails.
 pub fn unsafe() -> Binding {
   Binding(
     ..safe_default(),
@@ -129,6 +168,18 @@ pub fn safe_instance() -> Instance {
   instantiate(safe())
 }
 
+/// Convenience: the runnable Unsafe instance — `instantiate(unsafe())`. The one-call path a
+/// caller uses to link the Unsafe profile, mirroring `safe_instance()`.
+///
+/// Being the SOLE Unsafe convenience keeps the fail-closed guarantee legible: an author must
+/// NAME `unsafe`/`unsafe_instance` to leave Safe (`is_safe(unsafe_instance()) == False`,
+/// `mode(unsafe_instance()) == Unsafe`). `instantiate/1`/`mode/1`/`is_safe/1` are unchanged —
+/// they read the binding, so they carry the Unsafe posture through with no edit. Total — never
+/// fails.
+pub fn unsafe_instance() -> Instance {
+  instantiate(unsafe())
+}
+
 /// The execution `Mode` an instance realises (`Safe` for every Phase-1 instance).
 ///
 /// - `inst`: the instance to inspect.
@@ -146,4 +197,24 @@ pub fn mode(inst: Instance) -> Mode {
 ///   explicit, tested opt-out rather than an accident. Total.
 pub fn is_safe(inst: Instance) -> Bool {
   inst.binding.mode == Safe
+}
+
+/// Derive a DISTINCT output module name for a coexisting build of the same source module
+/// (§B.3), so a Safe and an Unsafe `.beam` of ONE source can load together on one node without
+/// an atom clash. Two `.beam`s cannot load under the same module atom, and a name collision
+/// hot-replaces the earlier module; the generated atom is `ir.Module.name`, so the linker
+/// gives the two builds distinct names before `emit_core`.
+///
+/// - `base`: the source module's canonical name (its `ir.Module.name`).
+/// - `mode`: the build's execution mode. `Safe` keeps `base` (the canonical name); `Unsafe`
+///   returns `base <> "_unsafe"`. The two results are therefore ALWAYS distinct (`base` never
+///   equals `base <> "_unsafe"`), which is the load-time precondition for coexistence.
+/// - Returns the derived module-name string. PURE string derivation — introduces no policy and
+///   reads no binding; lives here (unit-10-owned) so `instance.gleam` (keystone-owned) is
+///   untouched. Total — never fails.
+pub fn coexist_name(base: String, mode: Mode) -> String {
+  case mode {
+    Safe -> base
+    Unsafe -> base <> "_unsafe"
+  }
 }

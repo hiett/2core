@@ -5,8 +5,8 @@
 import gleam/list
 import twocore/middle/ir_opt.{Aggressive, Baseline}
 import twocore/runtime/instance.{
-  BifAllowlist, BifOpen, HostDenyAll, HostOpen, MeterFuel, MeterOff, Safe,
-  StdlibOwn, StdlibPassthrough, Unsafe,
+  BifAllowlist, BifOpen, Binding, HostDenyAll, HostOpen, MeterFuel, MeterOff,
+  Safe, StdlibOwn, StdlibPassthrough, Unsafe,
 }
 import twocore/runtime/profiles
 
@@ -94,6 +94,7 @@ pub fn safe_family_is_full_safe_posture_test() {
   let bindings = [
     profiles.safe(),
     profiles.safe_capped(3),
+    profiles.safe_metered(1000),
     instance.safe_default(),
     profiles.safe_instance().binding,
   ]
@@ -131,6 +132,7 @@ pub fn no_constructor_pairs_aggressive_with_meter_fuel_test() {
   let shipped = [
     profiles.safe(),
     profiles.safe_capped(3),
+    profiles.safe_metered(1000),
     instance.safe_default(),
     profiles.safe_instance().binding,
     profiles.unsafe(),
@@ -138,4 +140,78 @@ pub fn no_constructor_pairs_aggressive_with_meter_fuel_test() {
   list.each(shipped, fn(b) {
     assert !{ b.opt_level == Aggressive && b.meter == MeterFuel }
   })
+}
+
+// ───────────────────────────── Unit 10: first-class Unsafe + coexistence seams ─────────────────────────────
+
+/// `unsafe()` has the EXACT aggressive posture asserted field-by-field against F4 (the spec,
+/// not the constructor body), AND its shared/inherited fields are IDENTICAL to `safe()`: the
+/// `twocore@runtime@rt_*` module names (the runtime code is shared), `safe_max_pages` (the i32
+/// hard cap is a WASM invariant, not a sandbox lever — Unsafe keeps it), and `fuel_budget`
+/// (inherited but unused under `MeterOff`). Only the six policy fields differ — the instance is
+/// the unit of policy.
+pub fn unsafe_posture_and_inherited_fields_test() {
+  let u = profiles.unsafe()
+  let s = profiles.safe()
+  // The aggressive posture (F4), field by field.
+  assert u.mode == Unsafe
+  assert u.opt_level == Aggressive
+  assert u.meter == MeterOff
+  assert u.bif_gate == BifOpen
+  assert u.stdlib == StdlibPassthrough
+  assert u.host_policy == HostOpen
+  // Inherited-from-safe fields are BYTE-IDENTICAL to `safe()` (shared runtime + WASM caps).
+  assert u.num_module == s.num_module
+  assert u.trap_module == s.trap_module
+  assert u.host_module == s.host_module
+  assert u.meter_module == s.meter_module
+  assert u.stdlib_module == s.stdlib_module
+  assert u.mem_module == s.mem_module
+  assert u.table_module == s.table_module
+  assert u.state_module == s.state_module
+  assert u.safe_max_pages == s.safe_max_pages
+  assert u.fuel_budget == s.fuel_budget
+}
+
+/// `safe_metered(budget)` lowers ONLY the `fuel_budget` on a Safe posture (F5, the CPU analogue
+/// of `safe_capped`): the result equals `safe()` with just `fuel_budget` replaced, so `mode`
+/// stays `Safe`, every policy field stays the fail-closed Safe choice, and `safe_max_pages` is
+/// unchanged. There is no `unsafe_metered` — the budget can only be set on a Safe posture.
+pub fn safe_metered_lowers_only_the_budget_test() {
+  // The budget is threaded verbatim.
+  assert profiles.safe_metered(1000).fuel_budget == 1000
+  assert profiles.safe_metered(0).fuel_budget == 0
+  // ONLY the budget changes: equal to `safe()` with `fuel_budget` replaced.
+  assert profiles.safe_metered(1000)
+    == Binding(..profiles.safe(), fuel_budget: 1000)
+  // And it stays fully Safe (posture + page cap unchanged).
+  assert profiles.safe_metered(1000).mode == Safe
+  assert profiles.safe_metered(1000).meter == MeterFuel
+  assert profiles.safe_metered(1000).safe_max_pages
+    == profiles.safe().safe_max_pages
+}
+
+/// `is_safe` distinguishes at the instance level (§B): `safe_instance()` is Safe,
+/// `unsafe_instance()` is not, and `unsafe_instance()` is `Unsafe`. `unsafe_instance()` is
+/// equivalent to `instantiate(unsafe())` and is the SOLE Unsafe convenience path.
+pub fn is_safe_distinguishes_instances_test() {
+  assert profiles.is_safe(profiles.safe_instance())
+  assert !profiles.is_safe(profiles.unsafe_instance())
+  assert profiles.mode(profiles.unsafe_instance()) == Unsafe
+  assert profiles.unsafe_instance() == profiles.instantiate(profiles.unsafe())
+  // The instance carries the full Unsafe binding through the linker unchanged.
+  assert profiles.unsafe_instance().binding == profiles.unsafe()
+}
+
+/// `coexist_name` derives DISTINCT output atoms for a Safe and an Unsafe build of one source
+/// (§B.3): `Safe` keeps the canonical `base`, `Unsafe` returns `base <> "_unsafe"`, and the two
+/// are always distinct — the load-time precondition for coexistence (two `.beam`s cannot load
+/// under one atom). Pure derivation; no policy.
+pub fn coexist_name_gives_distinct_output_atoms_test() {
+  assert profiles.coexist_name("m", Safe) == "m"
+  assert profiles.coexist_name("m", Unsafe) == "m_unsafe"
+  // Always distinct for any base.
+  assert profiles.coexist_name("m", Safe) != profiles.coexist_name("m", Unsafe)
+  assert profiles.coexist_name("twocore@x@mod", Safe)
+    != profiles.coexist_name("twocore@x@mod", Unsafe)
 }
