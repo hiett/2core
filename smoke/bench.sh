@@ -1,22 +1,42 @@
 #!/usr/bin/env bash
-# 2core Phase-3 benchmark (F8, capstone proof 6) — HONEST numbers, methodology + limitations in
-# docs/phase-3-benchmark.md. Compiles the committed smoke wasm (CRC-32 / SHA-256 / DEFLATE real
-# crates) to a .beam under EACH profile, times the emitted BEAM code with `exec -n N` (invocations
-# ONLY — excludes compile/load/instantiate), and compares against a hand-written pure-Erlang
-# CRC-32 baseline and the native NIF ceiling (crypto/zlib). No hero number.
+# 2core Phase-4 benchmark revisit (unit P4-10, overview G8) — HONEST numbers, methodology +
+# limitations in docs/phase-4-benchmark.md. Holds the committed smoke wasm (CRC-32 / SHA-256 /
+# DEFLATE real crates) FIXED and varies only the linked `Binding` along the Phase-4 tier axes:
 #
-# NOTE (honest limitation): the Aggressive/Unsafe inliner does not scale to the 80-function smoke
-# module in practical compile time (code explosion — see the report), so the Unsafe compile is
-# attempted under a timeout and reported "n/a" when it does not finish. Compile time is a one-time
-# cost (excluded from the exec timing), so this is a compile-scalability limit, not a run cost.
+#   build         Binding (schematic)                        isolates
+#   ----------------------------------------------------------------------------------------
+#   safe          safe()            — Cell + Paged            the Phase-3 baseline (the number we beat)
+#   atomics-safe  safe() + Atomics  — Cell + Atomics + --cap  THE memory-tier delta (mem_tier the ONLY change)
+#   portable      portable()        — Threaded + Paged        threading overhead / runs-anywhere posture
+#   unsafe-paged  unsafe()          — Cell + Paged + Aggr     the optimizer delta on paged (now compilable)
+#   ceiling       ceiling() + --cap — Cell + Atomics + Aggr   the fastest build (all levers at once)
 #
-# Usage: ./smoke/bench.sh [REPEAT] [UNSAFE_TIMEOUT_SECS]   (defaults: 100, 45)
+# Each build is compiled to a persisted `.beam` under its Binding via `to-beam-wasm`, is
+# CORRECTNESS-GATED bit-exact vs wasmtime BEFORE it is timed (a fast number that is wrong is not a
+# number), then timed with `exec -n N` (invocations ONLY — excludes compile/load/instantiate). The
+# hand-written pure-Erlang CRC-32 baseline and the native NIF ceilings (crypto/zlib) are the
+# unchanged Phase-3 references. No hero number.
+#
+# The atomics tier is FIXED-SIZE at creation, so `atomics`/`ceiling` bake a lowered page cap
+# (`--cap $CAP`) sized above each kernel's peak `memory.grow` watermark (crc32/sha256 = 18 pages,
+# deflate = 22 pages on the reported inputs; see the report). The default CAP=1024 (64 MiB) exceeds
+# all three and sits well below the 4096-page atomics reserve cap. A cap below the working set makes
+# `grow` return -1 and changes the result — the correctness gate catches it and aborts non-zero.
+#
+# NOTE (compile-time, honest): the Aggressive optimizer (unsafe/ceiling) inlines the 80-function
+# module; with the post-P3 whole-module node ceiling it now TERMINATES (~90 s wall each on the
+# reference machine) rather than the Phase-3 `n/a`. Compile time is a one-time cost EXCLUDED from the
+# exec timing; the generous COMPILE_TIMEOUT is only a safety net — a build is reported `n/a` ONLY if
+# it genuinely fails to finish, with the reason.
+#
+# Usage: ./smoke/bench.sh [REPEAT] [CAP] [COMPILE_TIMEOUT_SECS]   (defaults: 100, 1024, 300)
 set -uo pipefail
 cd "$(dirname "$0")/.."                       # repo root
 WASM=smoke/target/wasm32v1-none/release/twocore_smoke.wasm
 REL=smoke/target/wasm32v1-none/release
 REPEAT=${1:-100}
-UNSAFE_TIMEOUT=${2:-45}
+CAP=${2:-1024}
+COMPILE_TIMEOUT=${3:-300}
 OUT=build/bench
 mkdir -p "$OUT"
 
@@ -38,27 +58,56 @@ fi
 imp=$(wasm-tools print "$WASM" 2>/dev/null | grep -c '(import' || true)
 [ "${imp:-1}" = 0 ] || { echo "FAIL: $imp imports (2core has no import support)"; exit 1; }
 echo "== smoke wasm: $(wc -c <"$WASM") bytes, $(wasm-tools print "$WASM"|grep -c '(func ') funcs, 0 imports =="
-
-# ── 1. profile-selecting compile to .beam (CLI verb `to-beam-wasm`) ─────────────────────────
-echo "== compile to .beam under each profile =="
 gleam build >/dev/null 2>&1
-SBEAM="$OUT/smoke.safe.beam"; UBEAM="$OUT/smoke.unsafe.beam"; rm -f "$UBEAM"
-gleam run -- to-beam-wasm "$WASM" "$SBEAM" >/dev/null && echo "  Safe   → $SBEAM ($(wc -c <"$SBEAM") bytes)"
-echo "  Unsafe → attempting (Aggressive optimizer, ${UNSAFE_TIMEOUT}s timeout) ..."
-if run_to "$UNSAFE_TIMEOUT" gleam run -- to-beam-wasm --unsafe "$WASM" "$UBEAM" >/dev/null 2>&1 && [ -f "$UBEAM" ]; then
-  echo "  Unsafe → $UBEAM ($(wc -c <"$UBEAM") bytes)"; HAVE_UNSAFE=1
-else
-  echo "  Unsafe → n/a (Aggressive inliner did not finish within ${UNSAFE_TIMEOUT}s — see report)"; HAVE_UNSAFE=0
-fi
+
+# ── 1. the tier build matrix (one program, three knobs) ─────────────────────────────────────
+# Parallel arrays: build name · the `to-beam-wasm` axis flags that select its Binding.
+BUILDS=(   "safe"  "atomics-safe"                    "portable"    "unsafe-paged" "ceiling" )
+FLAGS=(    ""      "--tier atomics --cap $CAP"       "--portable"  "--unsafe"     "--ceiling --cap $CAP" )
+# The three kernels: export · input · repeat count (deflate is heavier, so fewer repeats).
+DREPEAT=$(( REPEAT/5 > 20 ? 20 : REPEAT/5 )); [ "$DREPEAT" -lt 5 ] && DREPEAT=5
+SPEC_FN=(  "crc32"  "sha256_word"  "deflate_roundtrip" )
+SPEC_ARG=( "4096"   "4096"         "2000" )
+SPEC_REP=( "$REPEAT" "$REPEAT"     "$DREPEAT" )
 
 # `exec -n N` prints "<result>\n<N> call(s) · <us> us total · <ns> ns/call".
 exec_ns()  { gleam run -- exec -n "$1" "$2" "$3" "$4" 2>/dev/null | sed -n '2p' | awk '{print $(NF-1)}'; }
 exec_val() { gleam run -- exec -n "$1" "$2" "$3" "$4" 2>/dev/null | sed -n '1p'; }
-ratio()    { awk -v s="$1" -v u="$2" 'BEGIN{ if (u ~ /^[0-9]+$/ && u+0>0) printf "%.2f", s/u; else printf "n/a" }'; }
-# Deflate is ~60 ms/call on 2core's paged memory; cap its repeat so the bench stays quick.
-DREPEAT=$(( REPEAT/5 > 20 ? 20 : REPEAT/5 )); [ "$DREPEAT" -lt 5 ] && DREPEAT=5
+ratio()    { awk -v s="$1" -v u="$2" 'BEGIN{ if (s ~ /^[0-9]+$/ && u ~ /^[0-9]+$/ && s+0>0) printf "%.1f", u/s; else printf "n/a" }'; }
+u32()      { awk -v x="$1" 'BEGIN{ m=4294967296; v=(x%m); if (v<0) v+=m; printf "%d", v }'; }
 
-# ── 2. hand-written pure-Erlang CRC-32 + native-NIF ceilings via an escript ─────────────────
+# ── 2. compile each build to a persisted .beam, then correctness-gate it bit-exact vs wasmtime ──
+echo "== compile each tier build to .beam + gate bit-exact vs wasmtime (cap=$CAP pages) =="
+declare -a HAVE                                    # HAVE[i]=1 iff build i compiled AND gated OK
+# Precompute the wasmtime oracle (u32) for each kernel once.
+declare -a ORACLE
+for k in "${!SPEC_FN[@]}"; do
+  w=$(cd "$REL" && wasmtime run --invoke "${SPEC_FN[$k]}" twocore_smoke.wasm "${SPEC_ARG[$k]}" 2>/dev/null | tail -1)
+  ORACLE[$k]=$(u32 "$w")
+done
+for i in "${!BUILDS[@]}"; do
+  name=${BUILDS[$i]}; beam="$OUT/smoke.$name.beam"; rm -f "$beam"
+  # shellcheck disable=SC2086   (FLAGS entries are intentionally word-split into flags)
+  if run_to "$COMPILE_TIMEOUT" gleam run -- to-beam-wasm ${FLAGS[$i]} "$WASM" "$beam" >/dev/null 2>&1 && [ -f "$beam" ]; then
+    gate_ok=1
+    for k in "${!SPEC_FN[@]}"; do
+      v=$(exec_val 1 "$beam" "${SPEC_FN[$k]}" "${SPEC_ARG[$k]}")
+      if [ "$(u32 "${v:-x}")" != "${ORACLE[$k]}" ]; then
+        echo "  FAIL: $name not bit-exact vs wasmtime on ${SPEC_FN[$k]}(${SPEC_ARG[$k]}): got '$v', want ${ORACLE[$k]}"
+        gate_ok=0
+      fi
+    done
+    if [ "$gate_ok" = 1 ]; then
+      HAVE[$i]=1; echo "  $name → $beam ($(wc -c <"$beam") bytes) · gated bit-exact"
+    else
+      HAVE[$i]=0; echo "== correctness gate failed: aborting (a wrong fast number is never reported) =="; exit 1
+    fi
+  else
+    HAVE[$i]=0; echo "  $name → n/a (compile did not finish within ${COMPILE_TIMEOUT}s — see report)"
+  fi
+done
+
+# ── 3. hand-written pure-Erlang CRC-32 + native-NIF ceilings via an escript ──────────────────
 BASE="$OUT/baseline.escript"
 cat > "$BASE" <<'ESCRIPT'
 #!/usr/bin/env escript
@@ -100,32 +149,48 @@ crc32(<<>>, Crc, _) -> Crc.
 
 sha_word(Bin) -> <<W:32/big, _/binary>> = crypto:hash(sha256, Bin), W.
 ESCRIPT
-
-echo "== timing (crc/sha REPEAT=$REPEAT, deflate=$DREPEAT calls; ns/call) =="
-CRC_S=$(exec_ns "$REPEAT" "$SBEAM" crc32 4096)
-SHA_S=$(exec_ns "$REPEAT" "$SBEAM" sha256_word 4096)
-DEF_S=$(exec_ns "$DREPEAT" "$SBEAM" deflate_roundtrip 2000)
-CRC_VAL=$(exec_val "$REPEAT" "$SBEAM" crc32 4096)
-if [ "$HAVE_UNSAFE" = 1 ]; then
-  CRC_U=$(exec_ns "$REPEAT" "$UBEAM" crc32 4096)
-  SHA_U=$(exec_ns "$REPEAT" "$UBEAM" sha256_word 4096)
-  DEF_U=$(exec_ns "$DREPEAT" "$UBEAM" deflate_roundtrip 2000)
-else
-  CRC_U="n/a"; SHA_U="n/a"; DEF_U="n/a"
-fi
-
 BASE_OUT=$(escript "$BASE" "$REPEAT" 4096 4096 2000 "$DREPEAT" 2>/dev/null)
 ERL_CRC=$(echo "$BASE_OUT"  | awk '/erlang_crc32 /{print $2}')
 NAT_SHA=$(echo "$BASE_OUT"  | awk '/native_sha256 /{print $2}')
 NAT_ZLIB=$(echo "$BASE_OUT" | awk '/native_zlib /{print $2}')
 ERL_CRC_VAL=$(echo "$BASE_OUT" | awk '/erlang_crc32_value /{print $2}')
+REF=("$ERL_CRC" "$NAT_SHA" "$NAT_ZLIB")             # per-kernel hand-Erl/native reference
+
+# ── 4. time each build × kernel, then print the per-kernel matrix + derived ratios ──────────
+echo "== timing (crc/sha REPEAT=$REPEAT, deflate=$DREPEAT calls; ns/call, invocations only) =="
+# NS[k*5 + i] = ns/call of kernel k under build i ("n/a" if the build did not compile).
+declare -a NS
+for k in "${!SPEC_FN[@]}"; do
+  for i in "${!BUILDS[@]}"; do
+    if [ "${HAVE[$i]:-0}" = 1 ]; then
+      NS[$((k*5+i))]=$(exec_ns "${SPEC_REP[$k]}" "$OUT/smoke.${BUILDS[$i]}.beam" "${SPEC_FN[$k]}" "${SPEC_ARG[$k]}")
+    else
+      NS[$((k*5+i))]="n/a"
+    fi
+  done
+done
 
 echo
-printf "%-20s %14s %14s %16s %13s\n" "kernel" "2core-Unsafe" "2core-Safe" "hand-Erl/native" "Safe/Unsafe"
-printf "%-20s %11s ns %11s ns %13s ns %12s×\n" "crc32(4096)"       "$CRC_U" "$CRC_S" "$ERL_CRC"  "$(ratio "$CRC_S" "$CRC_U")"
-printf "%-20s %11s ns %11s ns %13s ns %12s×\n" "sha256_word(4096)" "$SHA_U" "$SHA_S" "$NAT_SHA"  "$(ratio "$SHA_S" "$SHA_U")"
-printf "%-20s %11s ns %11s ns %13s ns %12s×\n" "deflate_rt(2000)"  "$DEF_U" "$DEF_S" "$NAT_ZLIB" "$(ratio "$DEF_S" "$DEF_U")"
+printf "%-20s %13s %13s %13s %13s %13s %16s\n" \
+  "kernel" "safe/paged" "atomics-safe" "portable" "unsafe-paged" "ceiling" "hand-Erl/native"
+KLABEL=("crc32(4096)" "sha256_word(4096)" "deflate_rt(2000)")
+for k in "${!SPEC_FN[@]}"; do
+  printf "%-20s %10s ns %10s ns %10s ns %10s ns %10s ns %13s ns\n" \
+    "${KLABEL[$k]}" \
+    "${NS[$((k*5+0))]}" "${NS[$((k*5+1))]}" "${NS[$((k*5+2))]}" "${NS[$((k*5+3))]}" "${NS[$((k*5+4))]}" "${REF[$k]}"
+done
 echo
-echo "crc32(4096): 2core=$CRC_VAL  hand-written-Erlang=$ERL_CRC_VAL  (bit-identical head-to-head; both cross-check vs wasmtime in run.sh)"
+echo "== derived ratios per kernel =="
+printf "%-20s %20s %22s %18s\n" "kernel" "paged→atomics (× faster)" "atomics→ref (× slower)" "ceiling→ref (× slower)"
+for k in "${!SPEC_FN[@]}"; do
+  paged=${NS[$((k*5+0))]}; atom=${NS[$((k*5+1))]}; ceil=${NS[$((k*5+4))]}
+  printf "%-20s %20s %22s %18s\n" \
+    "${KLABEL[$k]}" \
+    "$(ratio "$atom" "$paged")×" \
+    "$(ratio "${REF[$k]}" "$atom")×" \
+    "$(ratio "${REF[$k]}" "$ceil")×"
+done
+echo
+echo "crc32(4096): 2core=$(exec_val 1 "$OUT/smoke.safe.beam" crc32 4096)  hand-written-Erlang=$ERL_CRC_VAL  (bit-identical head-to-head; both cross-check vs wasmtime in run.sh)"
 echo "hand-Erl/native col: crc32 = hand-written PURE Erlang; sha256/deflate = native NIF ceiling (crypto/zlib), NOT hand-written."
-[ "$HAVE_UNSAFE" = 0 ] && echo "2core-Unsafe = n/a: the Aggressive inliner does not scale to this 80-function module (compile-time only; see report)."
+echo "paged→atomics = safe/paged ÷ atomics-safe (mem_tier the ONLY change → the pure tier-O effect); atomics→ref / ceiling→ref = the residual to hand-written-Erlang/native."
