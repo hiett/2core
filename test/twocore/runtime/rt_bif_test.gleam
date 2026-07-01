@@ -8,6 +8,8 @@
 
 import gleam/list
 import gleeunit/should
+import twocore/runtime/instance.{BifAllowlist, BifOpen}
+import twocore/runtime/profiles
 import twocore/runtime/rt_bif.{BifTarget, NotAllowlisted}
 
 /// The resolved `own`-stdlib target `rt_stdlib:gcd/2` is permitted.
@@ -61,4 +63,48 @@ pub fn allowlist_entries_all_pass_test() {
   rt_bif.allowlist()
   |> list.all(fn(t) { rt_bif.check(t) == Ok(Nil) })
   |> should.equal(True)
+}
+
+// ───────────────────────── the posture-aware gate `check_gated/2` (F6, §C.3) ─────────────────────────
+
+/// Safe posture (`BifAllowlist`) is EXACTLY the untouched `check`: a build-fixed
+/// non-allowlisted target is still rejected fail-closed (D4/D9). The gate wrapper changes
+/// nothing about the Safe verdict.
+pub fn gated_allowlist_rejects_non_allowlisted_test() {
+  let t = BifTarget("erlang", "abs", 1)
+  rt_bif.check_gated(t, BifAllowlist)
+  |> should.equal(Error(NotAllowlisted(t)))
+  // …and it is LITERALLY `check(t)` — the Safe gate is byte-for-byte unchanged.
+  rt_bif.check_gated(t, BifAllowlist)
+  |> should.equal(rt_bif.check(t))
+}
+
+/// Open posture (`BifOpen`, Unsafe) ADMITS the same build-fixed target Safe just rejected —
+/// widening the build-controlled allow-set (never ambient authority: the target is still a
+/// compiler-built triple, D3a).
+pub fn gated_open_admits_previously_rejected_test() {
+  let t = BifTarget("erlang", "abs", 1)
+  // Safe rejects it …
+  rt_bif.check_gated(t, BifAllowlist)
+  |> should.equal(Error(NotAllowlisted(t)))
+  // … open admits it.
+  rt_bif.check_gated(t, BifOpen)
+  |> should.equal(Ok(Nil))
+}
+
+/// An allowlisted target passes under BOTH postures — open does not corrupt the Safe-admitted
+/// case.
+pub fn gated_allowlisted_passes_both_postures_test() {
+  let t = BifTarget("twocore@runtime@rt_stdlib", "gcd", 2)
+  rt_bif.check_gated(t, BifAllowlist) |> should.equal(Ok(Nil))
+  rt_bif.check_gated(t, BifOpen) |> should.equal(Ok(Nil))
+}
+
+/// Reachability is PROFILE-BOUND (§C.2): the open verdict is a property of the linked profile,
+/// not a flag a program can flip — `profiles.safe()` pins `BifAllowlist`, and only
+/// `profiles.unsafe()` yields `BifOpen`. So `check_gated(_, BifOpen)` is unreachable from a
+/// Safe build.
+pub fn gate_reachability_is_profile_bound_test() {
+  profiles.safe().bif_gate |> should.equal(BifAllowlist)
+  profiles.unsafe().bif_gate |> should.equal(BifOpen)
 }

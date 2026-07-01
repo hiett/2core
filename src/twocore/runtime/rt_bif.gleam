@@ -10,8 +10,19 @@
 //// Phase-1 contents: the resolved `own`-stdlib targets that `ir_lower` may rewrite a
 //// `CallHost` into — currently just `rt_stdlib:gcd/2`. (Numeric `rt_num` calls reach the
 //// runtime through the binding chokepoint directly, not via this gate.)
+////
+//// ## Phase-3 extension: the POSTURE-aware gate (`check_gated/2`, F6)
+////
+//// The fail-closed allowlist (`check/1`, `allowlist/0`, `is_allowed/1`) is untouched — it
+//// stays byte-for-byte the Phase-1 Safe gate. Phase 3 adds one wrapper, `check_gated/2`,
+//// parameterised by `instance.BifGate`: under `BifAllowlist` (Safe) it *is* `check/1`
+//// (fail-closed, unchanged); under `BifOpen` (Unsafe) it admits any BUILD-FIXED target. This
+//// is the ONE place the allowlist can be relaxed, and it is reachable only through the tested
+//// `profiles.unsafe()` opt-in (F4/D4/D9). Acyclic: `rt_bif → instance → ir_opt → ir`
+//// (`instance` imports neither `rt_bif` nor `rt_stdlib`).
 
 import gleam/list
+import twocore/runtime/instance.{type BifGate, BifAllowlist, BifOpen}
 
 /// A concrete BEAM call target: a `module:function/arity` triple.
 ///
@@ -59,4 +70,32 @@ pub fn check(target: BifTarget) -> Result(Nil, BifError) {
 ///   call sites that want a predicate rather than a `Result`.
 pub fn is_allowed(target: BifTarget) -> Bool {
   list.contains(allowlist(), target)
+}
+
+/// Gate a BUILD-FIXED `target` under the `gate` posture chosen by the profile
+/// (`binding.bif_gate`, F6/F7). This is the **one** place the allowlist can be relaxed, and it
+/// is reachable open only through the tested `profiles.unsafe()` opt-in (§C.2, F4/D4/D9).
+///
+/// - `target`: a concrete BEAM `module:function/arity` the compiler's build-time resolver
+///   constructed (never a module atom read from program/attacker data — D3a).
+/// - `gate`: the posture from `binding.bif_gate`.
+///
+/// Return:
+/// - `BifAllowlist` (Safe): **exactly `check(target)`** — fail-closed. A non-allowlisted
+///   target (including a known module/function at the wrong arity) is rejected
+///   `Error(NotAllowlisted(target))`. Nothing about the Safe gate changes.
+/// - `BifOpen` (Unsafe): a **no-op admit** — `Ok(Nil)` for any build-fixed `target`. This is
+///   NOT "arbitrary/full BEAM access": it widens the *build-controlled* allow-set from the
+///   small vetted list to exactly the targets the resolver constructs (the passthrough/own
+///   surface only), never arbitrary BIFs and never a program-derived atom. Node-safety of any
+///   admitted target rests on per-route human vetting, not on the gate. It adds no ambient
+///   authority: an admitted target is still emitted as a STATIC `call '<mod>':'<fn>'(...)`,
+///   never an `apply/3` of runtime data (D3a).
+///
+/// Total — never panics.
+pub fn check_gated(target: BifTarget, gate: BifGate) -> Result(Nil, BifError) {
+  case gate {
+    BifAllowlist -> check(target)
+    BifOpen -> Ok(Nil)
+  }
 }
