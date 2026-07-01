@@ -92,14 +92,19 @@ fn option_none() -> option.Option(a) {
 
 // ───────────────────────────── «IROPT-IFACE-FROZEN» ─────────────────────────────
 
-/// The empty freeze pipeline is the EXACT identity at every level (F1). This is the correct
-/// assertion for the freeze; units 03/04 replace it with the F2 semantics-preserving
-/// differential once real passes are registered.
-pub fn optimize_is_identity_at_every_level_test() {
+/// `OptNone` is the EXACT identity, forever (F1) — the F2 differential baseline. `Baseline` and
+/// `Aggressive` now carry unit-03's real passes, so they are semantics-preserving but NOT
+/// structurally the identity: const-`if`/`switch` reduce this sample's constant `If(1, …)` and
+/// `Switch(0, …)` to their taken arms. Here we assert the durable properties — `OptNone`
+/// identity, and that the optimizer reaches a FIXPOINT (idempotent) at `Baseline`/`Aggressive`;
+/// the per-pass F2 differential lives in `test/twocore/optimize/baseline_test.gleam`.
+pub fn optimize_none_identity_and_fixpoint_test() {
   let m = sample_module()
   assert ir_opt.optimize(m, OptNone) == m
-  assert ir_opt.optimize(m, Baseline) == m
-  assert ir_opt.optimize(m, Aggressive) == m
+  assert ir_opt.optimize(ir_opt.optimize(m, Baseline), Baseline)
+    == ir_opt.optimize(m, Baseline)
+  assert ir_opt.optimize(ir_opt.optimize(m, Aggressive), Aggressive)
+    == ir_opt.optimize(m, Aggressive)
 }
 
 /// `run_pipeline` with no passes is a fixpoint immediately — it returns the module unchanged.

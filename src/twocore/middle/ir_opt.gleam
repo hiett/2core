@@ -10,6 +10,7 @@
 //// (`pipeline/1`), the single point units 03/04 register real passes into.
 
 import twocore/ir.{type Module}
+import twocore/middle/ir_opt/baseline
 import twocore/middle/ir_opt/pass.{type Pass, run_pipeline}
 
 /// The optimization level a build profile selects (F1). `OptNone` is the identity (the
@@ -55,13 +56,15 @@ pub fn optimize(module: Module, level: OptLevel) -> Module {
 
 /// The ordered pass list for `level` — the ONE registration point (units 03/04 append here).
 ///
-/// FREEZE: every level is `[]` (identity). `OptNone` stays `[]` forever (F1); `Baseline` grows
-/// the trust-neutral passes (unit 03); `Aggressive` grows `baseline ++` the Unsafe-only passes
-/// (unit 04), so aggressive is a strict superset of baseline. Total.
+/// `OptNone` stays `[]` forever (F1) — the exact identity, the F2 differential baseline.
+/// `Baseline` runs the trust-neutral pass set (unit 03, `baseline.baseline_passes()`). Those
+/// same passes ALSO run at `Aggressive`, which is kept a superset of `Baseline` (keystone A.2);
+/// unit 04 replaces the `Aggressive` arm with `baseline.baseline_passes() ++
+/// aggressive.aggressive_passes()`, appending its Unsafe-only passes. Total.
 fn pipeline(level: OptLevel) -> List(Pass) {
   case level {
     OptNone -> []
-    Baseline -> []
-    Aggressive -> []
+    Baseline -> baseline.baseline_passes()
+    Aggressive -> baseline.baseline_passes()
   }
 }
