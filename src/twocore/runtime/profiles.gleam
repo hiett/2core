@@ -27,8 +27,8 @@
 import gleam/int
 import twocore/middle/ir_opt.{Aggressive}
 import twocore/runtime/instance.{
-  type Binding, type Mode, BifOpen, Binding, HostOpen, MeterOff, Safe,
-  StdlibPassthrough, Unsafe, safe_default,
+  type Binding, type Mode, Atomics, BifOpen, Binding, Cell, HostOpen, MeterOff,
+  Nif, Paged, Safe, StdlibPassthrough, Threaded, Unsafe, safe_default,
 }
 
 /// The Safe-profile **hard cap** on linear-memory pages (E3) — the single source of the
@@ -200,21 +200,41 @@ pub fn is_safe(inst: Instance) -> Bool {
 }
 
 /// Derive a DISTINCT output module name for a coexisting build of the same source module
-/// (§B.3), so a Safe and an Unsafe `.beam` of ONE source can load together on one node without
-/// an atom clash. Two `.beam`s cannot load under the same module atom, and a name collision
-/// hot-replaces the earlier module; the generated atom is `ir.Module.name`, so the linker
-/// gives the two builds distinct names before `emit_core`.
+/// (§B.5/B3), so any two `.beam`s of ONE source that differ in build identity can load together
+/// on one node without an atom clash. Two `.beam`s cannot load under the same module atom, and a
+/// name collision hot-replaces (clobbers) the earlier module; the generated atom is
+/// `ir.Module.name`, so the linker gives the builds distinct names before `emit_core`.
+///
+/// A build's identity is the triple `(mode, state_strategy, mem_tier)` — two builds that differ
+/// in ANY of these are different `.beam`s (the calling convention and the linked `rt_*` module
+/// differ, G1/B3), so `safe()` (cell) and `portable()` (threaded) — **both `Safe`** — must NOT
+/// collide. The atom keys on all three, appending suffixes in a FIXED order:
+///
+/// - `mode`: `Unsafe` appends `_unsafe`; `Safe` appends nothing.
+/// - `state_strategy`: `Threaded` appends `_threaded`; `Cell` appends nothing.
+/// - `mem_tier`: `Atomics` appends `_atomics`, `Nif` appends `_nif`; `Paged` appends nothing.
+///
+/// The default posture (`Safe`/`Cell`/`Paged`) appends NOTHING — the atom is the canonical
+/// `base`, byte-identical to Phase-2/3 (conformance-neutral, G7), so every existing coexistence
+/// assertion still holds. Any two distinct-identity builds derive distinct atoms.
 ///
 /// - `base`: the source module's canonical name (its `ir.Module.name`).
-/// - `mode`: the build's execution mode. `Safe` keeps `base` (the canonical name); `Unsafe`
-///   returns `base <> "_unsafe"`. The two results are therefore ALWAYS distinct (`base` never
-///   equals `base <> "_unsafe"`), which is the load-time precondition for coexistence.
-/// - Returns the derived module-name string. PURE string derivation — introduces no policy and
-///   reads no binding; lives here (unit-10-owned) so `instance.gleam` (keystone-owned) is
-///   untouched. Total — never fails.
-pub fn coexist_name(base: String, mode: Mode) -> String {
-  case mode {
-    Safe -> base
-    Unsafe -> base <> "_unsafe"
+/// - `binding`: the build's `Binding`; only `mode`/`state_strategy`/`mem_tier` are read.
+/// - Returns the derived module-name string. PURE string derivation — introduces no policy.
+///   Total — never fails.
+pub fn coexist_name(base: String, binding: Binding) -> String {
+  let mode_suffix = case binding.mode {
+    Safe -> ""
+    Unsafe -> "_unsafe"
   }
+  let state_suffix = case binding.state_strategy {
+    Cell -> ""
+    Threaded -> "_threaded"
+  }
+  let tier_suffix = case binding.mem_tier {
+    Paged -> ""
+    Atomics -> "_atomics"
+    Nif -> "_nif"
+  }
+  base <> mode_suffix <> state_suffix <> tier_suffix
 }

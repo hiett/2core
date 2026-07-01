@@ -203,15 +203,16 @@ pub fn is_safe_distinguishes_instances_test() {
   assert profiles.unsafe_instance().binding == profiles.unsafe()
 }
 
-/// `coexist_name` derives DISTINCT output atoms for a Safe and an Unsafe build of one source
-/// (§B.3): `Safe` keeps the canonical `base`, `Unsafe` returns `base <> "_unsafe"`, and the two
-/// are always distinct — the load-time precondition for coexistence (two `.beam`s cannot load
-/// under one atom). Pure derivation; no policy.
+/// `coexist_name` derives DISTINCT output atoms for builds of one source that differ in build
+/// identity (§B.5): the default `safe()` (Safe/Cell/Paged) keeps the canonical `base`, while
+/// `unsafe()` appends `_unsafe` — always distinct, the load-time precondition for coexistence
+/// (two `.beam`s cannot load under one atom). Pure derivation; no policy.
 pub fn coexist_name_gives_distinct_output_atoms_test() {
-  assert profiles.coexist_name("m", Safe) == "m"
-  assert profiles.coexist_name("m", Unsafe) == "m_unsafe"
+  assert profiles.coexist_name("m", profiles.safe()) == "m"
+  assert profiles.coexist_name("m", profiles.unsafe()) == "m_unsafe"
   // Always distinct for any base.
-  assert profiles.coexist_name("m", Safe) != profiles.coexist_name("m", Unsafe)
-  assert profiles.coexist_name("twocore@x@mod", Safe)
-    != profiles.coexist_name("twocore@x@mod", Unsafe)
+  assert profiles.coexist_name("m", profiles.safe())
+    != profiles.coexist_name("m", profiles.unsafe())
+  assert profiles.coexist_name("twocore@x@mod", profiles.safe())
+    != profiles.coexist_name("twocore@x@mod", profiles.unsafe())
 }

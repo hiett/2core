@@ -20,7 +20,7 @@ import gleam/list
 import gleam/option
 import twocore/ir
 import twocore/pipeline
-import twocore/runtime/instance.{type Binding, Safe, Unsafe}
+import twocore/runtime/instance.{type Binding}
 import twocore/runtime/profiles
 
 // ─────────────────────────────── fixture ───────────────────────────────
@@ -125,8 +125,8 @@ fn build(name: String, binding: Binding) -> BitArray {
 /// 4. `is_safe` distinguishes the two live instances.
 pub fn safe_and_unsafe_coexist_with_isolated_state_test() {
   let base = "twocore@coexist@statemod"
-  let safe_name = profiles.coexist_name(base, Safe)
-  let unsafe_name = profiles.coexist_name(base, Unsafe)
+  let safe_name = profiles.coexist_name(base, profiles.safe())
+  let unsafe_name = profiles.coexist_name(base, profiles.unsafe())
   // Precondition: the two builds have DISTINCT output atoms (else the second load hot-replaces
   // the first — no coexistence).
   assert safe_name != unsafe_name

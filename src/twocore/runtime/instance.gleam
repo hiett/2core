@@ -132,6 +132,53 @@ pub type HostPolicy {
   HostOpen
 }
 
+/// How generated code reaches mutable instance state (the memory handle, mutable globals, the
+/// table) — the tier-P/O state sub-axis (G1). A codegen-shape choice realised in `emit_core`'s
+/// state-access seam (G5), NOT a module swap through the binding. Orthogonal to `mem_tier`: the
+/// strategy picks the *function family* the seam calls (`store` vs `t_store`) and whether
+/// generated functions thread a state record; the tier picks the *module*.
+///
+/// - `Cell`: tier-O, the Phase-2/3 default. The seam emits `call '<state/mem/table_module>':
+///   '<op>'(...)` against the per-process **process-dictionary cell** (`rt_state`); generated
+///   function arities are unchanged; `instantiate/0` seeds the cell and returns `'ok'`.
+/// - `Threaded`: tier-P, new. The seam threads a purely-functional **instance-state record**
+///   (`rt_state.InstanceState`) through generated code — every state-reaching function takes the
+///   record as a parameter and RETURNS the (possibly updated) record (the uniform-threading rule
+///   §10, §A.3). No process dictionary; no OTP-native state; the "runs-anywhere" build.
+pub type StateStrategy {
+  Cell
+  Threaded
+}
+
+/// The linear-memory trust tier (G2). Selects which `rt_mem` backend the linker links, all
+/// behind one uniform interface (§B.2). Orthogonal to `state_strategy` (above) and to policy (G3).
+///
+/// - `Paged`: tier-P (Phase-2). Immutable-binary rebuild-on-write; universal, sparse-friendly.
+/// - `Atomics`: tier-O (new, unit 04). O(1) process-local mutation via Erlang `atomics` — no
+///   custom native code, cannot crash the node. The shipped performance lever. `grow` is the
+///   sharp edge (fixed size at creation → pre-allocate to the effective max; requires a bounded
+///   max/cap — an uncapped no-max module is a fail-closed link-time rejection, never a silent
+///   4 GiB pre-allocation or paged fallback, §B.2).
+/// - `Nif`: tier-N (new, unit 05, **Unsafe-only**). Raw O(1) native memory; the ceiling;
+///   **forbidden in Safe** (G6, §B.4). Interface + reference; the C impl may be documented-deferred.
+pub type MemTier {
+  Paged
+  Atomics
+  Nif
+}
+
+/// The funcref-table trust tier (G2). Every variant is node-safe (tier P or O) — there is no
+/// `nif` table tier, so `table_tier` cannot violate Safe-forbids-nif.
+///
+/// - `TablePaged`: tier-P (Phase-2) — immutable sparse `Dict` table (the existing `rt_table`).
+/// - `TableEts`: tier-O (new, unit 06) — an `ets`-backed table.
+/// - `TableAtomics`: tier-O (new, unit 06) — an `atomics`-indexed table.
+pub type TableTier {
+  TablePaged
+  TableEts
+  TableAtomics
+}
+
 /// Which compiled runtime module implements each runtime layer.
 ///
 /// Each field holds a Gleam→Erlang-mangled module name (e.g.
@@ -171,10 +218,21 @@ pub type HostPolicy {
 ///   `stdlib_module` (which names the `own` impl module the call still targets).
 /// - `host_policy`: deny-all / whitelist / open (F4).
 ///
+/// The Phase-4 **trust-tier** axes (G1/G2) — orthogonal to policy, composed by the linker:
+/// - `state_strategy`: `Cell` (tier-O, the pdict cell — Phase-2/3 default) vs `Threaded`
+///   (tier-P, the record-threading runs-anywhere build). A **codegen-shape** sub-axis realised
+///   in `emit_core`'s state-access seam (G5), NOT a module swap through this record.
+/// - `mem_tier`: the DECLARED linear-memory tier (`Paged`/`Atomics`/`Nif`) the linker (unit 07)
+///   maps to `mem_module` via `resolve_tiers`. `emit_core` links `mem_module` (never `mem_tier`,
+///   keeping it tier-agnostic, G5); `mem_tier` is the advisory the fail-closed gate checks
+///   against `mem_module` (§B.4). `Nif` is Unsafe-only (G6).
+/// - `table_tier`: the DECLARED funcref-table tier (`TablePaged`/`TableEts`/`TableAtomics`) the
+///   linker maps to `table_module`. Every variant is node-safe (no `nif` table tier).
+///
 /// Phase-2 added the memory/table/instance-state module fields; because binding lives in this
-/// one record, extending it with policy is a clean addition, not a retrofit. The cell↔threaded
-/// *state* tier is a codegen-shape sub-axis (`emit_core`'s state-access seam), NOT a module
-/// swap through this record (overview E1).
+/// one record, extending it with policy and the trust tiers is a clean addition, not a retrofit.
+/// The cell↔threaded *state* tier is a codegen-shape sub-axis (`emit_core`'s state-access seam),
+/// NOT a module swap through this record (overview E1).
 pub type Binding {
   Binding(
     mode: Mode,
@@ -194,6 +252,10 @@ pub type Binding {
     bif_gate: BifGate,
     stdlib: StdlibMode,
     host_policy: HostPolicy,
+    // ── Phase-4 trust-tier axes (G1/G2) ─────────────────────────────────────
+    state_strategy: StateStrategy,
+    mem_tier: MemTier,
+    table_tier: TableTier,
   )
 }
 
@@ -228,5 +290,12 @@ pub fn safe_default() -> Binding {
     bif_gate: BifAllowlist,
     stdlib: StdlibOwn,
     host_policy: HostDenyAll,
+    // ── Phase-4 trust-tier posture (G1/G2). The maximally node-safe default (D4): the
+    // tier-O `Cell` state strategy + the tier-P `Paged`/`TablePaged` backends — byte-identical
+    // to Phase-2/3. Leaving it (tier-P `portable` / tier-N `ceiling`) requires NAMING a profile
+    // (unit 07); tier-N (`Nif`) additionally requires Unsafe (§B.4).
+    state_strategy: Cell,
+    mem_tier: Paged,
+    table_tier: TablePaged,
   )
 }

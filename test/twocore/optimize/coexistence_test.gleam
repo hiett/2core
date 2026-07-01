@@ -31,7 +31,7 @@ import twocore/backend/build_beam
 import twocore/conformance/ffi
 import twocore/ir
 import twocore/pipeline
-import twocore/runtime/instance.{type Binding, Safe, Unsafe}
+import twocore/runtime/instance.{type Binding}
 import twocore/runtime/profiles
 
 // ─────────────────────────── state isolation (real iso.wasm, across profiles) ───────────────────────────
@@ -47,8 +47,8 @@ pub fn safe_unsafe_iso_state_coexist_test() {
     ffi.read_file("test/twocore/conformance/corpus/iso.wasm")
   let assert Ok(m0) = pipeline.source_to_ir(bytes)
   let base = m0.name <> "_" <> int.to_string(ffi.unique_int())
-  let safe_name = profiles.coexist_name(base, Safe)
-  let unsafe_name = profiles.coexist_name(base, Unsafe)
+  let safe_name = profiles.coexist_name(base, profiles.safe())
+  let unsafe_name = profiles.coexist_name(base, profiles.unsafe())
   // Precondition for coexistence: the two builds have DISTINCT output atoms (else the second
   // load hot-replaces the first — no coexistence).
   assert safe_name != unsafe_name
@@ -89,8 +89,8 @@ pub fn safe_unsafe_iso_state_coexist_test() {
 /// `HostDenyAll` into a return, and `HostOpen` is reachable only through `profiles.unsafe()`.
 pub fn safe_unsafe_host_capability_isolation_test() {
   let base = "twocore@coexist@hostmod_" <> int.to_string(ffi.unique_int())
-  let safe_name = profiles.coexist_name(base, Safe)
-  let unsafe_name = profiles.coexist_name(base, Unsafe)
+  let safe_name = profiles.coexist_name(base, profiles.safe())
+  let unsafe_name = profiles.coexist_name(base, profiles.unsafe())
   assert safe_name != unsafe_name
 
   let s = compile_load(host_module(safe_name), profiles.safe())
