@@ -15,6 +15,7 @@
 //// - the `FuelExhausted` policy trap carries its non-spec message and the `rt_meter` seam is
 ////   callable (F5).
 
+import gleam/erlang/process
 import gleam/list
 import gleam/option
 import twocore/ir
@@ -246,11 +247,21 @@ pub fn fuel_exhausted_message_test() {
 }
 
 /// The `rt_meter` seam is callable with its frozen ABI: `seed_fuel` seeds the budget and zeros
-/// the consumed total, and `charge` (arity 1, returns `Nil`) accumulates against it — so
-/// `fuel_consumed()` reads the charged total. (Enforcement lands in unit 05; the ABI is fixed
-/// here.)
+/// the consumed total, and `charge` (arity 1, returns `Nil`) charges against it — so
+/// `fuel_consumed()` reads the charged total (5, well within the 1000 budget, so no trap).
+///
+/// Enforcement is LIVE as of unit 05, so a seeded budget now bounds `charge`. This runs the
+/// seed inside a FRESH process (the one-instance-one-process posture) so the small budget does
+/// not leak into eunit's shared per-run process dictionary and trap later fuel-charging tests;
+/// the observed total is marshalled back.
 pub fn rt_meter_seam_is_callable_test() {
-  rt_meter.seed_fuel(1000)
-  rt_meter.charge(5)
-  assert rt_meter.fuel_consumed() == 5
+  let reply = process.new_subject()
+  let _ =
+    process.spawn(fn() {
+      rt_meter.seed_fuel(1000)
+      rt_meter.charge(5)
+      process.send(reply, rt_meter.fuel_consumed())
+    })
+  let assert Ok(total) = process.receive(reply, within: 5000)
+  assert total == 5
 }
