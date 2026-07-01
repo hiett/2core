@@ -51,6 +51,23 @@ import twocore/middle/ir_opt/pass.{type Pass, map_expr, pass, per_expr}
 /// guard + the size budget, not on this number.
 const small_body_nodes: Int = 24
 
+/// The ABSOLUTE ceiling (whole-module Expr-node count) inlining is allowed to grow a module to —
+/// the graceful-degradation bound (F8; Phase-3 §00 F8: "the optimizer is deliberately bounded").
+///
+/// The per-run size budget `8·nodes + 4096` scales with the input, so on a very large module
+/// (unit-11's ~80-function capstone finding) it would still license a MANY-FOLD expansion, and
+/// because `run_pipeline` recomputes that budget each fixpoint round over the already-enlarged
+/// module the growth compounds — a compile-time code explosion. This constant clamps the budget
+/// to a FIXED node ceiling INDEPENDENT of input size, so the module can never grow past it: on a
+/// large module the inliner fills up to the ceiling and then CLEANLY STOPS, leaving the remaining
+/// calls un-inlined. Reducing inlining is always sound (§B.4 — the un-inlined call keeps the exact
+/// same value/trap), so this cannot introduce a soundness bug; it only bounds compile time/size.
+///
+/// A tuning knob, not a correctness bound. It is far above every corpus/spec module (whose per-run
+/// budget never binds), so it changes nothing on realistic input; it engages only on pathological
+/// inputs whose fully-inlined form would explode.
+pub const inline_node_ceiling: Int = 65_536
+
 /// The ordered Unsafe-only passes, appended after the baseline passes to build the `Aggressive`
 /// pipeline arm: `pipeline(Aggressive) == baseline.baseline_passes() ++ aggressive_passes()`.
 ///
@@ -122,6 +139,11 @@ pub fn charge_elide() -> Pass {
 /// spent or no site is eligible, `run` is the identity, so the `run_pipeline` fixpoint
 /// converges. No `let assert`/`panic`: an ineligible/malformed shape is left unchanged (D4).
 ///
+/// GRACEFUL DEGRADATION (F8): the per-run budget is clamped by the absolute `inline_node_ceiling`,
+/// so on a very large module the inliner grows it to the ceiling and then cleanly STOPS — the
+/// remaining calls are left un-inlined (always sound, §B.4). This bounds compile time/size on a
+/// pathological input instead of letting the round-compounding budget explode.
+///
 /// - Return: the whole-module inlining `Pass`. Total — never fails.
 pub fn inline() -> Pass {
   pass("inline", run_inline)
@@ -132,7 +154,10 @@ pub fn inline() -> Pass {
 ///
 /// - `budget`: `B_remaining` — the number of Expr-nodes inlining may still ADD across the whole
 ///   module. Strictly decreases per inline; when it drops below the next callee's cost the site
-///   is left unchanged (the termination measure).
+///   is left unchanged (the termination measure). Seeded as
+///   `max(0, min(8·nodes + 4096, inline_node_ceiling − nodes))` — the generous size-proportional
+///   allowance, CLAMPED so the output can never exceed the absolute `inline_node_ceiling`
+///   (graceful degradation on a large module, F8).
 /// - `counter`: the next unused integer suffix for a fresh `…$inl<n>` name. Monotonically
 ///   increasing so every generated name is unique.
 type InlineState {
@@ -169,10 +194,18 @@ fn run_inline(module: ir.Module) -> ir.Module {
   let input_sites = count_calls_module(funcs)
   let ctx =
     InlineCtx(by_name: by_name, recursive: recursive, sites: input_sites)
-  // Budget: a generous allowance proportional to the module size (a safety valve; on the
-  // corpus it is never exhausted). Counter: seeded ABOVE every `$inl` suffix already present so
-  // generated names are globally unique across fixpoint rounds.
-  let budget = 8 * module_node_count(funcs) + 4096
+  // Budget: the generous size-proportional allowance `8·nodes + 4096` (a safety valve; on the
+  // corpus it is never exhausted), CLAMPED so the module can never grow past the absolute
+  // `inline_node_ceiling`. The `inline_node_ceiling - nodes` term is the graceful-degradation
+  // bound (F8): the size-proportional term alone would license a many-fold, round-compounding
+  // expansion on a large module, so we cap total output at a FIXED node ceiling — the inliner
+  // fills up to it and then cleanly stops (remaining calls left un-inlined; always sound, §B.4).
+  // Kept non-negative: an already-oversized input (nodes ≥ ceiling) yields budget 0 → no inlining.
+  // Counter: seeded ABOVE every `$inl` suffix already present so generated names are globally
+  // unique across fixpoint rounds.
+  let nodes = module_node_count(funcs)
+  let budget =
+    int.max(0, int.min(8 * nodes + 4096, inline_node_ceiling - nodes))
   let seed = 1 + max_inl_counter_module(funcs)
   let st0 = InlineState(budget: budget, counter: seed)
 

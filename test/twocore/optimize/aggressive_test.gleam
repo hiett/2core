@@ -11,6 +11,7 @@
 //// The optimizer is run at `Aggressive` (baseline + charge_elide + inline), and — for the
 //// Unsafe-only gating tests (F4) — also at `Baseline`/`OptNone`.
 
+import gleam/int
 import gleam/list
 import gleam/option
 import gleam/result
@@ -703,4 +704,130 @@ pub fn inlined_shape_is_emittable_test() {
 pub fn aggressive_passes_are_registered_once_test() {
   assert list.map(aggressive.aggressive_passes(), pass.pass_name)
     == ["charge-elide", "inline"]
+}
+
+// ══════════════════════════ §11. graceful degradation on a large module (F8) ══════════════════════════
+
+/// The Expr-node count of `e` (each node 1; structured forms add their sub-nodes) — a local mirror
+/// of the inliner's own cost measure, for the graceful-degradation bound below.
+fn expr_nodes(e: ir.Expr) -> Int {
+  case e {
+    ir.Let(_, rhs, body) -> 1 + expr_nodes(rhs) + expr_nodes(body)
+    ir.Block(_, _, body) -> 1 + expr_nodes(body)
+    ir.Loop(_, _, _, body) -> 1 + expr_nodes(body)
+    ir.If(_, _, t, el) -> 1 + expr_nodes(t) + expr_nodes(el)
+    ir.Switch(_, _, arms, default) ->
+      list.fold(arms, 1 + expr_nodes(default), fn(acc, a) {
+        acc + expr_nodes(a.body)
+      })
+    ir.Charge(_, body) -> 1 + expr_nodes(body)
+    _ -> 1
+  }
+}
+
+/// The total Expr-node count across every function body in `m`.
+fn module_nodes(m: ir.Module) -> Int {
+  list.fold(m.functions, 0, fn(acc, f) { acc + expr_nodes(f.body) })
+}
+
+/// The ascending list `[1, 2, …, n]` (empty for `n ≤ 0`) — a local range helper.
+fn upto(n: Int) -> List(Int) {
+  case n <= 0 {
+    True -> []
+    False -> list.append(upto(n - 1), [n])
+  }
+}
+
+/// GRACEFUL DEGRADATION (F8; Phase-3 §00 F8 "the optimizer is deliberately bounded"). On a module
+/// whose fully-inlined form would explode, the inliner fills up to the absolute
+/// `inline_node_ceiling` and then CLEANLY STOPS — it does NOT blow up, and (because reducing
+/// inlining is always sound, §B.4) it still preserves results.
+///
+/// The explosion driver is a depth-20 binary fan-out `blow(q) → e19 → … → e0`, where
+/// `e_k(x) = e_{k-1}(x) + e_{k-1}(x)`: each `e_k` is a small (≤ `small_body_nodes`) acyclic leaf-ish
+/// callee, so all are inlining-eligible, and the naive fully-inlined body is ~2²⁰ nodes. The leaf
+/// combines the *param* `q` (not a constant), so the expanded tree of adds does NOT constant-fold
+/// away — the expansion PERSISTS in the output, making the node-count bound meaningful. Without the
+/// cap this would compound across fixpoint rounds into a compile-time explosion.
+///
+/// Two assertions, exactly as the robustness fix requires:
+///   1. the optimized module's node count is BOUNDED by `inline_node_ceiling` (no explosion) — and
+///      it did grow well past the tiny input, so the cap is what stopped it (not a lack of work);
+///   2. a small embedded differential still holds: an independent probe chain
+///      `probe → p2 → p1 → p0` (`p0 = 42`) still fully inlines-and-folds to `42` — the value is
+///      preserved through the (bounded) inlining.
+pub fn large_module_degrades_gracefully_test() {
+  let depth = 20
+  // e0(x) = x  (leaf identity); e_k(x) = e_{k-1}(x) + e_{k-1}(x).
+  let e0 = func("e0", [p_i32("x")], [ir.TI32], ir.Return([ir.Var("x")]))
+  let e_levels =
+    list.map(upto(depth), fn(k) {
+      let prev = "e" <> int.to_string(k - 1)
+      func(
+        "e" <> int.to_string(k),
+        [p_i32("x")],
+        [ir.TI32],
+        ir.Let(
+          ["a"],
+          ir.CallDirect(prev, [ir.Var("x")]),
+          ir.Let(
+            ["b"],
+            ir.CallDirect(prev, [ir.Var("x")]),
+            ir.Let(
+              ["s"],
+              ir.Num(ir.IAdd(ir.W32), [ir.Var("a"), ir.Var("b")]),
+              ir.Return([ir.Var("s")]),
+            ),
+          ),
+        ),
+      )
+    })
+  let blow =
+    func(
+      "blow",
+      [p_i32("q")],
+      [ir.TI32],
+      ir.Let(
+        ["r"],
+        ir.CallDirect("e" <> int.to_string(depth), [ir.Var("q")]),
+        ir.Return([ir.Var("r")]),
+      ),
+    )
+
+  // Embedded probe (placed FIRST so it inlines within budget before `blow` consumes the rest):
+  // probe → p2 → p1 → p0, folding to the constant 42.
+  let p0 = func("p0", [], [ir.TI32], ir.Return([ir.ConstI32(42)]))
+  let relay = fn(name: String, callee: String) {
+    func(
+      name,
+      [],
+      [ir.TI32],
+      ir.Let(["v"], ir.CallDirect(callee, []), ir.Return([ir.Var("v")])),
+    )
+  }
+  let probe =
+    func(
+      "probe",
+      [],
+      [ir.TI32],
+      ir.Let(["v"], ir.CallDirect("p2", []), ir.Values([ir.Var("v")])),
+    )
+
+  let funcs =
+    list.flatten([
+      [probe, relay("p2", "p1"), relay("p1", "p0"), p0],
+      [blow, e0],
+      e_levels,
+    ])
+  let m =
+    mod_of(funcs, [ir.ExportFn("blow", "blow"), ir.ExportFn("probe", "probe")])
+  let optimized = opt_agg(m)
+
+  // (1) Graceful degradation — bounded output, no explosion; and the cap genuinely engaged (the
+  // module grew far beyond its tiny input rather than being left untouched).
+  assert module_nodes(optimized) <= aggressive.inline_node_ceiling
+  assert module_nodes(optimized) > module_nodes(m)
+
+  // (2) Results preserved — the embedded probe still inlines-and-folds to 42.
+  assert body_of(optimized, "probe") == vi32(42)
 }
