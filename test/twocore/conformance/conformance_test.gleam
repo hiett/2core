@@ -86,6 +86,15 @@ const matrix_skip_numeric: List(String) = [
   "i64.json", "int_exprs.json", "int_literals.json",
 ]
 
+/// Files that import `spectest`'s MEMORY/TABLE state — excluded from the NON-paged matrix combos
+/// only (see `run_combo`). The P5-09 `link.spectest_export` builds the provided memory/table with
+/// the PAGED tier unconditionally, so importing it under an `atomics` binding is a cross-tier
+/// handle mismatch (a named P5-09 gap, not a spec divergence). These files stay GREEN under the
+/// paged combos + both full profiles; their bulk semantics are tier-covered by the own-memory
+/// `memory_*` files. A file appears here ONLY because its OWN memory would otherwise be atomics but
+/// it imports the paged `spectest` memory — never for convenience.
+const matrix_skip_spectest_state: List(String) = ["data.json"]
+
 /// The spec suite under the fail-closed **Safe** profile (Baseline optimizer + enforcing fuel):
 /// `fail == 0 && pass > 0`. This is the Phase-1/2 green re-run through the Phase-3 full chain
 /// (`ir_lower → optimize → emit_core`), confirming the Baseline optimizer is conformance-neutral.
@@ -158,12 +167,26 @@ fn run_combo(c: Combo) -> Nil {
   let binding =
     Binding(..combos.binding_for(c), safe_max_pages: matrix_cap_pages)
   let assert Ok(validated) = profiles.validate_binding(binding)
+  // Under a non-PAGED memory tier, ALSO skip files that IMPORT `spectest`'s memory/table: the
+  // P5-09 link contract (`link.spectest_export`) builds the provided memory/table with the PAGED
+  // `rt_mem.fresh`/`rt_table.new` unconditionally, so importing it under an `atomics` binding hands
+  // a paged handle to atomics-tier code (a cross-tier mismatch, not a spec divergence). This is a
+  // NAMED, honest cross-unit gap (P5-09 spectest state is paged-tier); the affected file stays
+  // GREEN under `paged` + both full profiles, and its tier-sensitive bulk semantics are covered
+  // under `atomics` by `memory_init`/`memory_fill`/`memory_copy` (own-memory bulk, no import).
+  let paged_only = case string.contains(c.label, "atomics") {
+    True -> matrix_skip_spectest_state
+    False -> []
+  }
   // Skip the tier-invariant bulk-numeric files (see `matrix_skip_numeric`) — they cannot
   // differ across tiers and re-running them ×5 OOMs CI. The two full-profile runs cover them.
   run_suite_keep(
     driver.pipeline_with(validated),
     "Phase-4 matrix: " <> c.label,
-    fn(name) { !list.contains(matrix_skip_numeric, name) },
+    fn(name) {
+      !list.contains(matrix_skip_numeric, name)
+      && !list.contains(paged_only, name)
+    },
   )
 }
 

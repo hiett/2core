@@ -16,17 +16,22 @@ import twocore/conformance/runner
 
 const corpus_dir = "test/twocore/conformance/corpus"
 
-// A spy driver: `check_frontend` rejects (so a frontend-only assert "passes" by
-// rejection), and `instantiate` records that it was reached then fails. `invoke` is
-// never reached in these tests.
+// A spy driver: `check_frontend`/`check_frontend_ast` reject (so a frontend-only assert
+// "passes" by rejection), and every INSTANTIATE path records that it was reached then fails
+// (`ModuleCmd` now routes through `instantiate_env`). `invoke`/`get_global` are never reached.
 fn spy_driver() -> runner.Driver {
+  let spy_instantiate = fn() {
+    ffi.spy_mark()
+    Error("spy: instantiate must not run for invalid/malformed")
+  }
   runner.Driver(
     check_frontend: fn(_bytes) { Error("spy: rejected by frontend") },
-    instantiate: fn(_bytes) {
-      ffi.spy_mark()
-      Error("spy: instantiate must not run for invalid/malformed")
-    },
+    instantiate: fn(_bytes) { spy_instantiate() },
     invoke: fn(_inst, _field, _args) { runner.DriverError("spy: no invoke") },
+    instantiate_env: fn(_bytes, _env) { spy_instantiate() },
+    instantiate_ast: fn(_m, _env) { spy_instantiate() },
+    check_frontend_ast: fn(_m) { Error("spy: rejected by frontend") },
+    get_global: fn(_inst, _field) { runner.DriverError("spy: no get_global") },
   )
 }
 

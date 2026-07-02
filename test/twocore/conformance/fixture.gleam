@@ -36,13 +36,30 @@ pub type NanKind {
   Arithmetic
 }
 
+/// Which reference type a null / reference expectation is tagged with (the spec JSON
+/// `type` field, R18). At the value layer a null's reftype is not observable (both reftypes
+/// share the ONE null sentinel — `rt_ref.null_ref`), so the tag is carried for readable
+/// diagnostics; the oracle matches a null of EITHER type (see `oracle.matches`).
+pub type RefTypeTag {
+  FuncRefTag
+  ExternRefTag
+}
+
 /// A single WebAssembly value as it appears in a fixture. Integers and concrete floats
 /// hold the **raw UNSIGNED bit pattern** (the decimal-string in the JSON, parsed to an
-/// `Int`). A NaN expectation carries only a `NanKind`, never concrete bits.
+/// `Int`). A NaN expectation carries only a `NanKind`, never concrete bits. Reference values
+/// (P5-11 / R18) are BEAM terms, not integers — they marshal through the term invoke-ABI.
 ///
 /// - `I32Val(bits)` / `I64Val(bits)`: `bits` in `[0, 2^32)` / `[0, 2^64)`.
 /// - `F32Bits(bits)` / `F64Bits(bits)`: raw IEEE-754 binary32/binary64 bits.
 /// - `F32Nan(kind)` / `F64Nan(kind)`: a NaN expectation of the given class.
+/// - `NullRef(ty)`: a typed null reference (`ref.null func` | `ref.null extern`). Matches a
+///   returned null of either reftype (the null sentinel is shared).
+/// - `ExternRefVal(id)`: a non-null externref with a TESTABLE host identity `id` (the test's
+///   `ref.extern N` — the engine must round-trip the SAME id).
+/// - `FuncRefVal(index)`: a non-null funcref. Its identity is NOT compared (our funcref is an
+///   opaque type-tagged table entry); `index` is diagnostic only. `None` = wast2json's
+///   value-less funcref placeholder.
 pub type SpecValue {
   I32Val(bits: Int)
   I64Val(bits: Int)
@@ -50,6 +67,9 @@ pub type SpecValue {
   F64Bits(bits: Int)
   F32Nan(kind: NanKind)
   F64Nan(kind: NanKind)
+  NullRef(ty: RefTypeTag)
+  ExternRefVal(id: Int)
+  FuncRefVal(index: Option(Int))
 }
 
 /// Which on-disk form a rejected-module command references.
@@ -93,8 +113,12 @@ pub type Action {
 ///   but INSTANTIATING it must trap (an OOB active data/element segment, or a
 ///   trapping `start`) with a message containing `text` (E5). Full pipeline —
 ///   instantiated, and asserted to fail to instantiate.
+/// - `AssertUnlinkable(line, filename, text)`: `filename` decodes + validates + compiles,
+///   but LINKING it must fail (an unsatisfied / type-mismatched import) with a message
+///   containing `text` (H6/D3a fail-closed proof). A successful link is a FAIL — a silently
+///   linked unsatisfied import would be exactly the ambient authority D3a forbids.
 /// - `Unhandled(line, kind)`: a command outside the modelled set (e.g.
-///   `assert_exhaustion`, `assert_unlinkable`) — reported as a skip.
+///   `assert_exhaustion`) — reported as a skip.
 pub type Command {
   ModuleCmd(line: Int, name: Option(String), filename: String)
   Register(line: Int, as_name: String, module: Option(String))
@@ -113,6 +137,7 @@ pub type Command {
     text: String,
   )
   AssertUninstantiable(line: Int, filename: String, text: String)
+  AssertUnlinkable(line: Int, filename: String, text: String)
   /// A bare `(invoke …)` / `(get …)` script action with NO assertion — run purely for
   /// its SIDE EFFECTS on the current module's mutable state (e.g. a `reset`/`init`/`run`
   /// that stores into memory before later asserts read it). Phase-1's pure modules made
@@ -203,6 +228,11 @@ fn command_decoder() -> decode.Decoder(Command) {
       use text <- decode.optional_field("text", "", decode.string)
       decode.success(AssertUninstantiable(line, filename, text))
     }
+    "assert_unlinkable" -> {
+      use filename <- decode.field("filename", decode.string)
+      use text <- decode.optional_field("text", "", decode.string)
+      decode.success(AssertUnlinkable(line, filename, text))
+    }
     "action" -> {
       use action <- decode.field("action", action_decoder())
       decode.success(ActionCmd(line, action))
@@ -252,9 +282,27 @@ fn parse_spec_value(ty: String, value: String) -> SpecValue {
         Some(k) -> F64Nan(k)
         None -> F64Bits(parse_bits(value))
       }
-    // funcref/externref are not in the Phase-1 surface; model as I32 placeholder so a
-    // value position never panics (such modules skip at instantiate anyway).
-    _ -> I32Val(parse_bits(value))
+    // Reference values (P5-11 / R18). wast2json encodes them as
+    // `{"type":"externref"|"funcref","value":"null"|"<N>"}` (VERIFIED against wabt 1.0.41):
+    // `"null"` → the typed null sentinel; a decimal `"<N>"` → an externref host-identity `N`
+    // (from the test's `ref.extern N`) or a funcref slot index; an ABSENT value (an
+    // assert_trap's `[{type:externref}]` placeholder) → a value-less reference never compared.
+    "externref" ->
+      case value {
+        "null" -> NullRef(ExternRefTag)
+        "" -> ExternRefVal(0)
+        _ -> ExternRefVal(parse_bits(value))
+      }
+    "funcref" ->
+      case value {
+        "null" -> NullRef(FuncRefTag)
+        "" -> FuncRefVal(None)
+        _ -> FuncRefVal(Some(parse_bits(value)))
+      }
+    // Any other reftype spelling (anyref / typed refs — GC proposal) is out of Phase-5 scope;
+    // model as a null placeholder so a value position never panics (such modules skip at
+    // parse / instantiate anyway).
+    _ -> NullRef(FuncRefTag)
   }
 }
 

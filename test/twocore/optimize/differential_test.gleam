@@ -318,6 +318,8 @@ fn raw_of(v: SpecValue) -> Int {
   case v {
     I32Val(b) | I64Val(b) | F32Bits(b) | F64Bits(b) -> b
     F32Nan(_) | F64Nan(_) -> 0
+    // Reference values carry no raw bits (this differential corpus is numeric); 0 stays total.
+    fixture.NullRef(_) | fixture.ExternRefVal(_) | fixture.FuncRefVal(_) -> 0
   }
 }
 

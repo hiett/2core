@@ -9,7 +9,8 @@
 -module(twocore_conformance_ffi).
 -export([catch_apply/3, read_file/1, parse_json/1, list_dir/1, run/2,
          find_executable/1, unique_int/0,
-         start_instance/1, call_instance/3, stop_instance/1, gc_and_memory/1,
+         start_instance/1, start_instance_with/2, call_instance/3,
+         result_list/2, extern_payload/1, stop_instance/1, gc_and_memory/1,
          spy_reset/0, spy_mark/0, spy_called/0]).
 
 %% Force a garbage collection on process Pid, then report its total memory in bytes
@@ -62,10 +63,25 @@ gc_and_memory(Pid) ->
 %% `Threaded` branch is purely additive (unit P4-09 is the first to drive the whole
 %% corpus under `Threaded` through this driver, and unit 11 reuses it).
 start_instance(Module) ->
+    start_common(Module, fun() -> Module:instantiate() end).
+
+%% Like start_instance/1, but for an import-bearing module whose generated entry is
+%% `instantiate/1(Imports)` (unit P5-11 / R4): run `Module:instantiate(Imports)` in the
+%% owned process, where `Imports` is the positional `[Provided ...]` list `link:link_imports`
+%% returned (handed over opaquely as one Dynamic argument). The same cell/threaded
+%% self-detection + receive loop as start_instance/1 — the ABI difference is only the arity of
+%% the instantiate call.
+start_instance_with(Module, Imports) ->
+    start_common(Module, fun() -> Module:instantiate(Imports) end).
+
+%% Shared spawn+seed+loop for both the arity-0 and arity-1 instantiate ABIs. `RunInstantiate`
+%% is a 0-arg fun that performs the generated `instantiate/0` or `instantiate/1(Imports)` IN the
+%% spawned process (so it seeds THAT process's cell / builds THAT record).
+start_common(Module, RunInstantiate) ->
     Parent = self(),
     Pid = spawn(fun() ->
         Outcome =
-            try Module:instantiate() of
+            try RunInstantiate() of
                 Ret -> {ok, Ret}
             catch
                 _Class:Reason -> {error, render_reason(Reason)}
@@ -102,6 +118,27 @@ call_instance(Pid, Fun, Args) ->
     receive
         {result, Ref, Result} -> Result
     end.
+
+%% Unpack an invoke result PACKAGE into a flat list of its `Arity` values (unit P5-11, the
+%% multi-value run-ABI R17). A generated function returns exactly one BEAM term, so the WASM
+%% result vector is packaged at the boundary: 0 results → a unit placeholder (dropped here → []);
+%% 1 result → the bare value ([V]); N≥2 results → an N-tuple `{V1,…,Vn}` (destructured with
+%% tuple_to_list). This is symmetric across the Cell and Threaded ABIs (the Threaded loop already
+%% unwrapped `{Package, St'}` to `Package`, which is exactly this same package). Each element is a
+%% raw value / IEEE-754 bit pattern (numeric) or a reference term (rt_ref shape).
+result_list(Arity, V) ->
+    case Arity of
+        0 -> [];
+        1 -> [V];
+        _ -> tuple_to_list(V)
+    end.
+
+%% Extract the host-identity payload of an externref `{ref_extern, T}` (unit P5-11 / R18) —
+%% the `N` a `ref.extern N` carried, so the harness can compare a returned externref by IDENTITY
+%% (`rt_ref:classify_ref` reports it is an externref; this reads which one). Called only after
+%% classify says ExternRef, so the match always succeeds; the fallback keeps it total.
+extern_payload({ref_extern, T}) -> T;
+extern_payload(_) -> 0.
 
 %% Ask the instance process to exit (its pdict cell is GC'd with it).
 stop_instance(Pid) ->

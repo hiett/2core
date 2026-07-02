@@ -1,0 +1,6 @@
+# multimem — two memories are independent regions; memory.copy moves bytes across them (H3).
+invoke store_b i32:0 i32:305419896 => return
+invoke load_b i32:0 => return i32:305419896
+invoke load_a i32:0 => return i32:0
+invoke copy_b_to_a i32:0 i32:0 i32:4 => return
+invoke load_a i32:0 => return i32:305419896

@@ -341,6 +341,7 @@ fn fixture_kind(cmd: fixture.Command) -> String {
     fixture.AssertInvalid(_, _, _, _) -> "assert_invalid"
     fixture.AssertMalformed(_, _, _, _) -> "assert_malformed"
     fixture.AssertUninstantiable(_, _, _) -> "assert_uninstantiable"
+    fixture.AssertUnlinkable(_, _, _) -> "assert_unlinkable"
     fixture.ActionCmd(_, _) -> "action"
     fixture.Unhandled(_, kind) -> kind
   }

@@ -29,11 +29,15 @@ import gleam/string
 import twocore/conformance/fixture.{
   type Action, type Command, type Fixture, type SpecValue, ActionCmd,
   AssertInvalid, AssertMalformed, AssertReturn, AssertTrap, AssertUninstantiable,
-  BinaryModule, Get, Invoke, ModuleCmd, Register, TextModule, Unhandled,
+  AssertUnlinkable, BinaryModule, Get, Invoke, ModuleCmd, Register, TextModule,
+  Unhandled,
 }
 import twocore/conformance/oracle
 import twocore/conformance/registry.{type Registry}
+import twocore/frontend/wasm/ast
+import twocore/frontend/wasm/wat
 import twocore/ir
+import twocore/runtime/link
 
 // ─────────────────────────────── the Driver seam ───────────────────────────────
 
@@ -61,17 +65,45 @@ pub type InvokeResult {
   DriverError(String)
 }
 
+/// The import environment a module's non-function imports resolve against (H4/§D.2): the
+/// build-fixed `spectest` module (always consulted inside `link.link_imports`, so it needs no
+/// provider) PLUS every `(register)`ed provider the runner has accumulated. Assembled by the
+/// runner from the registry, consumed by the driver → `link.link_imports` (which wires provided
+/// global/table/memory state and FAILS CLOSED on an unsatisfied import).
+///
+/// Depth honesty (§D.2): cross-module *state* import (a later module importing a registered
+/// module's table/memory) needs shared mutable state across two one-process instances, which the
+/// E5 isolation model makes genuinely hard; those `providers` stay empty, so such an import fails
+/// closed at link → its dependent asserts skip (a named category), never a false green. The
+/// primary unlock — `spectest`'s read-mostly imports — works because `spectest` is built into the
+/// linker, independent of `providers`.
+pub type ImportEnv {
+  ImportEnv(providers: List(link.Provider))
+}
+
 /// The seam between the harness and the compiler. Split by command type:
-/// `check_frontend` is decode+validate ONLY (for `assert_invalid`/`assert_malformed`);
-/// `instantiate`+`invoke` are the full pipeline (for `assert_return`/`assert_trap`).
+/// `check_frontend`/`check_frontend_ast` are decode/validate ONLY (for
+/// `assert_invalid`/`assert_malformed`); `instantiate*`+`invoke`+`get_global` are the full
+/// pipeline (for `assert_return`/`assert_trap`/`get`/`assert_unlinkable`).
 pub type Driver {
   Driver(
     /// Decode + validate ONLY. `Ok(Nil)` = accepted; `Error(reason)` = rejected.
     check_frontend: fn(BitArray) -> Result(Nil, String),
-    /// Full pipeline: `.wasm` bytes → loaded `.beam` `Instance` (D10).
+    /// Full pipeline: `.wasm` bytes → loaded `.beam` `Instance` (D10). Links against `spectest`
+    /// only (the historical no-import seam kept for external callers).
     instantiate: fn(BitArray) -> Result(Instance, String),
     /// Run an export with raw args; see `InvokeResult`.
     invoke: fn(Instance, String, List(SpecValue)) -> InvokeResult,
+    /// Full pipeline with an import environment (H4): `.wasm` bytes + `ImportEnv` → `Instance`.
+    /// A link failure surfaces as `Error("link: <phrase>")` (the `assert_unlinkable` case).
+    instantiate_env: fn(BitArray, ImportEnv) -> Result(Instance, String),
+    /// The WAT path (H5): a parser-produced `ast.Module` + `ImportEnv` → `Instance`, entering at
+    /// `validate` (no binary re-encode — validate/lower serve the WAT AST directly).
+    instantiate_ast: fn(ast.Module, ImportEnv) -> Result(Instance, String),
+    /// Validate ONLY a parser-produced `ast.Module` (text `assert_invalid`).
+    check_frontend_ast: fn(ast.Module) -> Result(Nil, String),
+    /// Read an exported global (the `(get $m "field")` action). `Returned([v])` | error.
+    get_global: fn(Instance, String) -> InvokeResult,
   )
 }
 
@@ -125,11 +157,15 @@ fn skip(r: Report, why: String) -> Report {
 /// `Report`. Total — every command either passes, fails (with a reason), or skips
 /// (with a reason); the runner never panics.
 pub fn run_fixture(driver: Driver, fix: Fixture, base_dir: String) -> Report {
-  let #(_reg, report) =
-    list.fold(fix.commands, #(registry.new(), empty_report()), fn(state, cmd) {
-      let #(reg, rep) = state
-      run_command(driver, reg, rep, fix.source_filename, base_dir, cmd)
-    })
+  let #(_reg, _env, report) =
+    list.fold(
+      fix.commands,
+      #(registry.new(), ImportEnv(providers: []), empty_report()),
+      fn(state, cmd) {
+        let #(reg, env, rep) = state
+        run_command(driver, reg, env, rep, fix.source_filename, base_dir, cmd)
+      },
+    )
   // Reasons were accumulated reversed; restore source order for readable output.
   Report(
     ..report,
@@ -146,40 +182,51 @@ type Reg =
 fn run_command(
   driver: Driver,
   reg: Reg,
+  env: ImportEnv,
   rep: Report,
   src: String,
   base: String,
   cmd: Command,
-) -> #(Reg, Report) {
+) -> #(Reg, ImportEnv, Report) {
   case cmd {
     ModuleCmd(_line, name, filename) -> {
-      let res = load_wasm(base, filename, driver.instantiate)
-      #(registry.define(reg, name, res), rep)
+      let res =
+        load_wasm(base, filename, fn(bytes) {
+          driver.instantiate_env(bytes, env)
+        })
+      #(registry.define(reg, name, res), env, rep)
     }
 
     Register(_line, as_name, module) ->
       case registry.register(reg, as_name, module) {
-        Ok(reg2) -> #(reg2, rep)
-        Error(e) -> #(reg, skip(rep, at(src, 0) <> "register: " <> e))
+        // Registry aliasing is enough for a cross-module INVOKE (`(invoke $reg "f")`); cross-module
+        // state IMPORT needs shared mutable state we do not thread (§D.2 depth honesty), so `env`
+        // is unchanged — a later import of a registered module's state fails closed → skip.
+        Ok(reg2) -> #(reg2, env, rep)
+        Error(e) -> #(reg, env, skip(rep, at(src, 0) <> "register: " <> e))
       }
 
     AssertReturn(line, action, expected) -> #(
       reg,
+      env,
       run_return(driver, reg, rep, src, line, action, expected),
     )
 
     AssertTrap(line, action, text) -> #(
       reg,
+      env,
       run_trap(driver, reg, rep, src, line, action, text),
     )
 
     AssertInvalid(line, filename, mt, _text) -> #(
       reg,
+      env,
       run_frontend_reject(driver, rep, src, line, base, filename, mt, "invalid"),
     )
 
     AssertMalformed(line, filename, mt, _text) -> #(
       reg,
+      env,
       run_frontend_reject(
         driver,
         rep,
@@ -194,7 +241,14 @@ fn run_command(
 
     AssertUninstantiable(line, filename, text) -> #(
       reg,
-      run_uninstantiable(driver, rep, src, line, base, filename, text),
+      env,
+      run_uninstantiable(driver, env, rep, src, line, base, filename, text),
+    )
+
+    AssertUnlinkable(line, filename, text) -> #(
+      reg,
+      env,
+      run_unlinkable(driver, env, rep, src, line, base, filename, text),
     )
 
     // A bare action: run it for its SIDE EFFECTS on the current module's mutable state
@@ -203,11 +257,12 @@ fn run_command(
     // dropped (its dependent asserts already skip with a reason).
     ActionCmd(_line, action) -> {
       run_action_effect(driver, reg, action)
-      #(reg, rep)
+      #(reg, env, rep)
     }
 
     Unhandled(line, kind) -> #(
       reg,
+      env,
       skip(rep, at(src, line) <> "unhandled command: " <> kind),
     )
   }
@@ -224,37 +279,56 @@ fn run_return(
   action: Action,
   expected: List(SpecValue),
 ) -> Report {
-  case action {
-    Get(_, _) ->
-      skip(rep, at(src, line) <> "get action unsupported (no globals)")
-    Invoke(field, args, module) ->
-      case resolve_instance(reg, module) {
-        Error(why) -> skip(rep, at(src, line) <> why)
-        Ok(inst) ->
-          case driver.invoke(inst, field, args) {
-            Returned(actuals) ->
-              case oracle.matches_all(actuals, expected) {
-                True -> pass(rep)
-                False ->
-                  fail(
-                    rep,
-                    at(src, line)
-                      <> field
-                      <> ": got "
-                      <> string.inspect(actuals)
-                      <> " want "
-                      <> string.inspect(expected),
-                  )
-              }
-            Trapped(r) ->
-              fail(
-                rep,
-                at(src, line) <> field <> ": expected return, trapped " <> r,
-              )
-            DriverError(d) ->
-              skip(rep, at(src, line) <> field <> ": driver: " <> d)
-          }
+  // `Get` reads an exported global (D.1); `Invoke` calls an exported function. Both produce an
+  // `InvokeResult` judged identically against `expected` via the oracle.
+  let #(field, result) = case action {
+    Get(field, module) -> #(
+      field,
+      invoke_result(driver, reg, module, fn(inst) {
+        driver.get_global(inst, field)
+      }),
+    )
+    Invoke(field, args, module) -> #(
+      field,
+      invoke_result(driver, reg, module, fn(inst) {
+        driver.invoke(inst, field, args)
+      }),
+    )
+  }
+  case result {
+    Error(why) -> skip(rep, at(src, line) <> why)
+    Ok(Returned(actuals)) ->
+      case oracle.matches_all(actuals, expected) {
+        True -> pass(rep)
+        False ->
+          fail(
+            rep,
+            at(src, line)
+              <> field
+              <> ": got "
+              <> string.inspect(actuals)
+              <> " want "
+              <> string.inspect(expected),
+          )
       }
+    Ok(Trapped(r)) ->
+      fail(rep, at(src, line) <> field <> ": expected return, trapped " <> r)
+    Ok(DriverError(d)) -> skip(rep, at(src, line) <> field <> ": driver: " <> d)
+  }
+}
+
+/// Resolve `module` to an instance and run `run` on it, or `Error(reason)` if the target module
+/// is unknown / did not instantiate (→ a skip). Shared by `Get` (exported-global read) and
+/// `Invoke` (exported-function call).
+fn invoke_result(
+  _driver: Driver,
+  reg: Reg,
+  module,
+  run: fn(Instance) -> InvokeResult,
+) -> Result(InvokeResult, String) {
+  case resolve_instance(reg, module) {
+    Error(why) -> Error(why)
+    Ok(inst) -> Ok(run(inst))
   }
 }
 
@@ -267,42 +341,47 @@ fn run_trap(
   action: Action,
   text: String,
 ) -> Report {
-  case action {
-    Get(_, _) ->
-      skip(rep, at(src, line) <> "get action unsupported (no globals)")
-    Invoke(field, args, module) ->
-      case resolve_instance(reg, module) {
-        Error(why) -> skip(rep, at(src, line) <> why)
-        Ok(inst) ->
-          case driver.invoke(inst, field, args) {
-            Trapped(r) ->
-              case trap_matches(r, text) {
-                True -> pass(rep)
-                False ->
-                  fail(
-                    rep,
-                    at(src, line)
-                      <> field
-                      <> ": trapped "
-                      <> r
-                      <> " want substring "
-                      <> text,
-                  )
-              }
-            Returned(vs) ->
-              fail(
-                rep,
-                at(src, line)
-                  <> field
-                  <> ": expected trap '"
-                  <> text
-                  <> "', returned "
-                  <> string.inspect(vs),
-              )
-            DriverError(d) ->
-              skip(rep, at(src, line) <> field <> ": driver: " <> d)
-          }
+  let #(field, result) = case action {
+    Get(field, module) -> #(
+      field,
+      invoke_result(driver, reg, module, fn(inst) {
+        driver.get_global(inst, field)
+      }),
+    )
+    Invoke(field, args, module) -> #(
+      field,
+      invoke_result(driver, reg, module, fn(inst) {
+        driver.invoke(inst, field, args)
+      }),
+    )
+  }
+  case result {
+    Error(why) -> skip(rep, at(src, line) <> why)
+    Ok(Trapped(r)) ->
+      case trap_matches(r, text) {
+        True -> pass(rep)
+        False ->
+          fail(
+            rep,
+            at(src, line)
+              <> field
+              <> ": trapped "
+              <> r
+              <> " want substring "
+              <> text,
+          )
       }
+    Ok(Returned(vs)) ->
+      fail(
+        rep,
+        at(src, line)
+          <> field
+          <> ": expected trap '"
+          <> text
+          <> "', returned "
+          <> string.inspect(vs),
+      )
+    Ok(DriverError(d)) -> skip(rep, at(src, line) <> field <> ": driver: " <> d)
   }
 }
 
@@ -319,9 +398,40 @@ fn run_frontend_reject(
   kind: String,
 ) -> Report {
   case mt {
-    // A text-format case references a `.wat`; there is no Phase-1 WAT parser.
+    // A text-format case references a `.wat`: run it through OUR WAT parser (P5-10, H5). A
+    // rejection at parse (malformed text) OR at validate (invalid module) is the fail-closed PASS;
+    // an out-of-scope construct (SIMD/GC text) is a categorized skip; a module our parser AND
+    // validator both ACCEPT despite the spec rejecting it is an honest scope-gap skip (never a
+    // false pass, never a silent drop).
     TextModule ->
-      skip(rep, at(src, line) <> kind <> ": text module_type (no WAT parser)")
+      case read_wat_text(base, filename) {
+        Error(e) -> skip(rep, at(src, line) <> kind <> ": " <> e)
+        Ok(text) ->
+          case parse_text_module(text) {
+            Error(wat.Unsupported(_, _cat, detail)) ->
+              skip(
+                rep,
+                at(src, line)
+                  <> kind
+                  <> ": out-of-scope text ("
+                  <> detail
+                  <> ")",
+              )
+            // Any other parse error = the malformed text is correctly rejected.
+            Error(_) -> pass(rep)
+            Ok(ast_mod) ->
+              case driver.check_frontend_ast(ast_mod) {
+                Error(_) -> pass(rep)
+                Ok(Nil) ->
+                  skip(
+                    rep,
+                    at(src, line)
+                      <> kind
+                      <> ": text parser+validator accepted (scope gap)",
+                  )
+              }
+          }
+      }
     BinaryModule ->
       case read_bytes(base, filename) {
         Error(e) -> skip(rep, at(src, line) <> kind <> ": " <> e)
@@ -425,6 +535,7 @@ fn byte_count(bytes: BitArray) -> Int {
 
 fn run_uninstantiable(
   driver: Driver,
+  env: ImportEnv,
   rep: Report,
   src: String,
   line: Int,
@@ -435,7 +546,7 @@ fn run_uninstantiable(
   case read_bytes(base, filename) {
     Error(e) -> skip(rep, at(src, line) <> "uninstantiable: " <> e)
     Ok(bytes) ->
-      case driver.instantiate(bytes) {
+      case driver.instantiate_env(bytes, env) {
         // The module instantiated, but it MUST trap at instantiation — a real failure.
         Ok(_inst) ->
           fail(
@@ -471,6 +582,60 @@ fn run_uninstantiable(
   }
 }
 
+// assert_unlinkable — the module is well-formed + valid + compiles, but LINKING it FAILS (an
+// unsatisfied / type-mismatched import). This is the H6/D3a fail-closed proof: a silent link of an
+// unsatisfied import would be exactly the ambient authority D3a forbids. The runner instantiates
+// the module against the current `env` and REQUIRES a `link:`-prefixed failure whose phrase
+// contains `text` ("unknown import" / "incompatible import type"). A success (or an
+// instantiation-time trap that is not a link failure) is a FAIL; a compile-stage rejection of an
+// out-of-scope construct is an honest SKIP.
+fn run_unlinkable(
+  driver: Driver,
+  env: ImportEnv,
+  rep: Report,
+  src: String,
+  line: Int,
+  base: String,
+  filename: String,
+  text: String,
+) -> Report {
+  case read_bytes(base, filename) {
+    Error(e) -> skip(rep, at(src, line) <> "unlinkable: " <> e)
+    Ok(bytes) ->
+      case driver.instantiate_env(bytes, env) {
+        Ok(_inst) ->
+          fail(
+            rep,
+            at(src, line)
+              <> "unlinkable: module linked but the import must fail closed",
+          )
+        Error(reason) ->
+          case string.split_once(reason, "link: ") {
+            Ok(#(_, phrase)) ->
+              case trap_matches(phrase, text) {
+                True -> pass(rep)
+                False ->
+                  fail(
+                    rep,
+                    at(src, line)
+                      <> "unlinkable: link failed "
+                      <> phrase
+                      <> " want substring "
+                      <> text,
+                  )
+              }
+            // A non-link rejection (decode/validate/emit of an out-of-scope construct) — an honest
+            // skip, distinguished from a genuine link failure by the missing `link:` prefix.
+            Error(_) ->
+              skip(
+                rep,
+                at(src, line) <> "unlinkable (out of scope): " <> reason,
+              )
+          }
+      }
+  }
+}
+
 /// Run a bare action for its side effects on the resolved instance, discarding the result
 /// (and any trap — a bare setup action that traps is not an assertion). If the target module
 /// failed to instantiate, do nothing. `Get` actions read a global and have no side effect, so
@@ -487,6 +652,32 @@ fn run_action_effect(driver: Driver, reg: Reg, action: Action) -> Nil {
         }
       }
   }
+}
+
+/// Read a `.wat` text fixture (the text `assert_invalid`/`assert_malformed` path). `Ok(text)` or
+/// `Error(reason)` (unreadable / non-UTF-8). Total.
+fn read_wat_text(base: String, filename: String) -> Result(String, String) {
+  case read_bytes(base, filename) {
+    Error(e) -> Error(e)
+    Ok(bytes) ->
+      case bit_array.to_string(bytes) {
+        Ok(s) -> Ok(s)
+        Error(_) -> Error("non-UTF-8 .wat: " <> filename)
+      }
+  }
+}
+
+/// Parse a `.wat` text fragment into an `ast.Module` via the P5-10 parser (H5). wast2json emits a
+/// `(module quote …)` body as the module's FIELDS without the outer `(module …)`, so a fragment
+/// that does not already open with `(module` is wrapped before parsing. `Error(WatError)` on a
+/// malformed / out-of-scope text (the caller distinguishes `Unsupported` from a genuine reject).
+fn parse_text_module(text: String) -> Result(ast.Module, wat.WatError) {
+  let trimmed = string.trim(text)
+  let wrapped = case string.starts_with(trimmed, "(module") {
+    True -> trimmed
+    False -> "(module " <> trimmed <> ")"
+  }
+  wat.parse_module(wrapped)
 }
 
 // ─────────────────────────────── helpers ───────────────────────────────

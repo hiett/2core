@@ -72,6 +72,44 @@ pub fn call_instance(
   args: List(Int),
 ) -> Result(Int, String)
 
+/// Start an OWNED process for an IMPORT-BEARING instance and run its `instantiate/1(Imports)`
+/// IN it (unit P5-11 / R4). `imports` is the positional `[Provided ...]` list `link.link_imports`
+/// returned, handed over opaquely (Gleam cannot see the `Provided` list once it becomes the
+/// generated ABI's single argument). Semantics otherwise identical to `start_instance` (cell /
+/// threaded self-detected from `instantiate/1`'s return). `Ok(pid)` on success; `Error(reason)`
+/// on an instantiation-time trap (OOB active segment / trapping start).
+@external(erlang, "twocore_conformance_ffi", "start_instance_with")
+pub fn start_instance_with(
+  module: Atom,
+  imports: Dynamic,
+) -> Result(Pid, String)
+
+/// Invoke export `function` with TERM (reference / integer) `args` INSIDE the instance's owned
+/// process, returning the raw result PACKAGE as an opaque `Dynamic` (unit P5-11, the reference /
+/// multi-value ABI). Bound to the SAME Erlang `call_instance/3` as the integer path (Erlang is
+/// untyped), but typed for `Dynamic` in and out so a reference argument (`rt_ref` term) and a
+/// reference / multi-value result survive. `Error(reason)` is a trap. Use `result_list` to
+/// unpack the returned package into its value list.
+@external(erlang, "twocore_conformance_ffi", "call_instance")
+pub fn call_instance_terms(
+  proc: Pid,
+  function: Atom,
+  args: List(Dynamic),
+) -> Result(Dynamic, String)
+
+/// Extract the host-identity payload of an externref term `{ref_extern, N}` (R18) — the `N` a
+/// `ref.extern N` carried, so a returned externref is judged BY IDENTITY. Call only after
+/// `rt_ref.classify_ref` reports `ExternRef`; returns the boxed `N` (an integer `Dynamic`).
+@external(erlang, "twocore_conformance_ffi", "extern_payload")
+pub fn extern_payload(ref: Dynamic) -> Dynamic
+
+/// Unpack an invoke result `package` into a flat list of its `arity` values (R17 multi-value
+/// run-ABI). `arity == 0` → `[]` (the unit placeholder is dropped); `arity == 1` → `[package]`;
+/// `arity >= 2` → the N-tuple destructured with `tuple_to_list`. Each element is a raw numeric
+/// bit pattern or a reference term, ready for `tag`/`classify_ref`. Total.
+@external(erlang, "twocore_conformance_ffi", "result_list")
+pub fn result_list(arity: Int, package: Dynamic) -> List(Dynamic)
+
 /// Stop an instance's owned process; its process-dictionary cell is GC'd with it.
 @external(erlang, "twocore_conformance_ffi", "stop_instance")
 pub fn stop_instance(proc: Pid) -> Nil

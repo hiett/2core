@@ -9,8 +9,9 @@ import gleam/bit_array
 import gleam/option.{None, Some}
 import twocore/conformance/fixture.{
   Arithmetic, AssertInvalid, AssertMalformed, AssertReturn, AssertTrap,
-  BinaryModule, Canonical, F32Bits, F32Nan, F64Bits, Get, I32Val, I64Val, Invoke,
-  ModuleCmd, Register, TextModule, Unhandled,
+  BinaryModule, Canonical, ExternRefTag, ExternRefVal, F32Bits, F32Nan, F64Bits,
+  FuncRefTag, FuncRefVal, Get, I32Val, I64Val, Invoke, ModuleCmd, NullRef,
+  Register, TextModule, Unhandled,
 }
 
 fn parse(json: String) -> fixture.Fixture {
@@ -110,6 +111,38 @@ pub fn register_get_and_unhandled_test() {
     Register(1, "lib", Some("$m")),
     AssertReturn(2, Get("glob", Some("$m")), [I32Val(42)]),
     Unhandled(3, "assert_exhaustion"),
+  ] = parse(json).commands
+}
+
+/// Reference values (P5-11 / R18) decode from wast2json's `{"type":"externref"|"funcref",
+/// "value":"null"|"<N>"}` encoding: `"null"` → a typed `NullRef`; a decimal → an externref
+/// host-identity (`ExternRefVal`) or a funcref slot index (`FuncRefVal`); an absent value → a
+/// value-less reference placeholder. VERIFIED against wabt 1.0.41 output (table_get.json etc.).
+pub fn reference_value_parsing_test() {
+  let json =
+    "{\"commands\":[
+       {\"type\":\"assert_return\",\"line\":1,
+        \"action\":{\"type\":\"invoke\",\"field\":\"g\",
+                    \"args\":[{\"type\":\"externref\",\"value\":\"7\"}]},
+        \"expected\":[{\"type\":\"externref\",\"value\":\"null\"}]},
+       {\"type\":\"assert_return\",\"line\":2,
+        \"action\":{\"type\":\"invoke\",\"field\":\"g\",\"args\":[]},
+        \"expected\":[{\"type\":\"funcref\",\"value\":\"null\"}]},
+       {\"type\":\"assert_return\",\"line\":3,
+        \"action\":{\"type\":\"invoke\",\"field\":\"g\",\"args\":[]},
+        \"expected\":[{\"type\":\"funcref\",\"value\":\"3\"}]},
+       {\"type\":\"assert_return\",\"line\":4,
+        \"action\":{\"type\":\"invoke\",\"field\":\"g\",\"args\":[]},
+        \"expected\":[{\"type\":\"externref\",\"value\":\"5\"}]}]}"
+  let assert [
+    AssertReturn(
+      1,
+      Invoke("g", [ExternRefVal(7)], None),
+      [NullRef(ExternRefTag)],
+    ),
+    AssertReturn(2, Invoke("g", [], None), [NullRef(FuncRefTag)]),
+    AssertReturn(3, Invoke("g", [], None), [FuncRefVal(Some(3))]),
+    AssertReturn(4, Invoke("g", [], None), [ExternRefVal(5)]),
   ] = parse(json).commands
 }
 

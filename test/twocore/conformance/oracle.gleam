@@ -23,8 +23,8 @@
 
 import gleam/int
 import twocore/conformance/fixture.{
-  type NanKind, type SpecValue, Arithmetic, Canonical, F32Bits, F32Nan, F64Bits,
-  F64Nan, I32Val, I64Val,
+  type NanKind, type SpecValue, Arithmetic, Canonical, ExternRefVal, F32Bits,
+  F32Nan, F64Bits, F64Nan, FuncRefVal, I32Val, I64Val, NullRef,
 }
 
 // IEEE-754 binary32 field masks (sign|exp[8]|payload[23]).
@@ -52,12 +52,38 @@ const f64_payload_msb: Int = 0x8000000000000
 /// (e.g. all results carried as one numeric family) still compares correctly.
 pub fn matches(actual: SpecValue, expected: SpecValue) -> Bool {
   case expected {
-    I32Val(e) -> mask(raw_bits(actual), 32) == mask(e, 32)
-    I64Val(e) -> mask(raw_bits(actual), 64) == mask(e, 64)
-    F32Bits(e) -> mask(raw_bits(actual), 32) == mask(e, 32)
-    F64Bits(e) -> mask(raw_bits(actual), 64) == mask(e, 64)
-    F32Nan(k) -> is_f32_nan(mask(raw_bits(actual), 32), k)
-    F64Nan(k) -> is_f64_nan(mask(raw_bits(actual), 64), k)
+    // Numeric expectations reject a REFERENCE actual outright (the families are disjoint — a null's
+    // raw_bits is 0, which must NOT masquerade as the numeric 0). In real runs the driver tags an
+    // actual at the export's declared type, so this only guards against a mis-tagged reference.
+    I32Val(e) -> !is_ref(actual) && mask(raw_bits(actual), 32) == mask(e, 32)
+    I64Val(e) -> !is_ref(actual) && mask(raw_bits(actual), 64) == mask(e, 64)
+    F32Bits(e) -> !is_ref(actual) && mask(raw_bits(actual), 32) == mask(e, 32)
+    F64Bits(e) -> !is_ref(actual) && mask(raw_bits(actual), 64) == mask(e, 64)
+    F32Nan(k) -> !is_ref(actual) && is_f32_nan(mask(raw_bits(actual), 32), k)
+    F64Nan(k) -> !is_ref(actual) && is_f64_nan(mask(raw_bits(actual), 64), k)
+    // Reference comparison (P5-11 / R18), per the spec reference-value model
+    // (<https://webassembly.github.io/spec/core/syntax/types.html#reference-types>):
+    //  - a null expectation matches a null actual of EITHER reftype (the null sentinel is
+    //    shared; a null slot's reftype is not observable at the value layer);
+    //  - an externref matches by IDENTITY (the `ref.extern N` handle must round-trip exactly);
+    //  - a funcref matches any NON-NULL funcref (our funcref is an opaque type-tagged entry;
+    //    the suite's funcref checks are null-vs-non-null, so identity is deliberately not
+    //    compared — documented, not silently lenient).
+    NullRef(_) ->
+      case actual {
+        NullRef(_) -> True
+        _ -> False
+      }
+    ExternRefVal(a) ->
+      case actual {
+        ExternRefVal(b) -> a == b
+        _ -> False
+      }
+    FuncRefVal(_) ->
+      case actual {
+        FuncRefVal(_) -> True
+        _ -> False
+      }
   }
 }
 
@@ -83,6 +109,17 @@ fn raw_bits(v: SpecValue) -> Int {
   case v {
     I32Val(b) | I64Val(b) | F32Bits(b) | F64Bits(b) -> b
     F32Nan(_) | F64Nan(_) -> 0
+    // Reference values carry no numeric bits (they are compared as references, never as bits).
+    NullRef(_) | ExternRefVal(_) | FuncRefVal(_) -> 0
+  }
+}
+
+/// True iff `v` is a reference value (null / externref / funcref) — the disjointness guard so a
+/// numeric expectation never matches a reference actual.
+fn is_ref(v: SpecValue) -> Bool {
+  case v {
+    NullRef(_) | ExternRefVal(_) | FuncRefVal(_) -> True
+    _ -> False
   }
 }
 

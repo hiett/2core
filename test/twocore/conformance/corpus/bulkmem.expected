@@ -1,0 +1,15 @@
+# bulkmem — bulk-memory semantics (eager bounds → trap with no partial write; dropped seg = length 0).
+# init copies passive "abcd" into memory; fill overwrites; copy is memmove-correct.
+invoke init i32:0 i32:0 i32:4 => return
+invoke load8 i32:0 => return i32:97
+invoke load8 i32:3 => return i32:100
+invoke fill i32:0 i32:88 i32:2 => return
+invoke load8 i32:0 => return i32:88
+invoke load8 i32:2 => return i32:99
+invoke copy i32:10 i32:0 i32:4 => return
+invoke load8 i32:10 => return i32:88
+invoke load8 i32:13 => return i32:100
+invoke fill i32:65535 i32:1 i32:2 => trap out of bounds memory access
+invoke load8 i32:65535 => return i32:0
+invoke dropd => return
+invoke init i32:20 i32:0 i32:1 => trap out of bounds memory access

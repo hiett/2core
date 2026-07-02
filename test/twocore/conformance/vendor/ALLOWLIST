@@ -69,10 +69,38 @@ float_literals       # 99 binary assert_return in scope; SKIP its 78 text-format
 # ── Phase-2 Tier B — MVP memarg alignment validation (per-file feature flag)
 align	--enable-memory64   # SKIP the 2 memory64 assert_invalid (64-bit offset) — the flag makes them VALID
 
-# ── DEFERRED to Phase 3 (NOT here — record as honest file-level gaps, do NOT add):
-#   memory.wast / table.wast  — un-convertible at pin ((module definition …) + 2^32 literals / typed-ref)
-#   memory_grow.wast          — 100% multi-memory at pin (MVP grow coverage is in memory_size.wast)
-#   elem.wast                 — function-references; table_get/set/copy/fill.wast — reference-types runtime
-#   memory_fill/copy/init.wast — bulk-memory (memory.fill/copy/init + data.drop)
-#   table_init.wast           — un-convertible (GC array/arrayref)
-#   linking / imports / global-import — non-function imports + the spectest module
+# ── Phase-5 — REFERENCE TYPES (funcref/externref values, ref.func/ref.is_null, typed tables).
+#    All convert with wast2json's DEFAULT flags at wabt 1.0.41 (reference-types is default-on);
+#    empirically re-verified at the pin (R16). The harness marshals externref/funcref via the
+#    term invoke-ABI (rt_ref) and judges references by null-ness / externref identity.
+ref_func             # ref.func + a null-slot call_indirect trap
+table_get            # table.get returning externref/funcref (null + non-null identity)
+table_set            # table.set of externref/funcref
+table_size           # table.size
+table_grow           # table.grow(+delta, init) — SKIP its ~2 cross-module (register) table-import asserts
+table_fill           # table.fill(offset, value, count) — externref stores
+table_copy           # table.copy (overlap = memmove) — 1727 asserts
+
+# ── Phase-5 — BULK MEMORY (memory.fill/copy/init + data.drop; eager-bounds trap, no partial write).
+#    Default flags (bulk-memory default-on at 1.0.41); re-verified at the pin (R16).
+bulk                 # memory.fill/copy/init + data.drop mixed
+memory_fill          # memory.fill (eager bounds; d>size,n=0 traps; d=size,n=0 ok)
+memory_copy          # memory.copy overlap-correct (memmove) — 4450 asserts
+memory_init          # memory.init + data.drop (dropped seg = length 0)
+data                 # active/passive data segments + data.drop
+
+# ── DEFERRED — honest, MEASURED categorized skips (R16); NOT added (would be false-green):
+#   GC-proposal reference types (typed function references / anyref / array) — un-wast2json-able at
+#   the pin AND out of our funcref/externref scope (H8):
+#     ref_null.wast   — `(ref.null any)` / anyref            (GC)
+#     ref_is_null.wast— `(param (ref null $t))` typed refs   (GC)
+#     elem.wast       — `(table $t 10 (ref func) …)` typed refs (GC)
+#     select.wast     — `(result (ref null func))` typed refs (GC) — typed `select` value asserts blocked
+#     table_init.wast — `(type $arr (array (mut arrayref)))`  (GC array)
+#   Exception-handling / module-linking / multi-memory syntax un-parseable at the pin:
+#     imports.wast    — `(tag …)` exception-handling proposal (EH)
+#     linking.wast    — typed-ref globals + full cross-module MUTABLE linking (§D.2 depth)
+#     memory.wast / table.wast — `(module definition …)` module-linking + 2^32 literals
+#     memory_grow.wast— 100% multi-memory at pin (spectest-interp 0/50; MVP grow is in memory_size)
+#   NOTE: the reftype/bulk files above import NO spectest; `global.wast` (already listed) now passes
+#   its previously-skipped externref/funcref get/set asserts via the reference value model.

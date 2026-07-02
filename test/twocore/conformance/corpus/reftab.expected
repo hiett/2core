@@ -1,0 +1,14 @@
+# reftab — reference/table surface, results spec-sourced from the reference-types semantics
+# (table instructions; a null-slot call_indirect → uninitialized element; table.grow returns old size).
+invoke isnull i32:0 => return i32:0
+invoke isnull i32:1 => return i32:1
+invoke call0 i32:41 => return i32:42
+invoke callnull i32:7 => trap uninitialized element
+invoke isnull i32:100 => trap out of bounds table access
+invoke size => return i32:3
+invoke setcall i32:5 => return i32:6
+invoke isnull i32:1 => return i32:0
+invoke grow2 => return i32:3
+invoke size => return i32:5
+invoke isnull i32:3 => return i32:1
+invoke fill1 => return i32:0
