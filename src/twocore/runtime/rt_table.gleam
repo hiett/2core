@@ -1,67 +1,89 @@
-//// `rt_table` — the funcref table value + the 3-fault fail-closed `call_indirect`
-//// dispatch (owner: unit 05). SIGNATURES frozen by unit 01; BODIES implemented by unit 05.
+//// `rt_table` — the typed reference-table value + the 3-fault fail-closed `call_indirect`
+//// dispatch (owner: unit 05; Phase-5 reference/bulk extension: unit P5-07).
 ////
-//// **State location.** The table value lives in the `table` field of THIS process's cell
-//// (read via `rt_state.table_get`, written via `rt_state.table_put`); it is OPAQUE to
-//// `rt_state`. `rt_table` owns its shape — the private `Table` record below — and coerces
-//// to/from the cell's `Dynamic` via `gleam_stdlib:identity/1` (a tier-O no-op; `rt_table`
-//// is the sole producer/consumer of this term, so the coercion is sound).
+//// **State location.** A table value lives in the index-keyed `tables` vector of THIS
+//// process's cell (read via `rt_state.table_at(idx)` / the index-0 alias `table_get`, written
+//// via `rt_state.with_table_at(idx, _)` / `table_put`); it is OPAQUE to `rt_state`. `rt_table`
+//// owns its shape — the private `Table` record below — and coerces to/from the cell's `Dynamic`
+//// via `gleam_stdlib:identity/1` (a tier-O no-op; `rt_table` is the sole producer/consumer of
+//// this term, so the coercion is sound).
 ////
-//// **Representation.** A `Table` is `{size, slots}` where `size` is the declared `min`
-//// entry count (MVP has no `table.grow`, so the table is fixed-size after `new`) and
-//// `slots` is a SPARSE `Dict(Int, #(FuncType, closure))`: a PRESENT key in `[0, size)` is a
-//// filled slot, an ABSENT key in `[0, size)` is a null/uninitialised slot
-//// (→ `UninitializedElement`). Only `init_elem` ever writes slots (active element segments
-//// at instantiation); funcref tables are immutable at run time in the MVP, so structural
-//// sharing across the immutable `Table` versions is free.
+//// **Representation (Phase-5, §A).** A `Table` is `{size, max, slots}` where `slots` is a SPARSE
+//// `Dict(Int, RefValue)` mapping a slot index to a **reference value**. A reference value is one
+//// of the forge-proof `rt_ref` shapes (R1): a `funcref` `#(FuncType, closure)` (UNCHANGED from
+//// Phase-2 — a funcref value *is* a table-entry shape, so `call_indirect` stays byte-identical),
+//// an `externref` `{ref_extern, term}` (opaque host term), or the null sentinel `{ref_null}`.
+//// **Null is represented by ABSENCE** (a missing key): `ref.null` is never stored as the sentinel
+//// term — `set`/`fill`/`grow`/`init`/`copy` DELETE a slot written to null. So a slot present in
+//// `[0, size)` is a real (funcref | externref) reference and an absent key reads as the null
+//// sentinel. This keeps the Phase-2/4 `call_indirect` guard-2 ("absent key ⇒ `UninitializedElement`")
+//// byte-identical: a funcref-only module never stores a non-funcref value, so its dispatch is
+//// untouched (H7).
 ////
-//// **No ambient authority (E3, D3a).** Dispatch goes through BUILD-CONTROLLED closures
-//// populated from element segments — NEVER a data-driven `apply(Module, Fun, Args)` where
-//// `Module`/`Fun` come from table/runtime data. Each entry is TYPE-TAGGED `#(FuncType,
-//// closure)`: `emit_core` (unit 10) passes each element function's IR `FuncType` plus a
-//// closure that captures a COMPILE-TIME-LITERAL `'twocore@wasm@<mod>':'f<idx>'/arity`
-//// reference; `rt_table` only stores and invokes it. The ONLY runtime-data input that
-//// reaches a control transfer is the integer `index`; the dispatched target is the stored
-//// closure, invoked DIRECTLY as `target(args)` (a fun application). `rt_table` never
-//// constructs a module/function atom from its inputs and never calls `erlang:apply/3` on
-//// data-derived names — assert by construction/review (the unit-10 structural security
-//// test extends this to the generated `call_indirect` lowering).
+//// **`externref` opacity (H6).** `rt_table` stores `externref` values VERBATIM and never
+//// constructs, forges, inspects, or reveals their host payload — it moves the opaque term between
+//// slots and values. The only value comparison it makes is `rt_ref.is_null` (null detection) and,
+//// for a funcref, `FuncType == expected_type` (guard 3); neither touches `externref` contents.
+////
+//// **No ambient authority (E3, D3a).** Dispatch goes through BUILD-CONTROLLED closures populated
+//// from element segments / `ref.func` — NEVER a data-driven `apply(Module, Fun, Args)`. Each
+//// funcref is TYPE-TAGGED `#(FuncType, closure)`; the ONLY runtime-data input reaching a control
+//// transfer is the integer `index`, and the dispatched target is the stored closure, invoked
+//// DIRECTLY as `target(args)` (a fun application). The new reference/bulk ops move reference
+//// *values* between slots without ever turning runtime data into a module/function atom.
 ////
 //// **Three guards, in order, each fail-closed**
 //// (<https://webassembly.github.io/spec/core/exec/instructions.html>):
 //// 1. `index` in `[0, size)` — else `UndefinedElement` ("undefined element");
-//// 2. slot non-null (filled by an element segment) — else `UninitializedElement`
-////    ("uninitialized element");
+//// 2. slot non-null (a present key) — else `UninitializedElement` ("uninitialized element");
 //// 3. exact STRUCTURAL `FuncType` match against the call site's expected type — else
 ////    `IndirectCallTypeMismatch` ("indirect call type mismatch").
-//// The order is observable: an OOB index traps `UndefinedElement` BEFORE any null/type
-//// check; a null in-range slot traps `UninitializedElement` BEFORE any type comparison.
+//// The order is observable: an OOB index traps `UndefinedElement` BEFORE any null/type check.
 ////
-//// **Fail-closed on an un-seeded cell (E3 isolation).** `init_elem`/`call_indirect` read
-//// the cell via `rt_state.table_get`, which raises (a node-safe internal error) on an
-//// un-seeded cell rather than fabricating an empty table that silently "succeeds".
-//// Tier-O, never NIF.
+//// **Fail-closed on an un-seeded cell (E3 isolation).** The cell-backed ops read the cell via
+//// `rt_state`, which raises (a node-safe internal error) on an un-seeded cell rather than
+//// fabricating an empty table. Tier-O (immutable `Dict`), never NIF; `TablePaged` is the
+//// differential ORACLE the mutable tiers (`TableEts`/`TableAtomics`) are held against.
 
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import twocore/ir.{
   type FuncType, type TrapReason, IndirectCallTypeMismatch, TableOutOfBounds,
   UndefinedElement, UninitializedElement,
 }
+import twocore/runtime/rt_meter
+import twocore/runtime/rt_ref
 import twocore/runtime/rt_state.{type InstanceState}
 
-/// The funcref table value held (opaque, as `Dynamic`) in the cell's `table` field.
+/// A WebAssembly reference value as the runtime moves it: the null sentinel `{ref_null}`, a
+/// funcref `#(FuncType, closure)`, or an opaque externref `{ref_extern, term}` (R1). Held OPAQUE
+/// as `Dynamic` — `rt_table` stores/returns reference values verbatim and only ever INTERPRETS
+/// the funcref shape (for `call_indirect`) or tests null (via `rt_ref.is_null`). The value layer
+/// is owned by the keystone module `rt_ref`; this alias names it locally.
+pub type RefValue =
+  Dynamic
+
+/// The hard implementation cap on a table's entry count — the largest size `table.grow` may reach
+/// (identical across all tiers so the differential agrees). The reference-types spec caps a table
+/// at `2^32` elements; a Safe engine additionally bounds allocation, and `table.grow` fuel (R9)
+/// bounds a metered module. A grow past `min(declared_max, hard_max_slots)` returns `-1` (never a
+/// silent under-allocation, never a host escape).
+pub const hard_max_slots: Int = 4_294_967_295
+
+/// The immutable, sparse, typed reference table held (opaque, as `Dynamic`) in a `tables`-vector
+/// slot of the cell.
 ///
-/// - `size`: the number of slots — the declared `min`. MVP has no `table.grow`, so it is
-///   fixed at `new` time; `call_indirect`'s bounds guard checks `index` against it.
-/// - `slots`: SPARSE map slot-index → `#(FuncType, closure)`. A PRESENT key = a filled
-///   slot (guard 2 passes); an ABSENT key in `[0, size)` = a null/uninitialised slot
-///   (guard 2 → `UninitializedElement`). Private: the value never escapes `rt_table`
-///   except as the opaque `Dynamic` in the cell.
+/// - `size`: the number of slots (the current entry count; `table.size`). Grows via `grow`.
+/// - `max`: the EFFECTIVE maximum entry count, baked at `new` time as `min(declared_max,
+///   hard_max_slots)` — `grow` never exceeds it.
+/// - `slots`: SPARSE map slot-index → `RefValue`. A PRESENT key in `[0, size)` is a real
+///   (funcref | externref) reference; an ABSENT key is the null sentinel. Private: the value
+///   never escapes `rt_table` except as the opaque `Dynamic` in the cell.
 type Table {
-  Table(size: Int, slots: Dict(Int, #(FuncType, fn(List(Int)) -> List(Int))))
+  Table(size: Int, max: Int, slots: Dict(Int, RefValue))
 }
 
 /// Coerce a `Table` into the opaque `Dynamic` the cell stores. Identity at run time
@@ -69,53 +91,100 @@ type Table {
 @external(erlang, "gleam_stdlib", "identity")
 fn table_to_dynamic(table: Table) -> Dynamic
 
-/// Coerce the cell's opaque `Dynamic` back into a `Table`. Identity at run time; sound
-/// because `rt_table` is the sole producer of the term `rt_state` holds in the `table` slot.
+/// Coerce the cell's opaque `Dynamic` back into a `Table`. Identity at run time; sound because
+/// `rt_table` is the sole producer of the term `rt_state` holds in a table slot.
 @external(erlang, "gleam_stdlib", "identity")
 fn dynamic_to_table(value: Dynamic) -> Table
 
-/// Build a FRESH opaque table of `min` null (uninitialised) slots.
+/// Coerce a cell-ABI funcref entry `#(FuncType, closure)` into a `RefValue`. Identity at run time;
+/// a funcref value *is* a table-entry shape (R1), so this is a no-op box.
+@external(erlang, "gleam_stdlib", "identity")
+fn cell_funcref_to_ref(e: #(FuncType, fn(List(Int)) -> List(Int))) -> RefValue
+
+/// Coerce a `RefValue` back to a cell-ABI funcref entry. Identity at run time; sound only after a
+/// `classify_ref`/absence check has established the value is a funcref (never a null/externref).
+@external(erlang, "gleam_stdlib", "identity")
+fn ref_to_cell_funcref(v: RefValue) -> #(FuncType, fn(List(Int)) -> List(Int))
+
+/// Coerce a threaded-ABI funcref entry into a `RefValue`. Identity at run time.
+@external(erlang, "gleam_stdlib", "identity")
+fn threaded_funcref_to_ref(
+  e: #(FuncType, fn(InstanceState, List(Int)) -> #(List(Int), InstanceState)),
+) -> RefValue
+
+/// Coerce a `RefValue` back to a threaded-ABI funcref entry. Identity at run time; sound after a
+/// non-null/funcref check (the threaded family is the sole reader of a threaded-written slot).
+@external(erlang, "gleam_stdlib", "identity")
+fn ref_to_threaded_funcref(
+  v: RefValue,
+) -> #(FuncType, fn(InstanceState, List(Int)) -> #(List(Int), InstanceState))
+
+/// Read just a funcref `RefValue`'s `FuncType` tag (element 0), leaving the closure opaque —
+/// ABI-agnostic (the type tag is element 0 regardless of cell/threaded closure). For `to_canon`.
+@external(erlang, "gleam_stdlib", "identity")
+fn ref_func_type_entry(v: RefValue) -> #(FuncType, Dynamic)
+
+// ───────────────────────────── construction + reference constructors ─────────────────────────────
+
+/// Build a FRESH opaque table of `min` null (absent) slots.
 ///
-/// - `min`: the table's initial entry count (the declared minimum). Becomes the fixed
-///   `size`; every slot is initially absent (null), so a `call_indirect` to any in-range
-///   slot before an element segment fills it traps `UninitializedElement`.
-/// - `max`: optional maximum entry count, or `None` for unbounded. UNUSED in the MVP:
-///   funcref tables cannot grow (`table.grow` is a post-MVP reference-types op) and are
-///   only ever filled via `init_elem`, so there is no growth to bound.
-/// - Returns the fresh table value as `Dynamic` (opaque, ready to hand to
-///   `rt_state.seed`). `rt_state` cannot construct it (it does not import `rt_table`), so
-///   the generated `instantiate` entry calls this. Total.
-pub fn new(min: Int, _max: Option(Int)) -> Dynamic {
-  table_to_dynamic(Table(size: min, slots: dict.new()))
+/// - `min`: the table's initial entry count (the declared minimum); becomes the current `size`.
+///   Every slot is initially absent (null), so a `call_indirect` to any in-range slot before an
+///   element segment / `table.set` fills it traps `UninitializedElement`.
+/// - `max`: the declared maximum entry count, or `None` for unbounded. The EFFECTIVE cap baked
+///   into the table is `min(declared_max, hard_max_slots)`; `grow` enforces it.
+/// - Returns the fresh table value as `Dynamic` (opaque, ready for `rt_state.seed`). Total.
+pub fn new(min: Int, max: Option(Int)) -> Dynamic {
+  table_to_dynamic(Table(size: min, max: effective_max(max), slots: dict.new()))
 }
 
-/// Write an active ELEMENT segment's `entries` into this process's table starting at
-/// `offset`, at instantiation. Whole-range bounds-checked (all-or-nothing).
+/// Construct a `funcref` reference value from a cell-ABI closure (R1) — `#(ty, closure)`. Used by
+/// `emit_core`'s `RefFunc` lowering (cell strategy) and by tests to build funcref operands.
+///
+/// - `ty`: the function's structural `FuncType` (guard 3 of `call_indirect` matches it).
+/// - `closure`: the build-controlled `fn(List(Int)) -> List(Int)` over the referenced function.
+/// - Returns the funcref `RefValue`. Total; never fails.
+pub fn funcref(ty: FuncType, closure: fn(List(Int)) -> List(Int)) -> RefValue {
+  cell_funcref_to_ref(#(ty, closure))
+}
+
+/// Construct a `funcref` reference value from a threaded-ABI closure (R1). The threaded twin of
+/// `funcref`, for the `Threaded` state strategy.
+///
+/// - `ty`: the function's structural `FuncType`.
+/// - `closure`: the threaded closure `fn(InstanceState, List(Int)) -> #(List(Int), InstanceState)`.
+/// - Returns the funcref `RefValue`. Total.
+pub fn funcref_t(
+  ty: FuncType,
+  closure: fn(InstanceState, List(Int)) -> #(List(Int), InstanceState),
+) -> RefValue {
+  threaded_funcref_to_ref(#(ty, closure))
+}
+
+// ───────────────────────────── legacy funcref surface (byte-identical, §A) ─────────────────────────────
+
+/// Write an active ELEMENT segment's `entries` into THIS process's default table (index 0)
+/// starting at `offset`, at instantiation. Whole-range bounds-checked (all-or-nothing).
+///
+/// UNCHANGED from Phase-2 (byte-identity, H7): funcref-funcidx active segments lower here.
 ///
 /// - `offset`: the first entry index written; `entries[k]` goes into slot `offset + k`.
-/// - `entries`: the type-tagged build-controlled closures — each `#(FuncType, closure)`
-///   pairs an element function's IR signature with a closure over the generated function.
-///   The `FuncType` tag is what guard 3 of `call_indirect` matches; the closure is invoked
-///   directly (never `apply` of a data-derived name).
-/// - Bounds check FIRST, before any write: if `offset < 0` or
-///   `offset + length(entries) > size`, return `Error(TableOutOfBounds)` and write NOTHING
-///   (no partial table writes — a slot the failed segment would have filled still reads as
-///   null). On success returns `Ok(Nil)` and the cell's table now holds the entries.
-/// - Failure modes: `Error(TableOutOfBounds)` on an out-of-range segment; raises (fail-
-///   closed, via `rt_state.table_get`) if this process's cell is un-seeded.
+/// - `entries`: type-tagged build-controlled closures — each `#(FuncType, closure)` pairs an
+///   element function's IR signature with a closure over the generated function.
+/// - Bounds check FIRST: if `offset < 0` or `offset + length(entries) > size`, return
+///   `Error(TableOutOfBounds)` writing NOTHING. On success returns `Ok(Nil)`.
+/// - Failure modes: `Error(TableOutOfBounds)`; raises (fail-closed) on an un-seeded cell.
 pub fn init_elem(
   offset: Int,
   entries: List(#(FuncType, fn(List(Int)) -> List(Int))),
 ) -> Result(Nil, TrapReason) {
   let table = dynamic_to_table(rt_state.table_get())
-  // Whole-range bounds check up front: the segment must fit entirely, else write nothing.
   case offset < 0 || offset + list.length(entries) > table.size {
     True -> Error(TableOutOfBounds)
     False -> {
-      // Fold each entry into its slot: entries[k] → slot offset + k.
       let new_slots =
         list.index_fold(entries, table.slots, fn(slots, entry, k) {
-          dict.insert(slots, offset + k, entry)
+          dict.insert(slots, offset + k, cell_funcref_to_ref(entry))
         })
       rt_state.table_put(table_to_dynamic(Table(..table, slots: new_slots)))
       Ok(Nil)
@@ -123,94 +192,165 @@ pub fn init_elem(
   }
 }
 
-/// Dispatch a `call_indirect` through this process's table — THE 3-fault fail-closed
-/// dispatch.
+/// Dispatch a `call_indirect` through THIS process's default table (index 0) — the 3-fault
+/// fail-closed dispatch. UNCHANGED behaviour from Phase-2 (§A).
 ///
-/// Reads the cell's table, applies the three guards IN ORDER, and on success invokes the
-/// slot's build-controlled `target` with `args` directly (`target(args)` — a closure
-/// application, NOT a data-driven `apply`).
-///
-/// - `index`: the table entry index to call (the only runtime-data input that reaches a
-///   control transfer).
-/// - `expected_type`: the call site's statically-required `FuncType`. Guard 3 matches the
-///   stored entry's type tag against this with exact STRUCTURAL equality (`==`) — two
-///   structurally-equal `FuncType` values match even if they came from different typeidx
-///   entries; differing params OR results mismatch.
-/// - `args`: the call arguments as raw bit patterns.
-/// - Returns `Ok(results)` (the callee's result values as raw bit patterns), or an
-///   `Error(reason)` checked in this order:
-///   - `UndefinedElement`         — `index < 0` or `index >= size`   (guard 1);
-///   - `UninitializedElement`     — slot is null/absent              (guard 2);
-///   - `IndirectCallTypeMismatch` — `entry_type != expected_type`    (guard 3).
-/// - Failure modes: the three trap reasons above; raises (fail-closed, via
-///   `rt_state.table_get`) if this process's cell is un-seeded.
+/// - `index`/`expected_type`/`args`: the entry index, the call site's required `FuncType`
+///   (exact STRUCTURAL `==`), and the raw-bit arguments.
+/// - Returns `Ok(results)`, or an `Error(reason)` in guard order: `UndefinedElement` (bounds),
+///   `UninitializedElement` (absent/null slot), `IndirectCallTypeMismatch` (type). Raises
+///   (fail-closed) on an un-seeded cell.
 pub fn call_indirect(
   index: Int,
   expected_type: FuncType,
   args: List(Int),
 ) -> Result(List(Int), TrapReason) {
   let table = dynamic_to_table(rt_state.table_get())
-  // Guard 1 — bounds. Must fire before any null/type inspection.
   case index < 0 || index >= table.size {
     True -> Error(UndefinedElement)
     False ->
-      // Guard 2 — null slot. An absent key is an uninitialised slot.
       case dict.get(table.slots, index) {
         Error(Nil) -> Error(UninitializedElement)
-        Ok(#(entry_type, target)) ->
-          // Guard 3 — exact structural FuncType match.
+        Ok(value) -> {
+          let #(entry_type, target) = ref_to_cell_funcref(value)
           case entry_type == expected_type {
             False -> Error(IndirectCallTypeMismatch)
-            // Build-controlled invocation: invoke the STORED closure directly.
             True -> Ok(target(args))
           }
+        }
       }
   }
 }
 
-// ── the paged THREADED family (state_strategy: Threaded; owner: unit P4-06) ──────
+// ───────────────────────────── cell-backed reference/bulk surface (§B) ─────────────────────────────
 //
-// The purely-functional twin of the cell surface above (which owns `new`/`init_elem`/
-// `call_indirect`, untouched). Under `state_strategy: Threaded` the SAME immutable `Table`
-// handle travels in `st.table` (projected via `rt_state.table`, re-injected via
-// `rt_state.with_table`) instead of the pdict cell — the §10 uniform-threading rule. The
-// three guards and the `TrapReason`s are IDENTICAL to the cell surface (§F); only the state
-// seam differs, so a tier is a pure state-strategy composition (unit 06's headline invariant:
-// TablePaged ≡ ets ≡ atomics on `call_indirect`).
+// The Phase-5 reference-types + bulk-table ops (state_strategy: Cell). Each reaches table `idx` via
+// the R7 index-keyed `rt_state.table_at`/`with_table_at` accessors (index 0 = the default table),
+// coerces the opaque handle to a `Table`, drives the SHARED op core (`do_*`), and re-injects the
+// rebuilt handle. The op cores charge fuel (R9) on success, so the cell and threaded families are
+// metering-identical by construction (the G7 parity bar).
+
+/// `table.get idx` — read the reference value at `index`. Ok(ref) in range (a never-written /
+/// grown-into slot reads as the null sentinel); `Error(TableOutOfBounds)` if `index < 0 || index
+/// >= size` ("out of bounds table access"). No mutation. (exec/instructions.html — Table
+/// Instructions; reference-types proposal.)
+pub fn get(idx: Int, index: Int) -> Result(RefValue, TrapReason) {
+  do_get(read_at(idx), index)
+}
+
+/// `table.set idx` — write reference `value` at `index`. Ok(Nil) in range (writes back the table);
+/// `Error(TableOutOfBounds)` out of range with NO write (eager). `value = ref.null` stores the
+/// null sentinel (represented as an absent slot).
+pub fn set(idx: Int, index: Int, value: RefValue) -> Result(Nil, TrapReason) {
+  commit(idx, do_set(read_at(idx), index, value))
+}
+
+/// `table.size idx` — the current slot count. Total; no trap.
+pub fn size(idx: Int) -> Int {
+  do_size(read_at(idx))
+}
+
+/// `table.grow idx` — append `delta` slots each initialised to `init`; return the OLD size on
+/// success, or `-1` if `old + delta` exceeds the effective `max`/cap or `delta < 0` (the table is
+/// UNCHANGED and NO fuel is charged). On success charges `delta` growth fuel (R9/§G). Never traps.
+pub fn grow(idx: Int, delta: Int, init: RefValue) -> Int {
+  case do_grow(read_at(idx), delta, init) {
+    #(-1, _) -> -1
+    #(old, table) -> {
+      rt_state.with_table_at(idx, table_to_dynamic(table))
+      old
+    }
+  }
+}
+
+/// `table.fill idx` — write `value` into `count` slots from `offset`. `Error(TableOutOfBounds)` if
+/// `offset < 0` or `offset + count > size` (eager, evaluated even for `count == 0`, R10) with NO
+/// partial writes; else Ok(Nil), charging `count` fuel (R9).
+pub fn fill(
+  idx: Int,
+  offset: Int,
+  value: RefValue,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  commit(idx, do_fill(read_at(idx), offset, value, count))
+}
+
+/// `table.init idx` from element-segment items — copy `count` references from `items` (source
+/// offset `src`) into table `idx` at `dst`. `items` is the segment's CURRENT element vector,
+/// supplied by `emit_core` (ε when the segment is dropped, R2). Eager bounds against BOTH
+/// `src + count > length(items)` and `dst + count > size` ⇒ `Error(TableOutOfBounds)` with NO
+/// write; else Ok(Nil), charging `count` fuel (R9). (bulk-memory proposal; exec/instructions.html.)
+pub fn table_init(
+  idx: Int,
+  items: List(RefValue),
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  commit(idx, do_table_init(read_at(idx), items, dst, src, count))
+}
+
+/// `table.copy dst_idx src_idx` — copy `count` references from table `src_idx` (offset `src`) to
+/// table `dst_idx` (offset `dst`) with **memmove/overlap correctness** (R11). Eager bounds against
+/// both ranges ⇒ `Error(TableOutOfBounds)` with NO write; else Ok(Nil), charging `count` fuel (R9).
+pub fn table_copy(
+  dst_idx: Int,
+  src_idx: Int,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  commit(
+    dst_idx,
+    do_table_copy(read_at(dst_idx), read_at(src_idx), dst, src, count),
+  )
+}
+
+/// Write an active reference-typed ELEMENT segment's `refs` into table `idx` at `offset`, at
+/// instantiation (the generalisation of `init_elem` to arbitrary references — funcref | externref
+/// | null — and any table index). All-or-nothing: `Error(TableOutOfBounds)` if `offset < 0` or
+/// `offset + length(refs) > size`, no partial write. Charges NO fuel (an instantiation write,
+/// parity with `init_elem`). `emit_core` uses this for expr/externref/null/non-zero-table active
+/// segments; funcref-funcidx active segments keep the byte-identical `init_elem` fast path.
+pub fn init_elem_ref(
+  idx: Int,
+  offset: Int,
+  refs: List(RefValue),
+) -> Result(Nil, TrapReason) {
+  commit(idx, do_init_elem_ref(read_at(idx), offset, refs))
+}
+
+/// Read table `idx`'s handle from the cell and coerce it to a `Table`. Fail-closed on an un-seeded
+/// cell (via `rt_state`).
+fn read_at(idx: Int) -> Table {
+  dynamic_to_table(rt_state.table_at(idx))
+}
+
+/// Commit a mutating op's `Result(Table, _)` back into table `idx` of the cell: on `Ok`, re-inject
+/// the rebuilt handle and return `Ok(Nil)`; on `Error`, propagate (nothing was written).
+fn commit(
+  idx: Int,
+  result: Result(Table, TrapReason),
+) -> Result(Nil, TrapReason) {
+  case result {
+    Ok(table) -> {
+      rt_state.with_table_at(idx, table_to_dynamic(table))
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+// ───────────────────────────── the paged THREADED family (state_strategy: Threaded) ─────────────────────────────
 //
-// The threaded closure ABI is `fn(InstanceState, List(Int)) -> #(List(Int), InstanceState)`
-// (the callee threads any memory/global updates), which differs from the cell ABI
-// `fn(List(Int)) -> List(Int)`. Both closure shapes are the SAME BEAM term at run time (a fun),
-// so — since `new` builds one `Table` handle for BOTH strategies and the threaded family is the
-// SOLE reader of what it writes — the threaded closure is coerced through the `Table`'s cell-typed
-// slot via `gleam_stdlib:identity` on the way in and back out. No cell op ever reads a threaded
-// slot (a threaded build never touches the pdict cell), so the coercion is sound.
+// The purely-functional twin of the cell surface. The handle travels in the `tables` vector of the
+// threaded `InstanceState` (projected via `rt_state.t_table_at`, re-injected via
+// `rt_state.t_with_table_at`) instead of the pdict cell — the §10 uniform-threading rule. Every op
+// drives the SAME `do_*` core the cell family uses (so cell ≡ threaded, including fuel), a mutating
+// op re-injecting the rebuilt immutable handle.
 
-/// Coerce a threaded closure into the cell-typed slot the `Table` record stores. Identity at run
-/// time (`gleam_stdlib:identity/1`); sound because only the threaded family reads it back.
-@external(erlang, "gleam_stdlib", "identity")
-fn threaded_as_cell(
-  f: fn(InstanceState, List(Int)) -> #(List(Int), InstanceState),
-) -> fn(List(Int)) -> List(Int)
-
-/// Coerce a stored slot closure back to the threaded ABI. Identity at run time; sound because a
-/// threaded-written slot is only ever read by the threaded family.
-@external(erlang, "gleam_stdlib", "identity")
-fn cell_as_threaded(
-  f: fn(List(Int)) -> List(Int),
-) -> fn(InstanceState, List(Int)) -> #(List(Int), InstanceState)
-
-/// Threaded `init_elem`: project `st.table`, whole-range bounds-check, and RETURN the record with
-/// the rebuilt immutable `Table`.
-///
-/// - `st`: the threaded instance-state record; its `table` slot holds the `Table` handle.
-/// - `offset`: the first slot written; `entries[k]` goes into slot `offset + k`.
-/// - `entries`: the type-tagged build-controlled threaded closures — each `#(FuncType, closure)`
-///   pairs an element function's IR signature with a closure over the generated function.
-/// - Bounds check FIRST, before any write: if `offset < 0` or `offset + length(entries) > size`,
-///   return `Error(TableOutOfBounds)` and write NOTHING (all-or-nothing). On success returns
-///   `Ok(st')` where `st'.table` is a NEW immutable `Table` with the entries (the §10 rule for an
-///   immutable backend: rebuilt handle, structural sharing across versions is free).
+/// Threaded `init_elem` (byte-identical to Phase-4): whole-range bounds-check, RETURN the record
+/// with the rebuilt `Table`, or `Error(TableOutOfBounds)` writing nothing.
 pub fn t_init_elem(
   st: InstanceState,
   offset: Int,
@@ -224,7 +364,7 @@ pub fn t_init_elem(
     False -> {
       let new_slots =
         list.index_fold(entries, table.slots, fn(slots, entry, k) {
-          dict.insert(slots, offset + k, #(entry.0, threaded_as_cell(entry.1)))
+          dict.insert(slots, offset + k, threaded_funcref_to_ref(entry))
         })
       Ok(rt_state.with_table(
         st,
@@ -234,16 +374,8 @@ pub fn t_init_elem(
   }
 }
 
-/// Threaded `call_indirect`: the 3-fault dispatch (§F) over `st.table`, invoking the slot's target
-/// as `target(st, args) -> #(results, st')`.
-///
-/// - `st`: the threaded instance-state record.
-/// - `index`/`expected_type`/`args`: as the cell `call_indirect`. Guard 3 is exact STRUCTURAL
-///   `FuncType` equality (`==`).
-/// - Returns `Ok(#(results, st'))` where `st'` is whatever the invoked build-controlled closure
-///   threaded (memory/global updates the callee made), or the three `Error(reason)`s in guard
-///   order (`UndefinedElement` → `UninitializedElement` → `IndirectCallTypeMismatch`). The table
-///   slot is unchanged — the MVP dispatch never mutates the table.
+/// Threaded `call_indirect` (byte-identical to Phase-4): the 3-fault dispatch over `st`'s default
+/// table, invoking the target as `target(st, args) -> #(results, st')`.
 pub fn t_call_indirect(
   st: InstanceState,
   index: Int,
@@ -256,29 +388,337 @@ pub fn t_call_indirect(
     False ->
       case dict.get(table.slots, index) {
         Error(Nil) -> Error(UninitializedElement)
-        Ok(#(entry_type, target)) ->
+        Ok(value) -> {
+          let #(entry_type, target) = ref_to_threaded_funcref(value)
           case entry_type == expected_type {
             False -> Error(IndirectCallTypeMismatch)
-            True -> Ok(cell_as_threaded(target)(st, args))
+            True -> Ok(target(st, args))
           }
+        }
       }
   }
 }
 
-/// The differential canon hook (§B.2 / §F) — the tier's whole slot image as a `size`-length list:
-/// `None` = a null slot, `Some(ty)` = a filled slot's structural `FuncType` tag. `TablePaged` is
-/// the differential ORACLE, so this is the reference image unit 09 compares every tier against
-/// (the table analog of `rt_mem.to_flat`). Closures are not comparable; behaviour is compared via
-/// `call_indirect`. Tests only.
-///
-/// - `handle`: the opaque table `Dynamic` (from `rt_state.table(st)` or `rt_state.table_get()`).
-/// - Returns the `size`-length `List(Option(FuncType))` slot image. Total.
+/// Threaded `table.get` (read-only): `st` unchanged. See `get`.
+pub fn t_get(
+  st: InstanceState,
+  idx: Int,
+  index: Int,
+) -> Result(RefValue, TrapReason) {
+  do_get(read_at_t(st, idx), index)
+}
+
+/// Threaded `table.set`: returns `Ok(st')` with the rebuilt handle (immutable backend, §10), or
+/// `Error(TableOutOfBounds)` with `st` untouched. See `set`.
+pub fn t_set(
+  st: InstanceState,
+  idx: Int,
+  index: Int,
+  value: RefValue,
+) -> Result(InstanceState, TrapReason) {
+  commit_t(st, idx, do_set(read_at_t(st, idx), index, value))
+}
+
+/// Threaded `table.size` (read-only). See `size`.
+pub fn t_size(st: InstanceState, idx: Int) -> Int {
+  do_size(read_at_t(st, idx))
+}
+
+/// Threaded `table.grow`: returns `#(old_size_or_-1, st')` — on success the rebuilt handle and
+/// `delta` fuel charged (parity with cell `grow`), on failure `#(-1, st)` unchanged. See `grow`.
+pub fn t_grow(
+  st: InstanceState,
+  idx: Int,
+  delta: Int,
+  init: RefValue,
+) -> #(Int, InstanceState) {
+  case do_grow(read_at_t(st, idx), delta, init) {
+    #(-1, _) -> #(-1, st)
+    #(old, table) -> #(
+      old,
+      rt_state.t_with_table_at(st, idx, table_to_dynamic(table)),
+    )
+  }
+}
+
+/// Threaded `table.fill`: eager bounds, no partial writes; `Ok(st')` charging `count` fuel, else
+/// `Error(TableOutOfBounds)`. See `fill`.
+pub fn t_fill(
+  st: InstanceState,
+  idx: Int,
+  offset: Int,
+  value: RefValue,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  commit_t(st, idx, do_fill(read_at_t(st, idx), offset, value, count))
+}
+
+/// Threaded `table.init` from segment `items` (R2): eager double bounds, no partial writes;
+/// `Ok(st')` charging `count` fuel, else `Error(TableOutOfBounds)`. See `table_init`.
+pub fn t_table_init(
+  st: InstanceState,
+  idx: Int,
+  items: List(RefValue),
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  commit_t(st, idx, do_table_init(read_at_t(st, idx), items, dst, src, count))
+}
+
+/// Threaded `table.copy` (memmove, R11): eager bounds, no partial writes; `Ok(st')` charging
+/// `count` fuel, else `Error(TableOutOfBounds)`. See `table_copy`.
+pub fn t_table_copy(
+  st: InstanceState,
+  dst_idx: Int,
+  src_idx: Int,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  commit_t(
+    st,
+    dst_idx,
+    do_table_copy(
+      read_at_t(st, dst_idx),
+      read_at_t(st, src_idx),
+      dst,
+      src,
+      count,
+    ),
+  )
+}
+
+/// Threaded active reference-segment write (no fuel). See `init_elem_ref`.
+pub fn t_init_elem_ref(
+  st: InstanceState,
+  idx: Int,
+  offset: Int,
+  refs: List(RefValue),
+) -> Result(InstanceState, TrapReason) {
+  commit_t(st, idx, do_init_elem_ref(read_at_t(st, idx), offset, refs))
+}
+
+/// Project table `idx`'s handle out of the threaded record and coerce it to a `Table`. Read-only.
+fn read_at_t(st: InstanceState, idx: Int) -> Table {
+  dynamic_to_table(rt_state.t_table_at(st, idx))
+}
+
+/// Commit a mutating op's `Result(Table, _)` into table `idx` of the threaded record: on `Ok`,
+/// re-inject the rebuilt handle (§10) and return `Ok(st')`; on `Error`, propagate `st` untouched.
+fn commit_t(
+  st: InstanceState,
+  idx: Int,
+  result: Result(Table, TrapReason),
+) -> Result(InstanceState, TrapReason) {
+  case result {
+    Ok(table) -> Ok(rt_state.t_with_table_at(st, idx, table_to_dynamic(table)))
+    Error(reason) -> Error(reason)
+  }
+}
+
+// ───────────────────────────── the shared op cores (the testable algebra) ─────────────────────────────
+//
+// One core per op, driven by BOTH the cell and threaded families — so behaviour AND fuel are
+// identical across state strategies by construction. Cores operate on an explicit immutable
+// `Table`, treating every reference value as OPAQUE (they never invoke or inspect a funcref
+// closure), and charge fuel (R9) on the success path.
+
+/// Pure `table.get`: bounds-check, else the slot's reference (absent ⇒ null sentinel).
+fn do_get(t: Table, index: Int) -> Result(RefValue, TrapReason) {
+  case index < 0 || index >= t.size {
+    True -> Error(TableOutOfBounds)
+    False -> Ok(slot_ref(t, index))
+  }
+}
+
+/// Pure `table.set`: bounds-check FIRST (eager, no write on trap), else the rebuilt table.
+fn do_set(t: Table, index: Int, value: RefValue) -> Result(Table, TrapReason) {
+  case index < 0 || index >= t.size {
+    True -> Error(TableOutOfBounds)
+    False -> Ok(Table(..t, slots: put_slot(t.slots, index, value)))
+  }
+}
+
+/// Pure `table.size`.
+fn do_size(t: Table) -> Int {
+  t.size
+}
+
+/// Pure `table.grow`. Returns `#(old_size, grown)` on success (charging `delta` fuel, R9) or
+/// `#(-1, t)` if `delta < 0` or `old + delta` exceeds the effective `max` (unchanged, no charge).
+fn do_grow(t: Table, delta: Int, init: RefValue) -> #(Int, Table) {
+  let old = t.size
+  let new = old + delta
+  case delta >= 0 && new <= t.max {
+    False -> #(-1, t)
+    True -> {
+      let grown =
+        Table(..t, size: new, slots: fill_slots(t.slots, old, init, delta))
+      rt_meter.charge(delta)
+      #(old, grown)
+    }
+  }
+}
+
+/// Pure `table.fill`: eager bounds (`offset + count > size`, checked even for `count == 0`, R10),
+/// no partial writes; else the filled table, charging `count` fuel (R9).
+fn do_fill(
+  t: Table,
+  offset: Int,
+  value: RefValue,
+  count: Int,
+) -> Result(Table, TrapReason) {
+  case offset < 0 || count < 0 || offset + count > t.size {
+    True -> Error(TableOutOfBounds)
+    False -> {
+      let filled = Table(..t, slots: fill_slots(t.slots, offset, value, count))
+      rt_meter.charge(count)
+      Ok(filled)
+    }
+  }
+}
+
+/// Pure `table.init` from `items`: eager bounds against BOTH the segment length and the table
+/// size, no partial writes; else the written table, charging `count` fuel (R9). A dropped segment
+/// arrives as `items = []`, so any `count > 0` traps and `count == 0` no-ops (R2/§D).
+fn do_table_init(
+  t: Table,
+  items: List(RefValue),
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Table, TrapReason) {
+  case
+    dst < 0
+    || src < 0
+    || count < 0
+    || dst + count > t.size
+    || src + count > list.length(items)
+  {
+    True -> Error(TableOutOfBounds)
+    False -> {
+      let slice = list.take(list.drop(items, src), count)
+      let written = Table(..t, slots: write_slots(t.slots, dst, slice))
+      rt_meter.charge(count)
+      Ok(written)
+    }
+  }
+}
+
+/// Pure `table.copy` (memmove, R11): eager bounds against both ranges, no partial writes; else the
+/// written destination table, charging `count` fuel (R9). Overlap correctness comes from
+/// SNAPSHOTTING the whole source slice as a list BEFORE any destination write.
+fn do_table_copy(
+  dst_t: Table,
+  src_t: Table,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Table, TrapReason) {
+  case
+    dst < 0
+    || src < 0
+    || count < 0
+    || dst + count > dst_t.size
+    || src + count > src_t.size
+  {
+    True -> Error(TableOutOfBounds)
+    False -> {
+      let slice = list.map(range_list(src, count), fn(i) { slot_ref(src_t, i) })
+      let written = Table(..dst_t, slots: write_slots(dst_t.slots, dst, slice))
+      rt_meter.charge(count)
+      Ok(written)
+    }
+  }
+}
+
+/// Pure active reference-segment write (no fuel): whole-range bounds, no partial writes.
+fn do_init_elem_ref(
+  t: Table,
+  offset: Int,
+  refs: List(RefValue),
+) -> Result(Table, TrapReason) {
+  case offset < 0 || offset + list.length(refs) > t.size {
+    True -> Error(TableOutOfBounds)
+    False -> Ok(Table(..t, slots: write_slots(t.slots, offset, refs)))
+  }
+}
+
+// ───────────────────────────── slot helpers ─────────────────────────────
+
+/// The reference value at slot `index`: the stored value, or the null sentinel if absent.
+fn slot_ref(t: Table, index: Int) -> RefValue {
+  case dict.get(t.slots, index) {
+    Ok(value) -> value
+    Error(Nil) -> rt_ref.null_ref()
+  }
+}
+
+/// Write `value` into slot `index`: a non-null reference is INSERTED; the null sentinel is
+/// represented by ABSENCE, so a null write DELETES the slot (keeping `call_indirect`'s absent-key
+/// guard byte-identical).
+fn put_slot(
+  slots: Dict(Int, RefValue),
+  index: Int,
+  value: RefValue,
+) -> Dict(Int, RefValue) {
+  case rt_ref.is_null(value) {
+    True -> dict.delete(slots, index)
+    False -> dict.insert(slots, index, value)
+  }
+}
+
+/// Fill slots `[start, start + count)` all with `value` (via `put_slot`).
+fn fill_slots(
+  slots: Dict(Int, RefValue),
+  start: Int,
+  value: RefValue,
+  count: Int,
+) -> Dict(Int, RefValue) {
+  case count <= 0 {
+    True -> slots
+    False ->
+      fill_slots(put_slot(slots, start, value), start + 1, value, count - 1)
+  }
+}
+
+/// Write `values` into consecutive slots starting at `start` (`values[k]` → slot `start + k`).
+fn write_slots(
+  slots: Dict(Int, RefValue),
+  start: Int,
+  values: List(RefValue),
+) -> Dict(Int, RefValue) {
+  list.index_fold(values, slots, fn(acc, value, k) {
+    put_slot(acc, start + k, value)
+  })
+}
+
+/// The effective maximum entry count baked at `new` time: `min(declared_max, hard_max_slots)`, or
+/// `hard_max_slots` when no maximum is declared. `grow` never exceeds it.
+pub fn effective_max(max: Option(Int)) -> Int {
+  case max {
+    Some(declared) -> int.min(declared, hard_max_slots)
+    None -> hard_max_slots
+  }
+}
+
+// ───────────────────────────── differential canon hook (tests only, §H) ─────────────────────────────
+
+/// The tier's whole slot image as a `size`-length list of funcref type tags — the differential
+/// ORACLE image (`TablePaged` is the oracle). `None` = a null slot (absent) OR a non-funcref
+/// (externref) reference; `Some(ty)` = a funcref slot's structural `FuncType`. Closures/externref
+/// payloads are not compared here (behaviour is compared via `call_indirect`/`get`). Tests only.
 pub fn to_canon(handle: Dynamic) -> List(Option(FuncType)) {
   let table = dynamic_to_table(handle)
   list.map(indices(table.size), fn(i) {
     case dict.get(table.slots, i) {
       Error(Nil) -> None
-      Ok(#(ty, _target)) -> Some(ty)
+      Ok(value) ->
+        case rt_ref.classify_ref(value) {
+          rt_ref.FuncRef -> Some(ref_func_type_entry(value).0)
+          _ -> None
+        }
     }
   })
 }
@@ -286,12 +726,17 @@ pub fn to_canon(handle: Dynamic) -> List(Option(FuncType)) {
 /// The ascending slot indices `[0, 1, …, size-1]` (`[]` for `size <= 0`). Built by hand so it
 /// never depends on `list.range`'s descending-range edge behaviour. Private helper for `to_canon`.
 fn indices(size: Int) -> List(Int) {
-  build_indices(size - 1, [])
+  range_list(0, size)
 }
 
-fn build_indices(i: Int, acc: List(Int)) -> List(Int) {
-  case i < 0 {
-    True -> acc
-    False -> build_indices(i - 1, [i, ..acc])
+/// The `count` ascending integers `[start, start+1, …, start+count-1]` (`[]` for `count <= 0`).
+fn range_list(start: Int, count: Int) -> List(Int) {
+  build_range(start, count, [])
+}
+
+fn build_range(start: Int, count: Int, acc: List(Int)) -> List(Int) {
+  case count <= 0 {
+    True -> list.reverse(acc)
+    False -> build_range(start + 1, count - 1, [start, ..acc])
   }
 }

@@ -23,7 +23,7 @@
 %%% `twocore_rt_table_ets_tid`; it cannot collide with `rt_state`'s
 %%% `twocore_rt_state` cell key.
 -module(twocore_rt_table_ets_ffi).
--export([new/0, insert/3, lookup/2]).
+-export([new/0, insert/3, lookup/2, delete/2]).
 
 %% The process-local pdict key under which `new/0` tracks the table it last
 %% created, so a re-instantiation can delete it (no leak).
@@ -71,3 +71,14 @@ lookup(Tid, Key) ->
         [{Key, Entry}] -> {ok, Entry};
         [] -> {error, nil}
     end.
+
+%% delete(Tid, Key) -> nil
+%%
+%% Remove slot `Key`, mutating the table IN PLACE. Deleting an absent key is a
+%% no-op (`ets:delete/2` never raises on a missing key). Used to represent a
+%% `table.set`/`fill`/`copy` of the null reference: a null slot is an ABSENT key
+%% (so `call_indirect`'s guard-2 stays byte-identical — absent ⇒ uninitialised).
+%% Returns the Gleam `Nil` atom so the caller can type it `-> Nil`.
+delete(Tid, Key) ->
+    ets:delete(Tid, Key),
+    nil.

@@ -46,17 +46,25 @@ import twocore/ir.{
   type FuncType, type TrapReason, IndirectCallTypeMismatch, TableOutOfBounds,
   UndefinedElement, UninitializedElement,
 }
+import twocore/runtime/rt_meter
+import twocore/runtime/rt_ref
 import twocore/runtime/rt_state.{type InstanceState}
+import twocore/runtime/rt_table.{type RefValue, effective_max}
 
-/// The ETS-backed funcref table handle (opaque; carried as `Dynamic` in the `table` slot).
+/// The ETS-backed typed reference-table handle (opaque; carried as `Dynamic` in a `tables`-vector
+/// slot). Phase-5 generalises the funcref store to a typed REFERENCE store (§A).
 ///
 /// - `tid`: the PRIVATE, unnamed `set` ETS table owned by the instance process, keyed
-///   `slot_index -> #(FuncType, closure)` (ETS stores the closure term natively). A stable
-///   reference: a mutating op writes THROUGH it in place, so the handle value is unchanged.
-/// - `size`: the number of slots — the declared `min`. Fixed at `new` time (no runtime
-///   `table.grow` in the MVP); `call_indirect`'s bounds guard checks `index` against it.
+///   `slot_index -> RefValue` (ETS stores the reference term natively — a funcref
+///   `#(FuncType, closure)` or an externref `{ref_extern, term}`). A stable reference: a mutating
+///   op writes THROUGH it in place. **Null is ABSENCE** — a slot set to null is DELETED, so
+///   `call_indirect`'s absent-key guard stays byte-identical.
+/// - `size`: the current slot count (`table.size`). Grows via `grow` (a new handle with the new
+///   size; the `tid` is stable in place).
+/// - `max`: the EFFECTIVE maximum entry count (`min(declared_max, hard_max_slots)`), baked at
+///   `new` time; `grow` never exceeds it.
 type EtsTable {
-  EtsTable(tid: Dynamic, size: Int)
+  EtsTable(tid: Dynamic, size: Int, max: Int)
 }
 
 // ───────────────────────────── the `ets` FFI (twocore_-namespaced shim) ─────────────────────────────
@@ -72,10 +80,15 @@ fn ets_new() -> Dynamic
 @external(erlang, "twocore_rt_table_ets_ffi", "insert")
 fn ets_insert(tid: Dynamic, key: Int, entry: Dynamic) -> Nil
 
-/// Read slot `key`: `Ok(entry)` (the stored `#(FuncType, closure)` term as an opaque `Dynamic`)
-/// when the slot is filled, or `Error(Nil)` when it is null/absent (the guard-2 signal).
+/// Read slot `key`: `Ok(entry)` (the stored `RefValue` term as an opaque `Dynamic`) when the
+/// slot is filled, or `Error(Nil)` when it is null/absent (the guard-2 signal).
 @external(erlang, "twocore_rt_table_ets_ffi", "lookup")
 fn ets_lookup(tid: Dynamic, key: Int) -> Result(Dynamic, Nil)
+
+/// Delete slot `key` IN PLACE (a no-op if absent). Represents a null reference write (a null slot
+/// is an ABSENT key), keeping the `call_indirect` guard byte-identical.
+@external(erlang, "twocore_rt_table_ets_ffi", "delete")
+fn ets_delete(tid: Dynamic, key: Int) -> Nil
 
 // ───────────────────────────── opaque `Dynamic` coercions (identity at run time) ─────────────────────────────
 
@@ -128,10 +141,12 @@ fn dynamic_to_type_entry(d: Dynamic) -> #(FuncType, Dynamic)
 ///   segment fills it traps `UninitializedElement`.
 /// - `max`: optional maximum entry count. UNUSED in the MVP — funcref tables cannot grow
 ///   (`table.grow` is a post-MVP reference-types op) and are only ever filled via `init_elem`.
+/// - `max`: the declared maximum entry count, or `None` for unbounded. The EFFECTIVE cap baked
+///   into the handle is `min(declared_max, hard_max_slots)`; `grow` enforces it.
 /// - Returns the fresh handle. Side effect: creates a PRIVATE ETS table and (§C lifecycle)
 ///   deletes any prior one this process created, so re-instantiation never leaks. Total.
-pub fn new(min: Int, _max: Option(Int)) -> Dynamic {
-  ets_to_dynamic(EtsTable(tid: ets_new(), size: min))
+pub fn new(min: Int, max: Option(Int)) -> Dynamic {
+  ets_to_dynamic(EtsTable(tid: ets_new(), size: min, max: effective_max(max)))
 }
 
 // ───────────────────────────── cell-backed family (state_strategy: Cell) ─────────────────────────────
@@ -270,10 +285,414 @@ pub fn t_call_indirect(
   }
 }
 
-/// Project THIS record's `EtsTable` out of `st.table` (the field seam `rt_state.table`) and
-/// coerce it. Read-only.
+/// Project THIS record's default `EtsTable` out of `st.table` (the field seam `rt_state.table`)
+/// and coerce it. Read-only.
 fn project(st: InstanceState) -> EtsTable {
   dynamic_to_ets(rt_state.table(st))
+}
+
+// ───────────────────────────── cell-backed reference/bulk surface (§B) ─────────────────────────────
+//
+// The Phase-5 reference-types + bulk-table ops (state_strategy: Cell), reaching table `idx` via the
+// R7 index-keyed `rt_state.table_at`/`with_table_at` accessors. ETS is mutated IN PLACE, so `set`/
+// `fill`/`table_init`/`table_copy` need no write-back (the `tid` is stable); `grow` re-injects the
+// handle because the `size` field changes. The op cores charge fuel (R9) identically to the
+// threaded family (G7 parity).
+
+/// `table.get idx` — the reference at `index`; absent ⇒ null sentinel; `Error(TableOutOfBounds)`
+/// out of range. No mutation.
+pub fn get(idx: Int, index: Int) -> Result(RefValue, TrapReason) {
+  do_get(read_at(idx), index)
+}
+
+/// `table.set idx` — write `value` at `index` (eager bounds, no write on trap). Null ⇒ delete slot.
+pub fn set(idx: Int, index: Int, value: RefValue) -> Result(Nil, TrapReason) {
+  in_place(do_set(read_at(idx), index, value))
+}
+
+/// `table.size idx`.
+pub fn size(idx: Int) -> Int {
+  do_size(read_at(idx))
+}
+
+/// `table.grow idx` — append `delta` slots of `init`; the OLD size, or `-1` past `max`/cap
+/// (unchanged, no fuel). Charges `delta` fuel on success (R9). Re-injects the resized handle.
+pub fn grow(idx: Int, delta: Int, init: RefValue) -> Int {
+  case do_grow(read_at(idx), delta, init) {
+    #(-1, _) -> -1
+    #(old, table) -> {
+      rt_state.with_table_at(idx, ets_to_dynamic(table))
+      old
+    }
+  }
+}
+
+/// `table.fill idx` — eager bounds (checked even for `count == 0`, R10), no partial writes; charges
+/// `count` fuel on success (R9).
+pub fn fill(
+  idx: Int,
+  offset: Int,
+  value: RefValue,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  in_place(do_fill(read_at(idx), offset, value, count))
+}
+
+/// `table.init idx` from segment `items` (R2) — eager double bounds, no partial writes; `count`
+/// fuel on success (R9). A dropped segment arrives as `items = []`.
+pub fn table_init(
+  idx: Int,
+  items: List(RefValue),
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  in_place(do_table_init(read_at(idx), items, dst, src, count))
+}
+
+/// `table.copy dst_idx src_idx` — memmove/overlap-correct (R11); eager bounds, no partial writes;
+/// `count` fuel on success (R9).
+pub fn table_copy(
+  dst_idx: Int,
+  src_idx: Int,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  in_place(do_table_copy(read_at(dst_idx), read_at(src_idx), dst, src, count))
+}
+
+/// Active reference-segment write into table `idx` at `offset` (no fuel; whole-range bounds).
+pub fn init_elem_ref(
+  idx: Int,
+  offset: Int,
+  refs: List(RefValue),
+) -> Result(Nil, TrapReason) {
+  in_place(do_init_elem_ref(read_at(idx), offset, refs))
+}
+
+/// Read table `idx`'s `EtsTable` from the cell. Fail-closed on an un-seeded cell (via `rt_state`).
+fn read_at(idx: Int) -> EtsTable {
+  dynamic_to_ets(rt_state.table_at(idx))
+}
+
+/// Map an in-place op's `Result(EtsTable, _)` to `Result(Nil, _)`: the ETS mutation already
+/// happened in place (the `tid`/`size` are unchanged for these ops), so on `Ok` nothing is
+/// re-injected; on `Error` the table was left untouched (no partial write).
+fn in_place(result: Result(EtsTable, TrapReason)) -> Result(Nil, TrapReason) {
+  case result {
+    Ok(_table) -> Ok(Nil)
+    Error(reason) -> Error(reason)
+  }
+}
+
+// ───────────────────────────── threaded reference/bulk surface (§B) ─────────────────────────────
+//
+// The threaded twins reach table `idx` via `rt_state.t_table_at`/`t_with_table_at`. A mutating op
+// mutates ETS in place and returns the record: the SAME `st` when the handle is unchanged (§10 —
+// `set`/`fill`/`init`/`copy`), or a re-injected handle when `grow` changes the `size` field.
+
+/// Threaded `table.get` (read-only). See `get`.
+pub fn t_get(
+  st: InstanceState,
+  idx: Int,
+  index: Int,
+) -> Result(RefValue, TrapReason) {
+  do_get(read_at_t(st, idx), index)
+}
+
+/// Threaded `table.set`: mutates ETS in place, returns the SAME `st` (§10). See `set`.
+pub fn t_set(
+  st: InstanceState,
+  idx: Int,
+  index: Int,
+  value: RefValue,
+) -> Result(InstanceState, TrapReason) {
+  in_place_t(st, do_set(read_at_t(st, idx), index, value))
+}
+
+/// Threaded `table.size` (read-only). See `size`.
+pub fn t_size(st: InstanceState, idx: Int) -> Int {
+  do_size(read_at_t(st, idx))
+}
+
+/// Threaded `table.grow`: `#(old_or_-1, st')`; on success re-injects the resized handle and
+/// charges `delta` fuel (parity with cell `grow`). See `grow`.
+pub fn t_grow(
+  st: InstanceState,
+  idx: Int,
+  delta: Int,
+  init: RefValue,
+) -> #(Int, InstanceState) {
+  case do_grow(read_at_t(st, idx), delta, init) {
+    #(-1, _) -> #(-1, st)
+    #(old, table) -> #(
+      old,
+      rt_state.t_with_table_at(st, idx, ets_to_dynamic(table)),
+    )
+  }
+}
+
+/// Threaded `table.fill`: in place, returns the SAME `st`; `count` fuel on success. See `fill`.
+pub fn t_fill(
+  st: InstanceState,
+  idx: Int,
+  offset: Int,
+  value: RefValue,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  in_place_t(st, do_fill(read_at_t(st, idx), offset, value, count))
+}
+
+/// Threaded `table.init` from segment `items` (R2): in place, same `st`; `count` fuel on success.
+pub fn t_table_init(
+  st: InstanceState,
+  idx: Int,
+  items: List(RefValue),
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  in_place_t(st, do_table_init(read_at_t(st, idx), items, dst, src, count))
+}
+
+/// Threaded `table.copy` (memmove, R11): in place, same `st`; `count` fuel on success.
+pub fn t_table_copy(
+  st: InstanceState,
+  dst_idx: Int,
+  src_idx: Int,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  in_place_t(
+    st,
+    do_table_copy(
+      read_at_t(st, dst_idx),
+      read_at_t(st, src_idx),
+      dst,
+      src,
+      count,
+    ),
+  )
+}
+
+/// Threaded active reference-segment write (no fuel). See `init_elem_ref`.
+pub fn t_init_elem_ref(
+  st: InstanceState,
+  idx: Int,
+  offset: Int,
+  refs: List(RefValue),
+) -> Result(InstanceState, TrapReason) {
+  in_place_t(st, do_init_elem_ref(read_at_t(st, idx), offset, refs))
+}
+
+/// Project table `idx`'s `EtsTable` out of the threaded record. Read-only.
+fn read_at_t(st: InstanceState, idx: Int) -> EtsTable {
+  dynamic_to_ets(rt_state.t_table_at(st, idx))
+}
+
+/// Map an in-place threaded op's result to `Result(InstanceState, _)`: the ETS mutation already
+/// happened in place (the handle is unchanged), so on `Ok` the SAME `st` is returned (§10).
+fn in_place_t(
+  st: InstanceState,
+  result: Result(EtsTable, TrapReason),
+) -> Result(InstanceState, TrapReason) {
+  case result {
+    Ok(_table) -> Ok(st)
+    Error(reason) -> Error(reason)
+  }
+}
+
+// ───────────────────────────── the op cores (mutate ETS in place; §H) ─────────────────────────────
+//
+// One core per op, driven by BOTH families — so behaviour AND fuel are identical across state
+// strategies. Cores mutate the ETS table IN PLACE (an effect through the stable `tid`) and return
+// the (mostly unchanged) `EtsTable`; `grow` returns the resized handle. Reference values are
+// OPAQUE (never invoked/inspected here); fuel (R9) is charged on the success path.
+
+/// Pure-shaped `table.get`: bounds-check, else the slot's reference (absent ⇒ null sentinel).
+fn do_get(t: EtsTable, index: Int) -> Result(RefValue, TrapReason) {
+  case index < 0 || index >= t.size {
+    True -> Error(TableOutOfBounds)
+    False ->
+      Ok(case ets_lookup(t.tid, index) {
+        Ok(value) -> value
+        Error(Nil) -> rt_ref.null_ref()
+      })
+  }
+}
+
+/// `table.set` core: bounds-check FIRST (no write on trap), else write the slot in place.
+fn do_set(
+  t: EtsTable,
+  index: Int,
+  value: RefValue,
+) -> Result(EtsTable, TrapReason) {
+  case index < 0 || index >= t.size {
+    True -> Error(TableOutOfBounds)
+    False -> {
+      put_slot(t.tid, index, value)
+      Ok(t)
+    }
+  }
+}
+
+/// `table.size` core.
+fn do_size(t: EtsTable) -> Int {
+  t.size
+}
+
+/// `table.grow` core: `#(old, resized)` on success (inserting `init`, charging `delta` fuel), or
+/// `#(-1, t)` if `delta < 0` or `old + delta` exceeds the effective `max`.
+fn do_grow(t: EtsTable, delta: Int, init: RefValue) -> #(Int, EtsTable) {
+  let old = t.size
+  let new = old + delta
+  case delta >= 0 && new <= t.max {
+    False -> #(-1, t)
+    True -> {
+      fill_run(t.tid, old, init, delta)
+      rt_meter.charge(delta)
+      #(old, EtsTable(..t, size: new))
+    }
+  }
+}
+
+/// `table.fill` core: eager bounds (checked even for `count == 0`, R10), no partial writes; else
+/// fill in place, charging `count` fuel.
+fn do_fill(
+  t: EtsTable,
+  offset: Int,
+  value: RefValue,
+  count: Int,
+) -> Result(EtsTable, TrapReason) {
+  case offset < 0 || count < 0 || offset + count > t.size {
+    True -> Error(TableOutOfBounds)
+    False -> {
+      fill_run(t.tid, offset, value, count)
+      rt_meter.charge(count)
+      Ok(t)
+    }
+  }
+}
+
+/// `table.init` core from `items`: eager bounds against BOTH the segment length and the table
+/// size, no partial writes; else write in place, charging `count` fuel.
+fn do_table_init(
+  t: EtsTable,
+  items: List(RefValue),
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(EtsTable, TrapReason) {
+  case
+    dst < 0
+    || src < 0
+    || count < 0
+    || dst + count > t.size
+    || src + count > list.length(items)
+  {
+    True -> Error(TableOutOfBounds)
+    False -> {
+      write_run(t.tid, dst, list.take(list.drop(items, src), count))
+      rt_meter.charge(count)
+      Ok(t)
+    }
+  }
+}
+
+/// `table.copy` core (memmove, R11): eager bounds, no partial writes; SNAPSHOT the whole source
+/// slice as a list BEFORE writing the destination (overlap-correct); charge `count` fuel.
+fn do_table_copy(
+  dst_t: EtsTable,
+  src_t: EtsTable,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(EtsTable, TrapReason) {
+  case
+    dst < 0
+    || src < 0
+    || count < 0
+    || dst + count > dst_t.size
+    || src + count > src_t.size
+  {
+    True -> Error(TableOutOfBounds)
+    False -> {
+      let slice = snapshot(src_t, src, count)
+      write_run(dst_t.tid, dst, slice)
+      rt_meter.charge(count)
+      Ok(dst_t)
+    }
+  }
+}
+
+/// Active reference-segment write core (no fuel): whole-range bounds, no partial writes.
+fn do_init_elem_ref(
+  t: EtsTable,
+  offset: Int,
+  refs: List(RefValue),
+) -> Result(EtsTable, TrapReason) {
+  case offset < 0 || offset + list.length(refs) > t.size {
+    True -> Error(TableOutOfBounds)
+    False -> {
+      write_run(t.tid, offset, refs)
+      Ok(t)
+    }
+  }
+}
+
+// ───────────────────────────── slot helpers ─────────────────────────────
+
+/// Write `value` into slot `index` IN PLACE: a non-null reference is INSERTED; the null sentinel is
+/// represented by ABSENCE, so a null write DELETES the slot (keeping `call_indirect` byte-identical).
+fn put_slot(tid: Dynamic, index: Int, value: RefValue) -> Nil {
+  case rt_ref.is_null(value) {
+    True -> ets_delete(tid, index)
+    False -> ets_insert(tid, index, value)
+  }
+}
+
+/// Fill slots `[start, start + count)` all with `value`, in place.
+fn fill_run(tid: Dynamic, start: Int, value: RefValue, count: Int) -> Nil {
+  case count <= 0 {
+    True -> Nil
+    False -> {
+      put_slot(tid, start, value)
+      fill_run(tid, start + 1, value, count - 1)
+    }
+  }
+}
+
+/// Write `values` into consecutive slots from `start` (`values[k]` → slot `start + k`), in place.
+fn write_run(tid: Dynamic, start: Int, values: List(RefValue)) -> Nil {
+  list.index_fold(values, Nil, fn(_acc, value, k) {
+    put_slot(tid, start + k, value)
+  })
+}
+
+/// Snapshot source slots `[src, src + count)` into a list of reference values (read BEFORE any
+/// destination write — the memmove guarantee).
+fn snapshot(t: EtsTable, src: Int, count: Int) -> List(RefValue) {
+  snapshot_loop(t, src, count, [])
+}
+
+fn snapshot_loop(
+  t: EtsTable,
+  at: Int,
+  remaining: Int,
+  acc: List(RefValue),
+) -> List(RefValue) {
+  case remaining <= 0 {
+    True -> list.reverse(acc)
+    False -> {
+      let value = case ets_lookup(t.tid, at) {
+        Ok(v) -> v
+        Error(Nil) -> rt_ref.null_ref()
+      }
+      snapshot_loop(t, at + 1, remaining - 1, [value, ..acc])
+    }
+  }
 }
 
 // ───────────────────────────── differential canon hook (tests only, §F) ─────────────────────────────
@@ -287,7 +706,11 @@ pub fn to_canon(handle: Dynamic) -> List(Option(FuncType)) {
   list.map(indices(table.size), fn(i) {
     case ets_lookup(table.tid, i) {
       Error(Nil) -> None
-      Ok(entry) -> Some(dynamic_to_type_entry(entry).0)
+      Ok(value) ->
+        case rt_ref.classify_ref(value) {
+          rt_ref.FuncRef -> Some(dynamic_to_type_entry(value).0)
+          _ -> None
+        }
     }
   })
 }
