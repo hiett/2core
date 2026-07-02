@@ -662,6 +662,339 @@ pub fn br_to_if_e2e_test() {
   catch_apply(mod, atom.create("f"), [0]) |> should.equal(Ok(6))
 }
 
+// ═════════════════════════ Phase 5 (P5-05): reference / table / bulk ═════════════════════════
+
+/// Decode → validate → lower without asserting success (for fail-closed cases).
+fn try_build(bytes: BitArray) -> Result(ir.Module, lower.LowerError) {
+  let assert Ok(m) = decode.decode(bytes)
+  let assert Ok(typed) = validate.validate(m)
+  lower.lower(typed)
+}
+
+// ── reference instructions (spec exec/instructions §reference-instructions) ──
+
+/// `ref.null t` reduces to the null-reference VALUE `ConstNull(t)` (R1c — no separate
+/// `Expr`), pushed like a numeric const; a function returning it yields `Values([ConstNull(
+/// t)])` typed to the reftype. `ref.null func` ⇒ `ConstNull(FuncRef)`/`TFuncRef`;
+/// `ref.null extern` ⇒ `ConstNull(ExternRef)`/`TExternRef` (spec: the null reference of the
+/// given reftype).
+pub fn ref_null_test() {
+  let irm = build(ref_wasm)
+  let rn = func(irm, "f1")
+  rn.result |> should.equal([ir.TFuncRef])
+  rn.body |> should.equal(ir.Values([ir.ConstNull(ir.FuncRef)]))
+  let ren = func(irm, "f2")
+  ren.result |> should.equal([ir.TExternRef])
+  ren.body |> should.equal(ir.Values([ir.ConstNull(ir.ExternRef)]))
+}
+
+/// `ref.func $f` ⇒ a value-producing `RefFunc("f<abs_funcidx>")` of type `TFuncRef`; the
+/// name equals the target function's IR name (`"f0"` here), so the reference resolves to a
+/// real `Function` (spec: `ref.func x` pushes a funcref to function `x`).
+pub fn ref_func_test() {
+  let irm = build(ref_wasm)
+  let rf = func(irm, "f3")
+  rf.result |> should.equal([ir.TFuncRef])
+  list.any(all_exprs(rf.body), fn(e) { e == ir.RefFunc("f0") })
+  |> should.equal(True)
+  // the target name resolves to a real defined function.
+  list.any(irm.functions, fn(g) { g.name == "f0" }) |> should.equal(True)
+}
+
+/// `ref.is_null` ⇒ `RefIsNull(arg)` of type `TI32` (spec: pops a reference, pushes i32 `1`
+/// iff it is null). The argument is the reference operand (here the externref param `p0`).
+pub fn ref_is_null_test() {
+  let irm = build(ref_wasm)
+  let isn = func(irm, "f4")
+  isn.result |> should.equal([ir.TI32])
+  list.any(all_exprs(isn.body), fn(e) { e == ir.RefIsNull(ir.Var("p0")) })
+  |> should.equal(True)
+}
+
+/// Tables carry their element reference type (H1): a `funcref` table and an `externref`
+/// table lower to `TableDecl`s tagged `FuncRef`/`ExternRef` respectively (spec
+/// binary/types reftype). A declarative element segment (only makes `ref.func` targets
+/// valid) lowers to `ElemDeclarative` with no active table write.
+pub fn ref_tables_test() {
+  let irm = build(ref_wasm)
+  irm.tables
+  |> should.equal([
+    ir.TableDecl("t0", ir.FuncRef, 2, option.None),
+    ir.TableDecl("t1", ir.ExternRef, 1, option.None),
+  ])
+  irm.elements
+  |> should.equal([
+    ir.ElementSegment(ir.ElemDeclarative, ir.FuncRef, [ir.RefFunc("f0")]),
+  ])
+}
+
+// ── table instructions (spec exec/instructions §table-instructions + 0xFC 12..17) ──
+
+/// `table.get x` ⇒ `TableGet("t<x>", i)` typed to the table's element reftype (here
+/// `funcref` → `TFuncRef`); `table.set x` ⇒ the zero-result effect `TableSet("t<x>", i, v)`
+/// (index then value, spec stack `[i32 t] → []`).
+pub fn table_get_set_test() {
+  let irm = build(table_ops_wasm)
+  let tget = func(irm, "f1")
+  tget.result |> should.equal([ir.TFuncRef])
+  list.any(all_exprs(tget.body), fn(e) { e == ir.TableGet("t0", ir.Var("p0")) })
+  |> should.equal(True)
+  let tset = func(irm, "f2")
+  list.any(all_exprs(tset.body), fn(e) {
+    e == ir.TableSet("t0", ir.Var("p0"), ir.Var("p1"))
+  })
+  |> should.equal(True)
+}
+
+/// `table.size x` ⇒ `TableSize("t<x>")` (i32); `table.grow x` ⇒ `TableGrow("t<x>", delta,
+/// init)` where `delta` is the i32 count (top of stack) and `init` the reference filled into
+/// new slots (deeper) — the spec stack is `[t i32] → [i32]`; `table.fill x` ⇒ `TableFill(
+/// "t<x>", offset, value, count)` (spec `[i32 t i32] → []`).
+pub fn table_size_grow_fill_test() {
+  let irm = build(table_ops_wasm)
+  list.any(all_exprs(func(irm, "f3").body), fn(e) { e == ir.TableSize("t0") })
+  |> should.equal(True)
+  // tgrow(param0: funcref, param1: i32): delta = p1 (i32), init = p0 (funcref).
+  list.any(all_exprs(func(irm, "f4").body), fn(e) {
+    e == ir.TableGrow("t0", ir.Var("p1"), ir.Var("p0"))
+  })
+  |> should.equal(True)
+  list.any(all_exprs(func(irm, "f5").body), fn(e) {
+    e == ir.TableFill("t0", ir.Var("p0"), ir.Var("p1"), ir.Var("p2"))
+  })
+  |> should.equal(True)
+}
+
+/// `table.init x y` ⇒ `TableInit("t<x>", <seg y>, dst, src, count)` — the IR takes the target
+/// table FIRST then the element-segment index (R3, anti-swap): the AST wire order is
+/// `TableInit(elem, table)`, so the passive elem `$pe` (elemidx 1) becomes `seg = 1` and the
+/// target `$t` becomes `"t0"`. `table.copy x y` ⇒ `TableCopy("t<x>", "t<y>", …)`; `elem.drop
+/// y` ⇒ the zero-result effect `ElemDrop(y)`.
+pub fn table_init_copy_elemdrop_test() {
+  let irm = build(table_ops_wasm)
+  list.any(all_exprs(func(irm, "f6").body), fn(e) {
+    e == ir.TableInit("t0", 1, ir.Var("p0"), ir.Var("p1"), ir.Var("p2"))
+  })
+  |> should.equal(True)
+  list.any(all_exprs(func(irm, "f7").body), fn(e) {
+    e == ir.TableCopy("t0", "t0", ir.Var("p0"), ir.Var("p1"), ir.Var("p2"))
+  })
+  |> should.equal(True)
+  list.any(all_exprs(func(irm, "f8").body), fn(e) { e == ir.ElemDrop(1) })
+  |> should.equal(True)
+}
+
+// ── bulk memory (spec exec/instructions §memory + 0xFC 8..11) ──
+
+/// `memory.init x` ⇒ `MemInit(mem, <seg x>, dst, src, count)` (mem index FIRST then the
+/// data-segment index, R3; here mem 0, passive data seg 0); `data.drop x` ⇒ `DataDrop(x)`;
+/// `memory.copy` ⇒ `MemCopy(dst_mem, src_mem, dst, src, count)`; `memory.fill` ⇒ `MemFill(
+/// mem, dest, value, count)`. All zero-result effects; the passive data segment lowers to
+/// `DataPassive`.
+pub fn bulk_memory_test() {
+  let irm = build(bulk_wasm)
+  list.any(all_exprs(func(irm, "f0").body), fn(e) {
+    e == ir.MemInit(0, 0, ir.Var("p0"), ir.Var("p1"), ir.Var("p2"))
+  })
+  |> should.equal(True)
+  list.any(all_exprs(func(irm, "f1").body), fn(e) { e == ir.DataDrop(0) })
+  |> should.equal(True)
+  list.any(all_exprs(func(irm, "f2").body), fn(e) {
+    e == ir.MemCopy(0, 0, ir.Var("p0"), ir.Var("p1"), ir.Var("p2"))
+  })
+  |> should.equal(True)
+  list.any(all_exprs(func(irm, "f3").body), fn(e) {
+    e == ir.MemFill(0, ir.Var("p0"), ir.Var("p1"), ir.Var("p2"))
+  })
+  |> should.equal(True)
+  irm.data_segments
+  |> should.equal([
+    ir.DataSegment(ir.DataPassive, bit_array.from_string("abcd")),
+  ])
+}
+
+// ── multi-memory + memory64 (H3/R12) ──
+
+/// Multi-memory (H3): a module with two memories lowers each memory-touching node with the
+/// SPEC memory index. A store/copy/fill/load against memory `$b` (index 1) carries `mem: 1`;
+/// the copy's source memory `$a` is index 0 (`MemCopy(1, 0, …)`). Two `MemoryDecl`s are
+/// declared. (Cite the multi-memory proposal: every memory instruction carries a memidx.)
+pub fn multimemory_test() {
+  let irm = build(multimem_wasm)
+  list.length(irm.memories) |> should.equal(2)
+  let exprs = all_exprs(func(irm, "f0").body)
+  // store into memory 1
+  list.any(exprs, fn(e) {
+    case e {
+      ir.MemStore(1, _, _, _, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+  // copy dst=mem1, src=mem0
+  list.any(exprs, fn(e) {
+    case e {
+      ir.MemCopy(1, 0, _, _, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+  // fill + load against memory 1
+  list.any(exprs, fn(e) {
+    case e {
+      ir.MemFill(1, _, _, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+  list.any(exprs, fn(e) {
+    case e {
+      ir.MemLoad(1, _, _, _, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+}
+
+/// memory64 (R12): a module declaring a 64-bit memory decodes and validates (so a truly
+/// invalid memory64 module still fails `assert_invalid` upstream), but lower REJECTS it with
+/// `Error(Memory64Unsupported)` — the `Idx64` runtime is deferred to Phase 6. Never a panic.
+pub fn memory64_rejected_test() {
+  try_build(mem64_wasm) |> should.equal(Error(lower.Memory64Unsupported))
+}
+
+// ── typed select (spec exec/instructions §select) ──
+
+/// Typed `select t` (0x1C) lowers to the SAME `If` value-merge as untyped `select` (no new
+/// IR node), taking its result type from the immediate. `select (result funcref) v1 v2 c`
+/// over two funcrefs ⇒ `If(c, [TFuncRef], Values([v1]), Values([v2]))` — then-arm `v1` (the
+/// result when `c ≠ 0`, spec), else-arm `v2`. A numeric `select (result i32)` ⇒ `[TI32]`.
+pub fn select_t_test() {
+  let irm = build(select_t_wasm)
+  list.any(all_exprs(func(irm, "f0").body), fn(e) {
+    e
+    == ir.If(
+      ir.Var("p2"),
+      [ir.TFuncRef],
+      ir.Values([ir.Var("p0")]),
+      ir.Values([ir.Var("p1")]),
+    )
+  })
+  |> should.equal(True)
+  list.any(all_exprs(func(irm, "f1").body), fn(e) {
+    case e {
+      ir.If(_, [ir.TI32], _, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+}
+
+// ── grown module shape: segment modes + ref-init ──
+
+/// Element and data segments preserve every mode + reference-typed init (spec
+/// syntax/modules): a declarative + a passive-with-expr-init + an active-into-funcref +
+/// an active-into-externref element segment, and a passive + an active data segment. A
+/// passive elem's items are ref-producing `Expr`s (`RefFunc` / `Values([ConstNull(_)])` for
+/// `ref.null`); an active externref segment carries a null-reference item.
+pub fn segments_modes_test() {
+  let irm = build(segments_wasm)
+  irm.elements
+  |> should.equal([
+    ir.ElementSegment(ir.ElemDeclarative, ir.FuncRef, [ir.RefFunc("f0")]),
+    ir.ElementSegment(ir.ElemPassive, ir.FuncRef, [
+      ir.RefFunc("f0"),
+      ir.Values([ir.ConstNull(ir.FuncRef)]),
+    ]),
+    ir.ElementSegment(
+      ir.ElemActive("t0", ir.Values([ir.ConstI32(0)])),
+      ir.FuncRef,
+      [ir.RefFunc("f0")],
+    ),
+    ir.ElementSegment(
+      ir.ElemActive("t1", ir.Values([ir.ConstI32(0)])),
+      ir.ExternRef,
+      [ir.Values([ir.ConstNull(ir.ExternRef)])],
+    ),
+  ])
+  irm.data_segments
+  |> should.equal([
+    ir.DataSegment(ir.DataPassive, bit_array.from_string("xy")),
+    ir.DataSegment(
+      ir.DataActive(0, ir.Values([ir.ConstI32(0)])),
+      bit_array.from_string("hi"),
+    ),
+  ])
+}
+
+// ── non-function imports & exports + index spaces (H4/§G.5) ──
+
+/// Non-function imports become the provided-state variants `ImportGlobal`/`ImportTable`/
+/// `ImportMemory`; exports of state become `ExportGlobal`/`ExportTable`/`ExportMemory` (spec
+/// syntax/modules imports/exports). The index spaces are `imports ++ defined`: the imported
+/// global/table occupy indices 0, so the DEFINED global/table are named `g1`/`t1`; the
+/// imported global's `global.get` resolves to `g0` (the same absolute-index naming).
+pub fn nonfunction_imports_exports_test() {
+  let irm = build(imports_wasm)
+  irm.imports
+  |> should.equal([
+    ir.ImportGlobal("spectest", "global_i32", ir.TI32, False),
+    ir.ImportTable("spectest", "table", ir.FuncRef, 10, option.Some(20)),
+    ir.ImportMemory("spectest", "memory", 1, option.Some(2), ir.Idx32),
+  ])
+  // defined global/table named at their ABSOLUTE index (after the imports).
+  irm.globals
+  |> should.equal([
+    ir.GlobalDecl("g1", ir.TI32, True, ir.Values([ir.ConstI32(3)])),
+  ])
+  irm.tables
+  |> should.equal([ir.TableDecl("t1", ir.FuncRef, 2, option.None)])
+  // `global.get` of the imported global resolves to g0 (imported globalidx 0).
+  list.any(all_exprs(func(irm, "f0").body), fn(e) { e == ir.GlobalGet("g0") })
+  |> should.equal(True)
+  // state exports of all three kinds, naming the exported item at its absolute index.
+  list.contains(irm.exports, ir.ExportGlobal("g", "g1")) |> should.equal(True)
+  list.contains(irm.exports, ir.ExportTable("t", "t1")) |> should.equal(True)
+  list.contains(irm.exports, ir.ExportMemory("m", 1)) |> should.equal(True)
+}
+
+/// Reference-typed global inits (spec: a global's const-expr may be `ref.func`/`ref.null`):
+/// a `funcref` global initialised to `ref.func $f` ⇒ `GlobalDecl("g0", TFuncRef, _,
+/// RefFunc("f0"))`; a `mut externref` global initialised to `ref.null extern` ⇒
+/// `GlobalDecl("g1", TExternRef, True, Values([ConstNull(ExternRef)]))` (R1c). `global.get`
+/// of the funcref global lowers to `GlobalGet("g0")`.
+pub fn ref_global_init_test() {
+  let irm = build(globals_ref_wasm)
+  irm.globals
+  |> should.equal([
+    ir.GlobalDecl("g0", ir.TFuncRef, False, ir.RefFunc("f0")),
+    ir.GlobalDecl(
+      "g1",
+      ir.TExternRef,
+      True,
+      ir.Values([ir.ConstNull(ir.ExternRef)]),
+    ),
+  ])
+  list.any(all_exprs(func(irm, "f1").body), fn(e) { e == ir.GlobalGet("g0") })
+  |> should.equal(True)
+}
+
+/// Reference-typed DECLARED locals default to the null reference (spec exec/instructions
+/// local initialization: a reference local defaults to `ref.null` of its type). A function
+/// with a declared `funcref` local zero-inits it to `Values([ConstNull(FuncRef)])` at entry.
+pub fn ref_local_zero_init_test() {
+  let irm = build(ref_local_wasm)
+  let f = func(irm, "f0")
+  // The zero-init `Let` for the declared funcref local binds `ConstNull(FuncRef)`.
+  list.any(all_exprs(f.body), fn(e) {
+    case e {
+      ir.Let([_], ir.Values([ir.ConstNull(ir.FuncRef)]), _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+}
+
 // ───────────────────────────── fixtures ─────────────────────────────
 
 const add_wasm: BitArray = <<
@@ -773,4 +1106,135 @@ const data_start_wasm: BitArray = <<
 const fadd_wasm: BitArray = <<
   0, 97, 115, 109, 1, 0, 0, 0, 1, 7, 1, 96, 2, 124, 124, 1, 124, 3, 2, 1, 0, 7,
   8, 1, 4, 102, 97, 100, 100, 0, 0, 10, 9, 1, 7, 0, 32, 0, 32, 1, 160, 11,
+>>
+
+// ── Phase-5 (P5-05) fixtures (produced with wat2wasm; the WAT is in the doc comment) ──
+
+// `(table 2 funcref) (table $e 1 externref) (elem declare func $f)
+//  (func $f (result i32) (i32.const 42))
+//  (func (export "rn") (result funcref) (ref.null func))
+//  (func (export "ren") (result externref) (ref.null extern))
+//  (func (export "rf") (result funcref) (ref.func $f))
+//  (func (export "isn") (param externref) (result i32) (ref.is_null (local.get 0)))`
+const ref_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 18, 4, 96, 0, 1, 127, 96, 0, 1, 112, 96, 0, 1,
+  111, 96, 1, 111, 1, 127, 3, 6, 5, 0, 1, 2, 1, 3, 4, 7, 2, 112, 0, 2, 111, 0, 1,
+  7, 23, 4, 2, 114, 110, 0, 1, 3, 114, 101, 110, 0, 2, 2, 114, 102, 0, 3, 3, 105,
+  115, 110, 0, 4, 9, 5, 1, 3, 0, 1, 0, 10, 27, 5, 4, 0, 65, 42, 11, 4, 0, 208,
+  112, 11, 4, 0, 208, 111, 11, 4, 0, 210, 0, 11, 5, 0, 32, 0, 209, 11,
+>>
+
+// `(table $t 3 funcref) (table $x 2 externref) (elem declare func $g)
+//  (elem $pe funcref (ref.func $g)) (func $g (result i32) (i32.const 1))
+//  (func (export "tget") (param i32) (result funcref) (table.get $t (local.get 0)))
+//  (func (export "tset") (param i32 funcref) (table.set $t (local.get 0) (local.get 1)))
+//  (func (export "tsize") (result i32) (table.size $t))
+//  (func (export "tgrow") (param funcref i32) (result i32) (table.grow $t ...))
+//  (func (export "tfill") (param i32 funcref i32) (table.fill $t ...))
+//  (func (export "tinit") (param i32 i32 i32) (table.init $t $pe ...))
+//  (func (export "tcopy") (param i32 i32 i32) (table.copy $t $t ...))
+//  (func (export "edrop") (elem.drop $pe))`
+const table_ops_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 36, 7, 96, 0, 1, 127, 96, 1, 127, 1, 112, 96,
+  2, 127, 112, 0, 96, 2, 112, 127, 1, 127, 96, 3, 127, 112, 127, 0, 96, 3, 127,
+  127, 127, 0, 96, 0, 0, 3, 10, 9, 0, 1, 2, 0, 3, 4, 5, 5, 6, 4, 7, 2, 112, 0, 3,
+  111, 0, 2, 7, 63, 8, 4, 116, 103, 101, 116, 0, 1, 4, 116, 115, 101, 116, 0, 2,
+  5, 116, 115, 105, 122, 101, 0, 3, 5, 116, 103, 114, 111, 119, 0, 4, 5, 116,
+  102, 105, 108, 108, 0, 5, 5, 116, 105, 110, 105, 116, 0, 6, 5, 116, 99, 111,
+  112, 121, 0, 7, 5, 101, 100, 114, 111, 112, 0, 8, 9, 9, 2, 3, 0, 1, 0, 1, 0, 1,
+  0, 10, 82, 9, 4, 0, 65, 1, 11, 6, 0, 32, 0, 37, 0, 11, 8, 0, 32, 0, 32, 1, 38,
+  0, 11, 5, 0, 252, 16, 0, 11, 9, 0, 32, 0, 32, 1, 252, 15, 0, 11, 11, 0, 32, 0,
+  32, 1, 32, 2, 252, 17, 0, 11, 12, 0, 32, 0, 32, 1, 32, 2, 252, 12, 1, 0, 11,
+  12, 0, 32, 0, 32, 1, 32, 2, 252, 14, 0, 0, 11, 5, 0, 252, 13, 1, 11,
+>>
+
+// `(memory 1) (data $pd "abcd")
+//  (func (export "minit") (param i32 i32 i32) (memory.init $pd ...))
+//  (func (export "ddrop") (data.drop $pd))
+//  (func (export "mcopy") (param i32 i32 i32) (memory.copy ...))
+//  (func (export "mfill") (param i32 i32 i32) (memory.fill ...))`
+const bulk_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 10, 2, 96, 3, 127, 127, 127, 0, 96, 0, 0, 3, 5,
+  4, 0, 1, 0, 0, 5, 3, 1, 0, 1, 7, 33, 4, 5, 109, 105, 110, 105, 116, 0, 0, 5,
+  100, 100, 114, 111, 112, 0, 1, 5, 109, 99, 111, 112, 121, 0, 2, 5, 109, 102,
+  105, 108, 108, 0, 3, 12, 1, 1, 10, 45, 4, 12, 0, 32, 0, 32, 1, 32, 2, 252, 8,
+  0, 0, 11, 5, 0, 252, 9, 0, 11, 12, 0, 32, 0, 32, 1, 32, 2, 252, 10, 0, 0, 11,
+  11, 0, 32, 0, 32, 1, 32, 2, 252, 11, 0, 11, 11, 7, 1, 1, 4, 97, 98, 99, 100,
+>>
+
+// `(memory $a 1) (memory $b 1)
+//  (func (export "mm") (param i32) (result i32)
+//    (i32.store $b (i32.const 0) (i32.const 7))
+//    (memory.copy $b $a (i32.const 0) (i32.const 0) (i32.const 4))
+//    (memory.fill $b (i32.const 0) (i32.const 0) (i32.const 1))
+//    (i32.load $b (local.get 0)))` — wat2wasm --enable-multi-memory
+const multimem_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 6, 1, 96, 1, 127, 1, 127, 3, 2, 1, 0, 5, 5, 2,
+  0, 1, 0, 1, 7, 6, 1, 2, 109, 109, 0, 0, 10, 37, 1, 35, 0, 65, 0, 65, 7, 54, 66,
+  1, 0, 65, 0, 65, 0, 65, 4, 252, 10, 1, 0, 65, 0, 65, 0, 65, 1, 252, 11, 1, 32,
+  0, 40, 66, 1, 0, 11,
+>>
+
+// `(memory i64 1) (func (export "m64") (param i64) (result i64) (i64.load (local.get 0)))`
+// — wat2wasm --enable-memory64. Lower must REJECT this (Memory64Unsupported, R12).
+const mem64_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 6, 1, 96, 1, 126, 1, 126, 3, 2, 1, 0, 5, 3, 1,
+  4, 1, 7, 7, 1, 3, 109, 54, 52, 0, 0, 10, 9, 1, 7, 0, 32, 0, 41, 3, 0, 11,
+>>
+
+// `(func (export "sf") (param funcref funcref i32) (result funcref)
+//    (select (result funcref) (local.get 0) (local.get 1) (local.get 2)))
+//  (func (export "si") (param i32 i32 i32) (result i32)
+//    (select (result i32) (local.get 0) (local.get 1) (local.get 2)))`
+const select_t_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 15, 2, 96, 3, 112, 112, 127, 1, 112, 96, 3,
+  127, 127, 127, 1, 127, 3, 3, 2, 0, 1, 7, 11, 2, 2, 115, 102, 0, 0, 2, 115, 105,
+  0, 1, 10, 25, 2, 11, 0, 32, 0, 32, 1, 32, 2, 28, 1, 112, 11, 11, 0, 32, 0, 32,
+  1, 32, 2, 28, 1, 127, 11,
+>>
+
+// `(table $t 4 funcref) (table $x 4 externref) (memory 1) (elem declare func $a)
+//  (elem $pe funcref (ref.func $a) (ref.null func))
+//  (elem (table $t) (offset (i32.const 0)) func $a)
+//  (elem $xe (table $x) (offset (i32.const 0)) externref (ref.null extern))
+//  (data $pd "xy") (data (i32.const 0) "hi") (func $a (result i32) (i32.const 5))`
+// — wat2wasm --enable-multi-memory
+const segments_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 127, 3, 2, 1, 0, 4, 7, 2, 112,
+  0, 4, 111, 0, 4, 5, 3, 1, 0, 1, 9, 30, 4, 3, 0, 1, 0, 5, 112, 2, 210, 0, 11,
+  208, 112, 11, 0, 65, 0, 11, 1, 0, 6, 1, 65, 0, 11, 111, 1, 208, 111, 11, 10, 6,
+  1, 4, 0, 65, 5, 11, 11, 12, 2, 1, 2, 120, 121, 0, 65, 0, 11, 2, 104, 105,
+>>
+
+// `(import "spectest" "global_i32" (global $ig i32))
+//  (import "spectest" "table" (table $it 10 20 funcref))
+//  (import "spectest" "memory" (memory $im 1 2))
+//  (global $dg (mut i32) (i32.const 3)) (table $dt 2 funcref) (memory $dm 1)
+//  (func (export "getg") (result i32) (global.get $ig))
+//  (export "g" (global $dg)) (export "t" (table $dt)) (export "m" (memory $dm))`
+// — wat2wasm --enable-multi-memory
+const imports_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 127, 2, 64, 3, 8, 115, 112,
+  101, 99, 116, 101, 115, 116, 10, 103, 108, 111, 98, 97, 108, 95, 105, 51, 50,
+  3, 127, 0, 8, 115, 112, 101, 99, 116, 101, 115, 116, 5, 116, 97, 98, 108, 101,
+  1, 112, 1, 10, 20, 8, 115, 112, 101, 99, 116, 101, 115, 116, 6, 109, 101, 109,
+  111, 114, 121, 2, 1, 1, 2, 3, 2, 1, 0, 4, 4, 1, 112, 0, 2, 5, 3, 1, 0, 1, 6, 6,
+  1, 127, 1, 65, 3, 11, 7, 20, 4, 4, 103, 101, 116, 103, 0, 0, 1, 103, 3, 1, 1,
+  116, 1, 1, 1, 109, 2, 1, 10, 6, 1, 4, 0, 35, 0, 11,
+>>
+
+// `(elem declare func $f) (func $f (result i32) (i32.const 9))
+//  (global $gf funcref (ref.func $f)) (global $gn (mut externref) (ref.null extern))
+//  (func (export "gg") (result funcref) (global.get $gf))`
+const globals_ref_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 9, 2, 96, 0, 1, 127, 96, 0, 1, 112, 3, 3, 2, 0,
+  1, 6, 11, 2, 112, 0, 210, 0, 11, 111, 1, 208, 111, 11, 7, 6, 1, 2, 103, 103, 0,
+  1, 9, 5, 1, 3, 0, 1, 0, 10, 11, 2, 4, 0, 65, 9, 11, 4, 0, 35, 0, 11,
+>>
+
+// `(func (export "loc") (result funcref) (local funcref) (local.get 0))` — a declared
+// funcref local defaults to the null reference (spec local initialization).
+const ref_local_wasm: BitArray = <<
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 112, 3, 2, 1, 0, 7, 7, 1, 3,
+  108, 111, 99, 0, 0, 10, 8, 1, 6, 1, 1, 112, 32, 0, 11,
 >>

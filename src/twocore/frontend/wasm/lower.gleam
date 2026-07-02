@@ -38,9 +38,31 @@
 //// dropped, and they never enter the Phase-1 mutable-local → `LoopParam` machinery (they
 //// mutate the per-instance cell, not a WASM local).
 ////
-//// Still out of scope (returns a typed `LowerError`, never a panic): `select_t` / reference
-//// types (Phase 3), and any const-expr that is not a single `t.const`
-//// (`Error(NonConstInitExpr)` — imported-global init exprs are deferred with imports).
+//// Phase 5 (unit P5-05) completes the standardized instruction surface (minus SIMD).
+//// It adds the reference instructions (`ref.null`/`ref.func`/`ref.is_null` → the
+//// `ConstNull` value / `RefFunc`/`RefIsNull` `Expr`s — R1c), the table instructions
+//// (`table.get/set/size/grow/fill` + the `0xFC` `table.init/copy` + `elem.drop`), the
+//// bulk-memory `0xFC` ops (`memory.init/copy/fill` + `data.drop`), typed `select`
+//// (`select_t`, still → the existing `If` merge — no new node), the per-op memory index
+//// (multi-memory), and the grown module shape: `Module.memories` (a list),
+//// reference-typed tables, active/passive/declarative element segments with
+//// ref-producing init items, active/passive data segments, and the non-function
+//// `ImportGlobal`/`ImportTable`/`ImportMemory` + `ExportGlobal`/`ExportTable`/
+//// `ExportMemory` variants (the index spaces are threaded `imports ++ defined`). Const
+//// inits now accept `ref.func`/`ref.null`/`global.get` alongside the numeric literals.
+//// A single 32-bit-memory, funcref-only-active, import-free module lowers to
+//// byte-identical IR3 (H7): every new immediate defaults away (`mem: 0`, `FuncRef`,
+//// `ElemActive`/`DataActive`).
+////
+//// **memory64 (R12).** A 64-bit memory (`Idx64`, from the limits index-type flag)
+//// decodes and validates, but lower **rejects** it with `Error(Memory64Unsupported)` —
+//// the `Idx64` runtime is deferred to Phase 6. The IR `IdxType` axis stays frozen.
+////
+//// Still out of scope (returns a typed `LowerError`, never a panic): SIMD (`v128` +
+//// lane ops) and the GC-proposal reference types (`Error(Unsupported(_))`); a 64-bit
+//// memory (`Error(Memory64Unsupported)`); and any const-expr that is not a single
+//// `t.const` / `ref.func` / `ref.null` / `global.get` (`Error(NonConstInitExpr)` —
+//// extended-const arithmetic chains stay rejected).
 
 import gleam/dict.{type Dict}
 import gleam/int
@@ -65,11 +87,16 @@ import twocore/ir
 /// - `Malformed(detail)`: a structural inconsistency (e.g. an `else` with no `if`).
 /// - `UnknownLocalIndex(i)`/`UnknownTypeIndex(i)`/`UnknownFuncIndex(i)`: an index out
 ///   of range (validation should have caught it; kept so lowering is total).
-/// - `NonConstInitExpr(detail)`: a global init / element-offset / data-offset constant
-///   expression that is not a single `t.const` (Phase-2 MVP accepts only constant
-///   literals; `global.get` of an imported global and extended-const forms are rejected
-///   here — validation already blocks them, this is fail-closed insurance). `detail` is a
-///   stable tag.
+/// - `NonConstInitExpr(detail)`: a global init / element-item / element-or-data offset
+///   constant expression outside the admissible const-expr grammar. Phase 5 accepts a
+///   single `t.const` / `ref.func` / `ref.null` / `global.get` (of an immutable imported
+///   global); an extended-const arithmetic chain (a separate proposal) is rejected here —
+///   validation already blocks it, this is fail-closed insurance. `detail` is a stable tag.
+/// - `Memory64Unsupported`: the module declares (or imports) a 64-bit-indexed memory
+///   (`Idx64`, memory64). Decode/validate accept it so a genuinely-invalid memory64
+///   module still fails `assert_invalid`, but the `Idx64` **runtime is deferred to Phase
+///   6** (R12), so lower stops here rather than mis-lower i64 addressing. The conformance
+///   harness reports the module as a categorized skip (`memory64 runtime → Phase 6`).
 pub type LowerError {
   Unsupported(detail: String)
   StackUnderflow
@@ -78,6 +105,7 @@ pub type LowerError {
   UnknownTypeIndex(index: Int)
   UnknownFuncIndex(index: Int)
   NonConstInitExpr(detail: String)
+  Memory64Unsupported
 }
 
 // ─────────────────────────────── internal state ───────────────────────────────
@@ -92,6 +120,9 @@ pub type LowerError {
 /// - `global_types`: the IR value type of each module global, indexed by globalidx
 ///   (mirrors `local_types`; from `TypedModule.global_types`). Drives the result type of
 ///   `global.get` for SSA value-type tracking and the global declarations.
+/// - `table_types`: the element **reference type** of each table by absolute tableidx
+///   (imports ++ defined; from `TypedModule.table_types`). Drives the result type of
+///   `table.get` (a `table.get`'s result is the table's element reftype) — Phase 5.
 type LCtx {
   LCtx(
     types: List(ast.FuncType),
@@ -99,6 +130,7 @@ type LCtx {
     imported: Int,
     local_types: List(ir.ValType),
     global_types: List(ir.ValType),
+    table_types: List(ir.RefType),
   )
 }
 
@@ -184,18 +216,28 @@ type GoResult {
 /// (`NonConstInitExpr`).
 pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
   let module = typed.module
+  // memory64's runtime is deferred to Phase 6 (R12): reject a 64-bit memory here rather
+  // than mis-lower i64 addressing. Decode/validate already accepted it, so a genuinely
+  // invalid memory64 module still fails `assert_invalid` upstream.
+  use _ <- result.try(reject_memory64(module))
   use functions <- result.try(
     list.index_map(module.funcs, fn(f, i) { lower_func(f, i, typed) })
     |> result.all,
   )
+  // Exports of all four kinds. Functions → `f<funcidx>`; state exports carry the IR name
+  // of the exported item (`t<tableidx>` / `g<globalidx>` / the raw memidx) — the same
+  // absolute-index naming instruction lowering uses (H4/§G.5).
   let exports =
-    list.filter_map(module.exports, fn(e) {
+    list.map(module.exports, fn(e) {
       case e.kind {
-        ast.ExportFunc -> Ok(ir.ExportFn(e.name, "f" <> int.to_string(e.index)))
-        _ -> Error(Nil)
+        ast.ExportFunc -> ir.ExportFn(e.name, "f" <> int.to_string(e.index))
+        ast.ExportTable -> ir.ExportTable(e.name, tname(e.index))
+        ast.ExportGlobal -> ir.ExportGlobal(e.name, gname(e.index))
+        ast.ExportMemory -> ir.ExportMemory(e.name, e.index)
       }
     })
-  use globals <- result.try(lower_globals(module))
+  use imports <- result.try(lower_imports(module))
+  use globals <- result.try(lower_globals(module, typed.imported_global_count))
   use elements <- result.try(lower_elements(module))
   use data_segments <- result.try(lower_data(module))
   Ok(ir.Module(
@@ -203,14 +245,32 @@ pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
     uses_numerics: True,
     memories: lower_memory(module),
     globals: globals,
-    imports: [],
+    imports: imports,
     functions: functions,
     exports: exports,
     data_segments: data_segments,
-    tables: lower_tables(module),
+    tables: lower_tables(module, typed.imported_table_count),
     elements: elements,
     start: lower_start(module),
   ))
+}
+
+/// Reject a module that declares or imports a 64-bit-indexed memory (`Idx64`, memory64)
+/// with `Error(Memory64Unsupported)` (R12 — the `Idx64` runtime is deferred to Phase 6).
+/// A 32-bit-only module returns `Ok(Nil)` (byte-identical to Phase 4).
+fn reject_memory64(module: ast.Module) -> Result(Nil, LowerError) {
+  let defined = list.map(module.memories, fn(m) { m.idx_type })
+  let imported =
+    list.filter_map(module.imports, fn(imp) {
+      case imp.desc {
+        ast.ImportMemory(mt) -> Ok(mt.idx_type)
+        _ -> Error(Nil)
+      }
+    })
+  case list.any(list.append(imported, defined), fn(it) { it == ast.Idx64 }) {
+    True -> Error(Memory64Unsupported)
+    False -> Ok(Nil)
+  }
 }
 
 /// A sanitised base for the IR module name, derived from the first function export
@@ -311,6 +371,7 @@ fn lower_func(
       imported: typed.imported_func_count,
       local_types: local_types,
       global_types: list.map(typed.global_types, to_ir_vt),
+      table_types: list.map(typed.table_types, to_ir_reftype),
     )
   let st0 =
     LState(
@@ -445,63 +506,176 @@ fn go(
         // `result` is set from the opcode suffix (it, not `MemAccess`, disambiguates e.g.
         // `i32.load8_s` from `i64.load8_s`). `m.align` is dropped (validate checked it).
         ast.I32Load(m) ->
-          emit_load(ir.MemAccess(4, False), ir.TI32, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(4, False),
+            ir.TI32,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.I64Load(m) ->
-          emit_load(ir.MemAccess(8, False), ir.TI64, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(8, False),
+            ir.TI64,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.F32Load(m) ->
-          emit_load(ir.MemAccess(4, False), ir.TF32, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(4, False),
+            ir.TF32,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.F64Load(m) ->
-          emit_load(ir.MemAccess(8, False), ir.TF64, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(8, False),
+            ir.TF64,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.I32Load8S(m) ->
-          emit_load(ir.MemAccess(1, True), ir.TI32, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(1, True),
+            ir.TI32,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.I32Load8U(m) ->
-          emit_load(ir.MemAccess(1, False), ir.TI32, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(1, False),
+            ir.TI32,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.I32Load16S(m) ->
-          emit_load(ir.MemAccess(2, True), ir.TI32, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(2, True),
+            ir.TI32,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.I32Load16U(m) ->
-          emit_load(ir.MemAccess(2, False), ir.TI32, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(2, False),
+            ir.TI32,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.I64Load8S(m) ->
-          emit_load(ir.MemAccess(1, True), ir.TI64, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(1, True),
+            ir.TI64,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.I64Load8U(m) ->
-          emit_load(ir.MemAccess(1, False), ir.TI64, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(1, False),
+            ir.TI64,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.I64Load16S(m) ->
-          emit_load(ir.MemAccess(2, True), ir.TI64, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(2, True),
+            ir.TI64,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.I64Load16U(m) ->
-          emit_load(ir.MemAccess(2, False), ir.TI64, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(2, False),
+            ir.TI64,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.I64Load32S(m) ->
-          emit_load(ir.MemAccess(4, True), ir.TI64, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(4, True),
+            ir.TI64,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
         ast.I64Load32U(m) ->
-          emit_load(ir.MemAccess(4, False), ir.TI64, m.offset, tail, ctx, st)
+          emit_load(
+            m.mem,
+            ir.MemAccess(4, False),
+            ir.TI64,
+            m.offset,
+            tail,
+            ctx,
+            st,
+          )
 
         // linear-memory stores (pop [addr, value]; zero-result effect) ---------------
         // A store writes the low `bytes` bytes; `signed` is irrelevant → always `False`.
         ast.I32Store(m) ->
-          emit_store(ir.MemAccess(4, False), m.offset, tail, ctx, st)
+          emit_store(m.mem, ir.MemAccess(4, False), m.offset, tail, ctx, st)
         ast.I64Store(m) ->
-          emit_store(ir.MemAccess(8, False), m.offset, tail, ctx, st)
+          emit_store(m.mem, ir.MemAccess(8, False), m.offset, tail, ctx, st)
         ast.F32Store(m) ->
-          emit_store(ir.MemAccess(4, False), m.offset, tail, ctx, st)
+          emit_store(m.mem, ir.MemAccess(4, False), m.offset, tail, ctx, st)
         ast.F64Store(m) ->
-          emit_store(ir.MemAccess(8, False), m.offset, tail, ctx, st)
+          emit_store(m.mem, ir.MemAccess(8, False), m.offset, tail, ctx, st)
         ast.I32Store8(m) ->
-          emit_store(ir.MemAccess(1, False), m.offset, tail, ctx, st)
+          emit_store(m.mem, ir.MemAccess(1, False), m.offset, tail, ctx, st)
         ast.I32Store16(m) ->
-          emit_store(ir.MemAccess(2, False), m.offset, tail, ctx, st)
+          emit_store(m.mem, ir.MemAccess(2, False), m.offset, tail, ctx, st)
         ast.I64Store8(m) ->
-          emit_store(ir.MemAccess(1, False), m.offset, tail, ctx, st)
+          emit_store(m.mem, ir.MemAccess(1, False), m.offset, tail, ctx, st)
         ast.I64Store16(m) ->
-          emit_store(ir.MemAccess(2, False), m.offset, tail, ctx, st)
+          emit_store(m.mem, ir.MemAccess(2, False), m.offset, tail, ctx, st)
         ast.I64Store32(m) ->
-          emit_store(ir.MemAccess(4, False), m.offset, tail, ctx, st)
+          emit_store(m.mem, ir.MemAccess(4, False), m.offset, tail, ctx, st)
 
         // memory size/grow ----------------------------------------------------------
-        // memory index 0 (the default memory); P5-05 threads a real index for multi-memory.
-        ast.MemorySize(_) -> emit_nullary(ir.MemSize(0), ir.TI32, tail, ctx, st)
-        ast.MemoryGrow(_) ->
+        // The `mem` immediate is the memory index (default `0`; a single-memory module
+        // keeps `MemSize(0)`/`MemGrow(0, _)`, byte-identical to Phase-4).
+        ast.MemorySize(m) -> emit_nullary(ir.MemSize(m), ir.TI32, tail, ctx, st)
+        ast.MemoryGrow(m) ->
           emit_value_op_t(
             1,
             ir.TI32,
-            fn(a) { ir.MemGrow(0, one(a)) },
+            fn(a) { ir.MemGrow(m, one(a)) },
             tail,
             ctx,
             st,
@@ -523,6 +697,167 @@ fn go(
         ast.CallIndirect(ty, table) ->
           lower_call_indirect(ty, table, tail, ctx, st)
         ast.Select -> lower_select(tail, ctx, st)
+        ast.SelectT(types) -> lower_select_t(types, tail, ctx, st)
+
+        // reference instructions (0xD0..0xD2) — spec exec/instructions §reference ----
+        // `ref.null t` is a value literal — it reduces to a `ConstNull(t)` VALUE (R1c),
+        // pushed like a numeric const (no `Let`, no separate `Expr`). `ref.func`/
+        // `ref.is_null` produce value-producing `Expr`s bound to fresh names.
+        ast.RefNull(rt) ->
+          go(tail, ctx, push(st, ir.ConstNull(to_ir_reftype(rt))))
+        ast.RefFunc(f) ->
+          emit_nullary(
+            ir.RefFunc("f" <> int.to_string(f)),
+            ir.TFuncRef,
+            tail,
+            ctx,
+            st,
+          )
+        ast.RefIsNull ->
+          emit_value_op_t(
+            1,
+            ir.TI32,
+            fn(a) { ir.RefIsNull(one(a)) },
+            tail,
+            ctx,
+            st,
+          )
+
+        // table instructions (0x25/0x26 + 0xFC 12..17) — spec exec/instructions §table
+        ast.TableGet(x) ->
+          emit_value_op_t(
+            1,
+            ir.reftype_to_valtype(table_reftype(ctx, x)),
+            fn(a) { ir.TableGet(tname(x), one(a)) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.TableSet(x) ->
+          emit_effect(
+            2,
+            fn(a) {
+              case a {
+                [i, v] -> ir.TableSet(tname(x), i, v)
+                _ -> ir.TableSet(tname(x), ir.ConstI32(0), ir.ConstI32(0))
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        ast.TableSize(x) ->
+          emit_nullary(ir.TableSize(tname(x)), ir.TI32, tail, ctx, st)
+        ast.TableGrow(x) ->
+          // stack `[t i32] → [i32]`: operands push-order `[init, n]` (init deeper, delta on
+          // top). `TableGrow(table, delta, init)` returns the previous size (a value).
+          emit_value_op_t(
+            2,
+            ir.TI32,
+            fn(a) {
+              case a {
+                [init, n] -> ir.TableGrow(tname(x), n, init)
+                _ ->
+                  ir.TableGrow(
+                    tname(x),
+                    ir.ConstI32(0),
+                    ir.ConstNull(ir.FuncRef),
+                  )
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        ast.TableFill(x) ->
+          emit_effect(
+            3,
+            fn(a) {
+              case a {
+                [i, v, n] -> ir.TableFill(tname(x), i, v, n)
+                _ -> ir.TableFill(tname(x), z(), zref(), z())
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        // `table.init x y`: AST field order is wire order `TableInit(elem, table)` (R3);
+        // the IR is `TableInit(table, seg, dst, src, count)`, so map `table → tname(x)`,
+        // `elem → seg`.
+        ast.TableInit(elem, table) ->
+          emit_effect(
+            3,
+            fn(a) {
+              case a {
+                [d, s, n] -> ir.TableInit(tname(table), elem, d, s, n)
+                _ -> ir.TableInit(tname(table), elem, z(), z(), z())
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        ast.TableCopy(dst, src) ->
+          emit_effect(
+            3,
+            fn(a) {
+              case a {
+                [d, s, n] -> ir.TableCopy(tname(dst), tname(src), d, s, n)
+                _ -> ir.TableCopy(tname(dst), tname(src), z(), z(), z())
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        ast.ElemDrop(elem) ->
+          emit_effect(0, fn(_) { ir.ElemDrop(elem) }, tail, ctx, st)
+
+        // bulk-memory (0xFC 8..11) — spec exec/instructions §memory (finalized 2.0) ---
+        // Every op carries the memory index (default `0`). `memory.init x` field order is
+        // wire order `MemoryInit(data, mem)` (R3) → `MemInit(mem, seg=data, dst, src, n)`.
+        ast.MemoryFill(m) ->
+          emit_effect(
+            3,
+            fn(a) {
+              case a {
+                [d, v, n] -> ir.MemFill(m, d, v, n)
+                _ -> ir.MemFill(m, z(), z(), z())
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        ast.MemoryCopy(dst_mem, src_mem) ->
+          emit_effect(
+            3,
+            fn(a) {
+              case a {
+                [d, s, n] -> ir.MemCopy(dst_mem, src_mem, d, s, n)
+                _ -> ir.MemCopy(dst_mem, src_mem, z(), z(), z())
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        ast.MemoryInit(data, m) ->
+          emit_effect(
+            3,
+            fn(a) {
+              case a {
+                [d, s, n] -> ir.MemInit(m, data, d, s, n)
+                _ -> ir.MemInit(m, data, z(), z(), z())
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        ast.DataDrop(data) ->
+          emit_effect(0, fn(_) { ir.DataDrop(data) }, tail, ctx, st)
 
         // numeric / comparison / conversion / float leaves --------------------------
         _ -> lower_numeric(instr, tail, ctx, st)
@@ -622,10 +957,12 @@ fn emit_nullary(
   Ok(wrap_let([name], rhs, inner))
 }
 
-/// Lower a memory load: pop the i32 address, bind `MemLoad(op, addr, offset, result)` to a
-/// fresh name of type `result`, push it, and continue. `op` carries the access width/sign;
-/// `result` is the opcode-determined load result type.
+/// Lower a memory load: pop the i32 address, bind `MemLoad(mem, op, addr, offset, result)`
+/// to a fresh name of type `result`, push it, and continue. `mem` is the memory index
+/// (default `0` for a single-memory module — byte-identical); `op` carries the access
+/// width/sign; `result` is the opcode-determined load result type.
 fn emit_load(
+  mem: Int,
   op: ir.MemAccess,
   result: ir.ValType,
   offset: Int,
@@ -638,8 +975,8 @@ fn emit_load(
     result,
     fn(args) {
       case args {
-        [addr] -> ir.MemLoad(0, op, addr, offset, result)
-        _ -> ir.MemLoad(0, op, ir.ConstI32(0), offset, result)
+        [addr] -> ir.MemLoad(mem, op, addr, offset, result)
+        _ -> ir.MemLoad(mem, op, ir.ConstI32(0), offset, result)
       }
     },
     tail,
@@ -649,10 +986,12 @@ fn emit_load(
 }
 
 /// Lower a memory store: pop `[addr, value]` (value is on top of the WASM stack, so it is
-/// second in push order), sequence `MemStore(op, addr, value, offset)` as a zero-result
-/// effect, and continue. Pushes nothing. Evaluation order is addr, then value, then the
-/// store (E6) — preserved by the straight-line `Let([], …)` sequencing.
+/// second in push order), sequence `MemStore(mem, op, addr, value, offset)` as a zero-result
+/// effect, and continue. `mem` is the memory index (default `0` — byte-identical). Pushes
+/// nothing. Evaluation order is addr, then value, then the store (E6) — preserved by the
+/// straight-line `Let([], …)` sequencing.
 fn emit_store(
+  mem: Int,
   op: ir.MemAccess,
   offset: Int,
   tail: List(ast.Instr),
@@ -663,8 +1002,8 @@ fn emit_store(
     2,
     fn(args) {
       case args {
-        [addr, value] -> ir.MemStore(0, op, addr, value, offset)
-        _ -> ir.MemStore(0, op, ir.ConstI32(0), ir.ConstI32(0), offset)
+        [addr, value] -> ir.MemStore(mem, op, addr, value, offset)
+        _ -> ir.MemStore(mem, op, ir.ConstI32(0), ir.ConstI32(0), offset)
       }
     },
     tail,
@@ -703,6 +1042,19 @@ fn one(args: List(ir.Value)) -> ir.Value {
     [a] -> a
     _ -> ir.ConstI32(0)
   }
+}
+
+/// A defensive zero i32 operand for the unreachable `_ ->` arm of a bulk/table op's
+/// `build` (the arity was already checked by `emit_effect`; this only satisfies
+/// exhaustiveness). Never appears in the output of a validated module.
+fn z() -> ir.Value {
+  ir.ConstI32(0)
+}
+
+/// A defensive null funcref operand, the reference-typed counterpart of `z/0` (used where
+/// a bulk/table op's unreachable arm needs a reference value).
+fn zref() -> ir.Value {
+  ir.ConstNull(ir.FuncRef)
 }
 
 /// Lower `call_indirect y x`: pop the i32 table index (top of stack), then the type's
@@ -764,25 +1116,73 @@ fn lower_select(
   use #(cond, stack1) <- result.try(pop1(st.stack))
   // `val1` is deeper (pushed first), `val2` nearer the top (pushed second).
   case take_push_order(stack1, 2) {
-    [val1, val2] -> {
-      let t = value_type(st, val1)
-      let rest_stack = list.drop(stack1, 2)
-      let #(name, c2) = fresh(st.counter)
-      let st2 =
-        record_type(
-          LState(..st, stack: [ir.Var(name), ..rest_stack], counter: c2),
-          name,
-          t,
-        )
-      use inner <- result.try(go(tail, ctx, st2))
-      Ok(wrap_let(
-        [name],
-        ir.If(cond, [t], ir.Values([val1]), ir.Values([val2])),
-        inner,
-      ))
-    }
+    // Untyped `select` (0x1B): the result type is operand-determined — recover it from
+    // `val1` via the SSA type map (numeric operands only, per the spec).
+    [val1, val2] ->
+      finish_select(
+        cond,
+        val1,
+        val2,
+        value_type(st, val1),
+        stack1,
+        tail,
+        ctx,
+        st,
+      )
     _ -> Error(StackUnderflow)
   }
+}
+
+/// Lower typed `select t` (0x1C) — the reference-admitting form — to the SAME `If`
+/// value-merge (no new IR node, exactly like untyped `select`), but taking the result
+/// type from the explicit `vec(valtype)` immediate rather than recovering it from an
+/// operand. In the MVP the immediate is exactly one type (validate guarantees arity 1);
+/// a different arity is `Error(Malformed)` fail-closed. Per spec exec/instructions.
+fn lower_select_t(
+  types: List(ast.ValType),
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use t <- result.try(case types {
+    [ty] -> Ok(to_ir_vt(ty))
+    _ -> Error(Malformed("select_t result arity must be 1"))
+  })
+  use #(cond, stack1) <- result.try(pop1(st.stack))
+  case take_push_order(stack1, 2) {
+    [val1, val2] -> finish_select(cond, val1, val2, t, stack1, tail, ctx, st)
+    _ -> Error(StackUnderflow)
+  }
+}
+
+/// The shared `select`/`select_t` core: emit `If(cond, [t], Values([val1]),
+/// Values([val2]))` — the result is `val1` iff `cond ≠ 0` (spec: then-arm `val1`,
+/// else-arm `val2`) — bind it to a fresh name of type `t`, and lower the continuation.
+/// `stack1` is the operand stack after `cond` was popped (with `val1`/`val2` still on it).
+fn finish_select(
+  cond: ir.Value,
+  val1: ir.Value,
+  val2: ir.Value,
+  t: ir.ValType,
+  stack1: List(ir.Value),
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  let rest_stack = list.drop(stack1, 2)
+  let #(name, c2) = fresh(st.counter)
+  let st2 =
+    record_type(
+      LState(..st, stack: [ir.Var(name), ..rest_stack], counter: c2),
+      name,
+      t,
+    )
+  use inner <- result.try(go(tail, ctx, st2))
+  Ok(wrap_let(
+    [name],
+    ir.If(cond, [t], ir.Values([val1]), ir.Values([val2])),
+    inner,
+  ))
 }
 
 /// Lower a direct `call f`. Pops the callee's parameters, binds its results to fresh
@@ -1425,6 +1825,26 @@ fn to_ir_vt(t: ast.ValType) -> ir.ValType {
   }
 }
 
+/// Map a WASM reference type (the `FuncRef`/`ExternRef` subset of `ast.ValType`) to the
+/// IR's distinct `RefType`. A non-reftype value type never appears in reftype position
+/// (validate guarantees it); it defaults to `FuncRef` fail-closed so this stays total.
+fn to_ir_reftype(t: ast.ValType) -> ir.RefType {
+  case t {
+    ast.ExternRef -> ir.ExternRef
+    _ -> ir.FuncRef
+  }
+}
+
+/// Map a WASM memory address-width tag to the IR `IdxType`. `Idx64` (memory64) is rejected
+/// by `reject_memory64` before any successful lowering, so a lowered module only ever
+/// carries `Idx32` — but the mapping is faithful for completeness.
+fn to_ir_idxtype(it: ast.IdxType) -> ir.IdxType {
+  case it {
+    ast.Idx32 -> ir.Idx32
+    ast.Idx64 -> ir.Idx64
+  }
+}
+
 /// The zero value of an IR type (for declared-local initialisation). `TTerm` never
 /// arises from WASM; it maps to a zero i32 defensively.
 fn zero_value(t: ir.ValType) -> ir.Value {
@@ -1551,83 +1971,183 @@ fn global_ty(ctx: LCtx, i: Int) -> ir.ValType {
   }
 }
 
+/// The element reference type of table `x` (absolute tableidx), for typing a `table.get`
+/// result. Falls back to `FuncRef` for an out-of-range index (only reachable on an
+/// unvalidated module — validation rejects an out-of-range table).
+fn table_reftype(ctx: LCtx, x: Int) -> ir.RefType {
+  case nth_err(ctx.table_types, x, UnknownTypeIndex(x)) {
+    Ok(rt) -> rt
+    Error(_) -> ir.FuncRef
+  }
+}
+
 // ─────────────────────────────── module-level declarations ───────────────────────────────
 
-/// Lower the linear memory to the IR memories vector (H3): the single MVP memory becomes a
-/// one-element `[MemoryDecl(min, max, Idx32)]` (32-bit, byte-identical to Phase-4), or `[]` if
-/// the module declares no memory. Multi-memory / memory64 lowering is P5-05's (the AST only
-/// carries one 32-bit memory at the pin).
+/// Lower the memory section to the IR memories vector (H3), in index order. Each declared
+/// memory → `MemoryDecl(min, max, idx_type)`. A single 32-bit memory becomes a one-element
+/// `[MemoryDecl(min, max, Idx32)]` (byte-identical to Phase-4); `[]` if the module declares
+/// no memory. `reject_memory64` has already stopped a 64-bit memory (R12), so the mapped
+/// `idx_type` is always `Idx32` for a successfully-lowered module. These are the *defined*
+/// memories; imported memories occupy the low indices of the memory index space and are
+/// surfaced as `ImportMemory` (their runtime slot wiring is P5-09's).
 fn lower_memory(module: ast.Module) -> List(ir.MemoryDecl) {
   list.map(module.memories, fn(m) {
-    ir.MemoryDecl(m.limits.min, m.limits.max, ir.Idx32)
+    ir.MemoryDecl(m.limits.min, m.limits.max, to_ir_idxtype(m.idx_type))
   })
 }
 
-/// Lower the global section to `GlobalDecl`s in declaration (= index) order: global `i` →
-/// `GlobalDecl("g<i>", type, mutable, init)` with `init` a constant-literal expression
-/// (Phase-2 MVP). `Error(NonConstInitExpr(_))` if any init is not a single `t.const`.
+/// Lower the global section to `GlobalDecl`s in index order. Defined global `j` is named at
+/// its **absolute** globalidx `imported_global_count + j` (`g<abs>`) so a `GlobalGet`/`Set`
+/// referencing that absolute index resolves to the same slot (imports ++ defined, §G.5). The
+/// init is a const-expr (`t.const` / `ref.func` / `ref.null` / `global.get`).
+/// `Error(NonConstInitExpr(_))` on an inadmissible init. Byte-identical when there are no
+/// imported globals (`imported_global_count = 0` ⇒ `g0, g1, …`).
 fn lower_globals(
   module: ast.Module,
+  imported_global_count: Int,
 ) -> Result(List(ir.GlobalDecl), LowerError) {
   list.index_map(module.globals, fn(g, i) {
     use init <- result.try(lower_const_expr(g.init))
-    Ok(ir.GlobalDecl(gname(i), to_ir_vt(g.ty), g.mutable, init))
+    Ok(ir.GlobalDecl(
+      gname(imported_global_count + i),
+      to_ir_vt(g.ty),
+      g.mutable,
+      init,
+    ))
   })
   |> result.all
 }
 
-/// Lower the table section to `TableDecl`s: table `i` → `TableDecl("t<i>", min, max)`
-/// (funcref implicit). MVP ⇒ at most one, named `"t0"`.
-fn lower_tables(module: ast.Module) -> List(ir.TableDecl) {
-  // MVP tables are funcref (byte-identical to Phase-4); `externref` tables are P5-05's.
+/// Lower the table section to `TableDecl`s. Defined table `i` is named at its **absolute**
+/// tableidx `imported_table_count + i` (`t<abs>`) and carries its element reference type
+/// (`FuncRef`/`ExternRef`) from the AST table type. Imported tables occupy the low indices
+/// (surfaced as `ImportTable`). Byte-identical for a single funcref table with no imports
+/// (`TableDecl("t0", FuncRef, …)`).
+fn lower_tables(
+  module: ast.Module,
+  imported_table_count: Int,
+) -> List(ir.TableDecl) {
   list.index_map(module.tables, fn(t, i) {
-    ir.TableDecl(tname(i), ir.FuncRef, t.limits.min, t.limits.max)
+    ir.TableDecl(
+      tname(imported_table_count + i),
+      to_ir_reftype(t.elem_type),
+      t.limits.min,
+      t.limits.max,
+    )
   })
 }
 
-/// Lower active element segments: each → `ElementSegment("t<table>", offset, funcs)` where
-/// `offset` is the constant-literal offset expression and each funcidx → the IR function
-/// name `f<funcidx>` (the same name `lower_func` gives that funcidx, so targets resolve).
-/// `Error(NonConstInitExpr(_))` on a non-constant offset.
+/// Lower every element segment (active | passive | declarative), preserving its mode and
+/// element reference type, and lowering each init item to a ref-producing const-expr `Expr`
+/// (§G.3):
+///
+/// - **Active** → `ElemActive(t<table>, offset)` where `table` is the absolute tableidx and
+///   `offset` is the const-expr offset. A funcref-active flag-0 segment into table 0 lowers
+///   byte-identically to Phase-4 (`ElemActive("t0", …)`, `init = [RefFunc("f0"), …]`).
+/// - **Passive** → `ElemPassive`; the items are the source for a later `table.init`.
+/// - **Declarative** → `ElemDeclarative`; no runtime content (declares `ref.func` targets).
+///
+/// Init items: the legacy `funcidx` vector (`ElemFuncs`) maps each funcidx `x` →
+/// `RefFunc("f<x>")`; the expression form (`ElemExprs`) lowers each const-expr (`ref.func` →
+/// `RefFunc`, `ref.null t` → `Values([ConstNull(t)])`, `global.get` → `GlobalGet`).
+/// `Error(NonConstInitExpr(_))` on an inadmissible offset/item.
 fn lower_elements(
   module: ast.Module,
 ) -> Result(List(ir.ElementSegment), LowerError) {
-  list.map(module.elements, fn(e) {
-    // Active funcref segment into table 0 (byte-identical to Phase-4): each funcidx
-    // becomes a `RefFunc` init item. Passive/declarative, expr-init, explicit
-    // tableidx, and externref segments are P5-05's — rejected fail-closed here.
-    case e.mode, e.init, e.ref_ty {
-      ast.ElemActive(0, offset_expr), ast.ElemFuncs(funcs), ast.FuncRef -> {
+  list.try_map(module.elements, fn(e) {
+    use init <- result.try(lower_elem_init(e.init))
+    use mode <- result.try(case e.mode {
+      ast.ElemActive(table, offset_expr) -> {
         use offset <- result.try(lower_const_expr(offset_expr))
-        let init =
-          list.map(funcs, fn(idx) { ir.RefFunc("f" <> int.to_string(idx)) })
-        Ok(ir.ElementSegment(ir.ElemActive(tname(0), offset), ir.FuncRef, init))
+        Ok(ir.ElemActive(tname(table), offset))
       }
-      _, _, _ -> Error(Unsupported("element segment (Phase 5 surface)"))
-    }
+      ast.ElemPassive -> Ok(ir.ElemPassive)
+      ast.ElemDeclarative -> Ok(ir.ElemDeclarative)
+    })
+    Ok(ir.ElementSegment(mode, to_ir_reftype(e.ref_ty), init))
   })
-  |> result.all
 }
 
-/// Lower active data segments: each → `DataSegment(offset, bytes)` with `offset` the
-/// constant-literal offset expression. `Error(NonConstInitExpr(_))` on a non-constant offset.
+/// Lower an element segment's init items to ref-producing const-expr `Expr`s. The legacy
+/// funcidx vector maps each funcidx to `RefFunc("f<idx>")` (the same funcidx→name convention,
+/// so element targets resolve to real functions); the expression form lowers each const-expr.
+fn lower_elem_init(init: ast.ElemInit) -> Result(List(ir.Expr), LowerError) {
+  case init {
+    ast.ElemFuncs(funcs) ->
+      Ok(list.map(funcs, fn(idx) { ir.RefFunc("f" <> int.to_string(idx)) }))
+    ast.ElemExprs(exprs) -> list.try_map(exprs, lower_const_expr)
+  }
+}
+
+/// Lower every data segment (active | passive), preserving its mode:
+///
+/// - **Active** → `DataActive(mem, offset)` where `mem` is the (absolute) memory index and
+///   `offset` is the const-expr offset. `DataActive(0, …)` is byte-identical to Phase-4.
+/// - **Passive** → `DataPassive`; the bytes are the source for a later `memory.init`.
+///
+/// `Error(NonConstInitExpr(_))` on a non-constant active offset.
 fn lower_data(module: ast.Module) -> Result(List(ir.DataSegment), LowerError) {
-  list.map(module.data, fn(d) {
-    // Active-at-memory-0 (byte-identical to Phase-4); passive data and
-    // active-with-explicit-memidx are P5-05's — rejected fail-closed here.
+  list.try_map(module.data, fn(d) {
     case d.mode {
-      ast.DataActive(0, offset_expr) -> {
+      ast.DataActive(mem, offset_expr) -> {
         use offset <- result.try(lower_const_expr(offset_expr))
-        Ok(ir.DataSegment(ir.DataActive(0, offset), d.bytes))
+        Ok(ir.DataSegment(ir.DataActive(mem, offset), d.bytes))
       }
-      _ -> Error(Unsupported("data segment (Phase 5 surface)"))
+      ast.DataPassive -> Ok(ir.DataSegment(ir.DataPassive, d.bytes))
     }
   })
-  |> result.all
+}
+
+/// Lower the import section to `ImportDecl`s in order (H4). Function imports become
+/// `ImportFn(module, name, ty)` (the capability grouping is the WASM import module name, the
+/// convention host-function imports already use); the three state kinds become the provided
+/// -state variants `ImportGlobal`/`ImportTable`/`ImportMemory`. lower only *declares* imports
+/// — the actual link/instantiation wiring is P5-09's (`«INSTANTIATE3»`). `[]` for an
+/// import-free module (byte-identical to Phase-4). `Error(UnknownTypeIndex)` if a function
+/// import names a type index out of range.
+fn lower_imports(
+  module: ast.Module,
+) -> Result(List(ir.ImportDecl), LowerError) {
+  list.try_map(module.imports, fn(imp) {
+    case imp.desc {
+      ast.ImportFunc(tyidx) -> {
+        use sig <- result.try(nth_err(
+          module.types,
+          tyidx,
+          UnknownTypeIndex(tyidx),
+        ))
+        Ok(ir.ImportFn(imp.module, imp.name, ir_functype(sig)))
+      }
+      ast.ImportGlobal(ty, mutable) ->
+        Ok(ir.ImportGlobal(imp.module, imp.name, to_ir_vt(ty), mutable))
+      ast.ImportTable(tt) ->
+        Ok(ir.ImportTable(
+          imp.module,
+          imp.name,
+          to_ir_reftype(tt.elem_type),
+          tt.limits.min,
+          tt.limits.max,
+        ))
+      ast.ImportMemory(mt) ->
+        Ok(ir.ImportMemory(
+          imp.module,
+          imp.name,
+          mt.limits.min,
+          mt.limits.max,
+          to_ir_idxtype(mt.idx_type),
+        ))
+    }
+  })
+}
+
+/// Convert an AST function type to the nameless IR `FuncType` (params ++ results mapped to
+/// IR value types). Used for function imports and `call_indirect` type tags.
+fn ir_functype(sig: ast.FuncType) -> ir.FuncType {
+  ir.FuncType(list.map(sig.params, to_ir_vt), list.map(sig.results, to_ir_vt))
 }
 
 /// Lower the start section's funcidx (if present) to the IR function name `f<funcidx>`
-/// (run once at instantiation). With no imports, funcidx == the start function's index.
+/// (run once at instantiation). The funcidx is absolute (imports ++ defined).
 fn lower_start(module: ast.Module) -> Option(String) {
   case module.start {
     Some(idx) -> Some("f" <> int.to_string(idx))
@@ -1635,13 +2155,23 @@ fn lower_start(module: ast.Module) -> Option(String) {
   }
 }
 
-/// Lower a constant expression (a global init / element-or-data offset) to its IR value.
-/// Phase-2 MVP accepts ONLY a single `t.const` (optionally followed by a trailing `End`,
-/// though decode already strips it) → `Values([the const])`. Integers are stored as their
-/// raw unsigned bit pattern; floats keep their raw IEEE-754 bits (D5). Anything else
-/// (notably a `global.get` imported-global form, or an extended-const chain) →
-/// `Error(NonConstInitExpr(_))` — fail-closed, never a panic. (Validation already enforces
-/// the const-expr rule; this is the constructive counterpart + defence.)
+/// Lower a constant expression (a global init, an element item, or an element/data offset)
+/// to its IR value expression, per the WebAssembly const-expr grammar
+/// ([valid/instructions#constant-expressions]): a single `t.const` / `ref.func` / `ref.null`
+/// / `global.get` (of an immutable imported global), then `end` (decode already strips the
+/// `end`; a trailing `End` is stripped defensively here too):
+///
+/// - `t.const` → `Values([Const…])`. Integers are stored as their raw unsigned bit pattern;
+///   floats keep their raw IEEE-754 bits (D5).
+/// - `ref.func x` → `RefFunc("f<x>")` (a funcref to that function).
+/// - `ref.null t` → `Values([ConstNull(t)])` (the null reference literal — R1c: `ref.null`
+///   reduces to the `ConstNull` value, not a separate `Expr`).
+/// - `global.get i` → `GlobalGet("g<i>")` (an immutable imported global's value; now
+///   accepted, was rejected in Phase 2 when no imports existed).
+///
+/// Anything else (an extended-const arithmetic chain — a separate proposal) →
+/// `Error(NonConstInitExpr(_))`, fail-closed. Validation already enforces the const-expr
+/// rule; this is the constructive counterpart + defence.
 fn lower_const_expr(instrs: List(ast.Instr)) -> Result(ir.Expr, LowerError) {
   let stripped = case list.reverse(instrs) {
     [ast.End, ..rest] -> list.reverse(rest)
@@ -1652,6 +2182,9 @@ fn lower_const_expr(instrs: List(ast.Instr)) -> Result(ir.Expr, LowerError) {
     [ast.I64Const(v)] -> Ok(ir.Values([ir.ConstI64(unsigned_bits(v, 64))]))
     [ast.F32Const(bits)] -> Ok(ir.Values([ir.ConstF32(bits)]))
     [ast.F64Const(bits)] -> Ok(ir.Values([ir.ConstF64(bits)]))
+    [ast.RefFunc(x)] -> Ok(ir.RefFunc("f" <> int.to_string(x)))
+    [ast.RefNull(rt)] -> Ok(ir.Values([ir.ConstNull(to_ir_reftype(rt))]))
+    [ast.GlobalGet(i)] -> Ok(ir.GlobalGet(gname(i)))
     _ -> Error(NonConstInitExpr("non-constant init expression"))
   }
 }
