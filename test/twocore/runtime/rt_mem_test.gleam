@@ -19,13 +19,16 @@
 //// suite (paged ≡ oracle) across several chunk sizes; (3) cell-backed wrapper tests
 //// (seed → op → observe persistence + grow fuel); (4) a constant-space store-loop smoke.
 
+import gleam/dict
 import gleam/dynamic
+import gleam/list
 import gleam/option.{None, Some}
+import gleam/set
 import gleeunit/should
 import twocore/ir.{MemoryOutOfBounds}
 import twocore/runtime/rt_mem
 import twocore/runtime/rt_meter
-import twocore/runtime/rt_state.{StateDecl}
+import twocore/runtime/rt_state.{type InstanceState, InstanceState, StateDecl}
 
 // Page byte length; one fresh page = 65536 bytes.
 const page: Int = 65_536
@@ -382,6 +385,9 @@ type Op {
   OpStore(bytes: Int, addr: Int, value: Int, offset: Int)
   OpGrow(delta: Int)
   OpInit(offset: Int, bytes: BitArray)
+  OpFill(dest: Int, value: Int, count: Int)
+  OpCopy(dst: Int, src: Int, count: Int)
+  OpBulkInit(seg: BitArray, dst: Int, src: Int, count: Int)
 }
 
 /// A 31-bit linear-congruential PRNG (deterministic so a failure reproduces). Returns the
@@ -446,6 +452,22 @@ fn apply_paged(m: rt_mem.Mem, op: Op) -> #(rt_mem.Mem, OpResult) {
         Ok(m2) -> #(m2, RInit(Ok(Nil)))
         Error(e) -> #(m, RInit(Error(e)))
       }
+    OpFill(d, v, n) ->
+      case rt_mem.mem_fill(m, d, v, n) {
+        Ok(m2) -> #(m2, RInit(Ok(Nil)))
+        Error(e) -> #(m, RInit(Error(e)))
+      }
+    // Same-memory copy: dst_m and src_m are the same value (overlap → memmove).
+    OpCopy(d, s, n) ->
+      case rt_mem.mem_copy(m, m, d, s, n) {
+        Ok(m2) -> #(m2, RInit(Ok(Nil)))
+        Error(e) -> #(m, RInit(Error(e)))
+      }
+    OpBulkInit(seg, d, s, n) ->
+      case rt_mem.mem_init(m, seg, d, s, n) {
+        Ok(m2) -> #(m2, RInit(Ok(Nil)))
+        Error(e) -> #(m, RInit(Error(e)))
+      }
   }
 }
 
@@ -466,6 +488,21 @@ fn apply_oracle(o: rt_mem.OMem, op: Op) -> #(rt_mem.OMem, OpResult) {
         Ok(o2) -> #(o2, RInit(Ok(Nil)))
         Error(e) -> #(o, RInit(Error(e)))
       }
+    OpFill(d, v, n) ->
+      case rt_mem.o_fill(o, d, v, n) {
+        Ok(o2) -> #(o2, RInit(Ok(Nil)))
+        Error(e) -> #(o, RInit(Error(e)))
+      }
+    OpCopy(d, s, n) ->
+      case rt_mem.o_copy(o, o, d, s, n) {
+        Ok(o2) -> #(o2, RInit(Ok(Nil)))
+        Error(e) -> #(o, RInit(Error(e)))
+      }
+    OpBulkInit(seg, d, s, n) ->
+      case rt_mem.o_init(o, seg, d, s, n) {
+        Ok(o2) -> #(o2, RInit(Ok(Nil)))
+        Error(e) -> #(o, RInit(Error(e)))
+      }
   }
 }
 
@@ -474,8 +511,8 @@ fn apply_oracle(o: rt_mem.OMem, op: Op) -> #(rt_mem.OMem, OpResult) {
 /// random; grows stay within the 4-page max.
 fn gen_op(byte_len: Int, seed: Int) -> #(Op, Int) {
   let s = lcg(seed)
-  case s % 10 {
-    k if k < 5 -> {
+  case s % 16 {
+    k if k < 4 -> {
       let s2 = lcg(s)
       let bytes = pick_bytes(s2 % 4)
       let #(addr, s3) = pick_addr(s2, byte_len)
@@ -483,7 +520,7 @@ fn gen_op(byte_len: Int, seed: Int) -> #(Op, Int) {
       let s5 = lcg(s4)
       #(OpStore(bytes, addr, pick_value(s5), s4 % 8), s5)
     }
-    k if k < 8 -> {
+    k if k < 7 -> {
       let s2 = lcg(s)
       let bytes = pick_bytes(s2 % 4)
       let #(width, s3) = pick_width(bytes, s2)
@@ -492,16 +529,42 @@ fn gen_op(byte_len: Int, seed: Int) -> #(Op, Int) {
       let signed = s4 % 2 == 0
       #(OpLoad(bytes, signed, width, addr, s5 % 8), s5)
     }
-    8 -> {
+    7 -> {
       let s2 = lcg(s)
       #(OpGrow(s2 % 3), s2)
     }
-    _ -> {
+    8 -> {
       let s2 = lcg(s)
       let len = s2 % 6
       let #(addr, s3) = pick_addr(s2, byte_len)
       let #(bytes, s4) = rand_bytes(len, s3)
       #(OpInit(addr, bytes), s4)
+    }
+    k if k < 11 -> {
+      // memory.fill: dest spanning in/out of bounds, low-byte value, small count (incl. 0).
+      let s2 = lcg(s)
+      let #(dest, s3) = pick_addr(s2, byte_len)
+      let s4 = lcg(s3)
+      #(OpFill(dest, pick_value(s4), s4 % 7), s4)
+    }
+    k if k < 13 -> {
+      // memory.copy on ONE memory (dst_m == src_m) → exercises OVERLAP both directions.
+      let s2 = lcg(s)
+      let #(dst, s3) = pick_addr(s2, byte_len)
+      let #(src, s4) = pick_addr(s3, byte_len)
+      #(OpCopy(dst, src, s4 % 7), s4)
+    }
+    _ -> {
+      // memory.init from a random-length segment (occasionally ε — the dropped-segment case);
+      // src may exceed the segment length so the segment bound is exercised.
+      let s2 = lcg(s)
+      let seg_len = s2 % 6
+      let #(seg, s3) = rand_bytes(seg_len, s2)
+      let #(dst, s4) = pick_addr(s3, byte_len)
+      let s5 = lcg(s4)
+      let src = s5 % { seg_len + 3 }
+      let s6 = lcg(s5)
+      #(OpBulkInit(seg, dst, src, s6 % 7), s6)
     }
   }
 }
@@ -812,4 +875,302 @@ pub fn to_flat_dynamic_matches_oracle_test() {
   let o = rt_mem.o_fresh(1, Some(1), big_cap)
   let assert Ok(o) = rt_mem.o_store(o, 4, 100, 0x04030201, 0)
   rt_mem.to_flat(rt_state.mem_get()) |> should.equal(rt_mem.o_flat(o))
+}
+
+// ───────────────────────────── 15. Bulk memory spec corners (memory_fill/copy/init.wast, §4.4.9) ─────────────────────────────
+//
+// The finalized bulk-memory proposal (WebAssembly spec §4.4.9): eager bounds (strict `>`, checked
+// UNCONDITIONALLY incl. n==0 — R10), no partial writes on trap, memmove-correct copy (R11), init
+// bounded by BOTH the segment and the memory (a dropped/ε segment traps for n>0, no-ops for n=0).
+
+/// A fresh 1-page paged memory (declared max 1) with a generous cap.
+fn fresh1() -> rt_mem.Mem {
+  rt_mem.fresh_mem(1, Some(1), big_cap, rt_mem.default_chunk_bytes)
+}
+
+/// A fresh 1-page paged memory holding bytes `[0,1,2,3,4,5,6,7]` at offset 0.
+fn seed_0_to_7() -> rt_mem.Mem {
+  let assert Ok(m) =
+    rt_mem.mem_init_data(fresh1(), 0, <<0, 1, 2, 3, 4, 5, 6, 7>>)
+  m
+}
+
+/// The first 8 bytes of a paged memory as a list (for a compact image assertion).
+fn bytes8(m: rt_mem.Mem) -> List(Int) {
+  list.map([0, 1, 2, 3, 4, 5, 6, 7], fn(i) {
+    let assert Ok(b) = rt_mem.mem_load(m, 1, False, 32, i, 0)
+    b
+  })
+}
+
+/// The first 8 bytes of an oracle memory as a list.
+fn o_bytes8(o: rt_mem.OMem) -> List(Int) {
+  list.map([0, 1, 2, 3, 4, 5, 6, 7], fn(i) {
+    let assert Ok(b) = rt_mem.o_load(o, 1, False, 32, i, 0)
+    b
+  })
+}
+
+// `memory.fill` writes the LOW byte only, `count` times. fill(d, 0x12345678, 4) → 78 78 78 78.
+pub fn fill_low_byte_paged_test() {
+  let assert Ok(m) = rt_mem.mem_fill(fresh1(), 0, 0x12345678, 4)
+  rt_mem.mem_load(m, 1, False, 32, 0, 0) |> should.equal(Ok(0x78))
+  rt_mem.mem_load(m, 1, False, 32, 3, 0) |> should.equal(Ok(0x78))
+  rt_mem.mem_load(m, 4, False, 32, 0, 0) |> should.equal(Ok(0x78787878))
+  // Byte 4 is untouched.
+  rt_mem.mem_load(m, 1, False, 32, 4, 0) |> should.equal(Ok(0))
+  // A zero-count fill writes nothing.
+  let assert Ok(m0) = rt_mem.mem_fill(m, 10, 0xFF, 0)
+  rt_mem.mem_load(m0, 1, False, 32, 10, 0) |> should.equal(Ok(0))
+}
+
+pub fn fill_low_byte_oracle_test() {
+  let assert Ok(o) =
+    rt_mem.o_fill(rt_mem.o_fresh(1, Some(1), big_cap), 0, 0x12345678, 4)
+  rt_mem.o_load(o, 4, False, 32, 0, 0) |> should.equal(Ok(0x78787878))
+  rt_mem.o_load(o, 1, False, 32, 4, 0) |> should.equal(Ok(0))
+}
+
+// Eager bounds (R10): dest+count == byte_len succeeds; +1 traps with ZERO mutation; the exact
+// n==0 boundary: fill(byte_len, v, 0) succeeds, fill(byte_len+1, v, 0) traps.
+pub fn fill_eager_bounds_no_partial_write_paged_test() {
+  // Seed a marker across the tail so a partial write would be observable.
+  let assert Ok(m) = rt_mem.mem_store(fresh1(), 4, page - 4, 0xAABBCCDD, 0)
+  // dest+count == byte_len is in bounds.
+  rt_mem.mem_fill(m, page - 4, 0x11, 4) |> should.be_ok
+  // dest+count == byte_len+1 traps.
+  rt_mem.mem_fill(m, page - 3, 0x22, 4)
+  |> should.equal(Error(MemoryOutOfBounds))
+  // No partial write: the trapping fill's in-bounds prefix (bytes page-3, page-2, page-1) is
+  // still the seeded pattern in the (untouched) input `m`.
+  rt_mem.mem_load(m, 4, False, 32, page - 4, 0) |> should.equal(Ok(0xAABBCCDD))
+  // R10 exact boundary at n==0.
+  rt_mem.mem_fill(m, page, 0x33, 0) |> should.be_ok
+  rt_mem.mem_fill(m, page + 1, 0x33, 0)
+  |> should.equal(Error(MemoryOutOfBounds))
+  // A negative-index / negative-count fill traps.
+  rt_mem.mem_fill(m, -1, 0x33, 1) |> should.equal(Error(MemoryOutOfBounds))
+}
+
+pub fn fill_r10_boundary_oracle_test() {
+  let o = rt_mem.o_fresh(1, Some(1), big_cap)
+  rt_mem.o_fill(o, page, 0x33, 0) |> should.be_ok
+  rt_mem.o_fill(o, page + 1, 0x33, 0)
+  |> should.equal(Error(MemoryOutOfBounds))
+}
+
+// `memory.copy` is memmove: the §B.2 worked examples on [0..7] round-trip correctly in BOTH
+// directions — the exact case a naive ascending byte-by-byte copy would corrupt.
+pub fn copy_memmove_overlap_paged_test() {
+  let m = seed_0_to_7()
+  // copy(dst=1, src=0, count=3): naive ascending would give [0,0,0,0,..]; memmove → [0,0,1,2,..].
+  let assert Ok(fwd) = rt_mem.mem_copy(m, m, 1, 0, 3)
+  bytes8(fwd) |> should.equal([0, 0, 1, 2, 4, 5, 6, 7])
+  // copy(dst=0, src=1, count=3): → [1,2,3,3,4,5,6,7].
+  let assert Ok(bwd) = rt_mem.mem_copy(m, m, 0, 1, 3)
+  bytes8(bwd) |> should.equal([1, 2, 3, 3, 4, 5, 6, 7])
+}
+
+pub fn copy_memmove_overlap_oracle_test() {
+  let assert Ok(o) =
+    rt_mem.o_init_data(rt_mem.o_fresh(1, Some(1), big_cap), 0, <<
+      0, 1, 2, 3, 4, 5, 6, 7,
+    >>)
+  let assert Ok(fwd) = rt_mem.o_copy(o, o, 1, 0, 3)
+  o_bytes8(fwd) |> should.equal([0, 0, 1, 2, 4, 5, 6, 7])
+  let assert Ok(bwd) = rt_mem.o_copy(o, o, 0, 1, 3)
+  o_bytes8(bwd) |> should.equal([1, 2, 3, 3, 4, 5, 6, 7])
+}
+
+// Eager bounds on BOTH ranges; a trapping copy leaves the destination unchanged (immutable input).
+pub fn copy_eager_bounds_paged_test() {
+  let m = seed_0_to_7()
+  // src + count > byte_len traps.
+  rt_mem.mem_copy(m, m, 0, page - 2, 4)
+  |> should.equal(Error(MemoryOutOfBounds))
+  // dst + count > byte_len traps.
+  rt_mem.mem_copy(m, m, page - 2, 0, 4)
+  |> should.equal(Error(MemoryOutOfBounds))
+  // Neither wrote: the source image is intact.
+  bytes8(m) |> should.equal([0, 1, 2, 3, 4, 5, 6, 7])
+}
+
+// Cross-memory copy on the pure core: reads memory 1 (src), writes memory 0 (dst); the source
+// memory is untouched; and bounds use EACH memory's own length.
+pub fn cross_memory_copy_paged_test() {
+  let assert Ok(src) = rt_mem.mem_init_data(fresh1(), 0, <<10, 20, 30, 40, 50>>)
+  // dst is 2 pages so it has room past `src`'s length — bounds must still use src's length.
+  let dst = rt_mem.fresh_mem(2, Some(2), big_cap, rt_mem.default_chunk_bytes)
+  let assert Ok(dst2) = rt_mem.mem_copy(dst, src, 5, 0, 3)
+  // dst[5..7] == src[0..2].
+  rt_mem.mem_load(dst2, 1, False, 32, 5, 0) |> should.equal(Ok(10))
+  rt_mem.mem_load(dst2, 1, False, 32, 7, 0) |> should.equal(Ok(30))
+  // dst elsewhere is 0; src is unchanged.
+  rt_mem.mem_load(dst2, 1, False, 32, 0, 0) |> should.equal(Ok(0))
+  rt_mem.mem_load(src, 1, False, 32, 0, 0) |> should.equal(Ok(10))
+  // A copy that fits in `dst` but overruns `src` traps on src's length (per-memory bounds).
+  rt_mem.mem_copy(dst, src, page, page - 2, 4)
+  |> should.equal(Error(MemoryOutOfBounds))
+}
+
+// `memory.init` writes seg[src..src+count) at dst; eager bounds on the segment AND the memory.
+pub fn init_from_segment_paged_test() {
+  let m = fresh1()
+  let seg = <<0xAA, 0xBB, 0xCC, 0xDD, 0xEE>>
+  // init(dst=10, src=1, count=3) writes BB CC DD.
+  let assert Ok(m2) = rt_mem.mem_init(m, seg, 10, 1, 3)
+  rt_mem.mem_load(m2, 1, False, 32, 10, 0) |> should.equal(Ok(0xBB))
+  rt_mem.mem_load(m2, 1, False, 32, 12, 0) |> should.equal(Ok(0xDD))
+  rt_mem.mem_load(m2, 1, False, 32, 13, 0) |> should.equal(Ok(0))
+  // src + count > len(seg) traps (3 + 3 = 6 > 5).
+  rt_mem.mem_init(m, seg, 0, 3, 3) |> should.equal(Error(MemoryOutOfBounds))
+  // dst + count > byte_len traps.
+  rt_mem.mem_init(m, seg, page - 2, 0, 3)
+  |> should.equal(Error(MemoryOutOfBounds))
+}
+
+// `memory.init` from a dropped (ε) segment: n>0 traps (src-bound), n=0 no-ops — exactly the spec
+// behaviour `data.drop` then `memory.init` produces (R2). Modelled as an empty segment argument.
+pub fn init_from_dropped_segment_paged_test() {
+  let m = fresh1()
+  rt_mem.mem_init(m, <<>>, 0, 0, 1) |> should.equal(Error(MemoryOutOfBounds))
+  rt_mem.mem_init(m, <<>>, 0, 0, 0) |> should.be_ok
+  // R10 boundary carries to init: dst==byte_len with n=0 succeeds; dst>byte_len with n=0 traps.
+  rt_mem.mem_init(m, <<>>, page, 0, 0) |> should.be_ok
+  rt_mem.mem_init(m, <<>>, page + 1, 0, 0)
+  |> should.equal(Error(MemoryOutOfBounds))
+}
+
+pub fn init_from_dropped_segment_oracle_test() {
+  let o = rt_mem.o_fresh(1, Some(1), big_cap)
+  rt_mem.o_init(o, <<>>, 0, 0, 1) |> should.equal(Error(MemoryOutOfBounds))
+  rt_mem.o_init(o, <<>>, 0, 0, 0) |> should.be_ok
+}
+
+// No-wrap ea (E3) carries to bulk ops: a dest/dst near 2^32 with a count that would wrap to a
+// small in-bounds index must TRAP, not wrap. (0xFFFFFFFF + 100 = 99 mod 2^32; must not be used.)
+pub fn bulk_no_wrap_ea_paged_test() {
+  let m = fresh1()
+  rt_mem.mem_fill(m, 0xFFFFFFFF, 0x11, 100)
+  |> should.equal(Error(MemoryOutOfBounds))
+  rt_mem.mem_copy(m, m, 0xFFFFFFFF, 0, 4)
+  |> should.equal(Error(MemoryOutOfBounds))
+  rt_mem.mem_init(m, <<1, 2, 3, 4>>, 0xFFFFFFFF, 0, 4)
+  |> should.equal(Error(MemoryOutOfBounds))
+}
+
+// ───────────────────────────── 16. Multi-memory routing (paged threaded, hand-built 2-mem state) ─────────────────────────────
+//
+// Until unit 09 seeds N memories from `StateDecl`, a multi-memory instance is built directly here
+// to prove the index routing: `t_copy` reads `src_mem`, writes `dst_mem`; `t_fill`/`t_init` touch
+// only their named memory.
+
+/// A threaded InstanceState with TWO independent 1-page paged memories (indices 0 and 1).
+fn two_mem_state() -> InstanceState {
+  InstanceState(
+    mems: [rt_mem.fresh(1, Some(1), big_cap), rt_mem.fresh(1, Some(1), big_cap)],
+    globals: dict.new(),
+    tables: [],
+    dropped_data: set.new(),
+    dropped_elem: set.new(),
+    ref_globals: dict.new(),
+  )
+}
+
+pub fn threaded_cross_memory_copy_test() {
+  let st = two_mem_state()
+  // Put a byte into memory 1.
+  let assert Ok(st) = rt_mem.t_store_at(st, 1, 1, 0, 0xAB, 0)
+  // Copy 1 byte from memory 1 (src) to memory 0 (dst) at address 5.
+  let assert Ok(st) = rt_mem.t_copy(st, 0, 1, 5, 0, 1)
+  rt_mem.t_load_at(st, 0, 1, False, 32, 5, 0) |> should.equal(Ok(0xAB))
+  // Memory 1 is untouched; memory 0 address 0 was never written.
+  rt_mem.t_load_at(st, 1, 1, False, 32, 0, 0) |> should.equal(Ok(0xAB))
+  rt_mem.t_load_at(st, 0, 1, False, 32, 0, 0) |> should.equal(Ok(0))
+}
+
+pub fn threaded_fill_init_second_memory_test() {
+  let st = two_mem_state()
+  // Fill memory 1; memory 0 must be untouched.
+  let assert Ok(st) = rt_mem.t_fill(st, 1, 0, 0x77, 4)
+  rt_mem.t_load_at(st, 1, 4, False, 32, 0, 0) |> should.equal(Ok(0x77777777))
+  rt_mem.t_load_at(st, 0, 4, False, 32, 0, 0) |> should.equal(Ok(0))
+  // Init into memory 0 from a segment.
+  let assert Ok(st) = rt_mem.t_init(st, 0, <<1, 2, 3, 4>>, 8, 0, 4)
+  rt_mem.t_load_at(st, 0, 1, False, 32, 8, 0) |> should.equal(Ok(1))
+  rt_mem.t_load_at(st, 0, 1, False, 32, 11, 0) |> should.equal(Ok(4))
+}
+
+// ───────────────────────────── 17. Bulk cell wrappers (fuel + no partial write, index 0) ─────────────────────────────
+
+/// Seed a fresh 1-page cell memory for the bulk-wrapper tests.
+fn seed_cell_1page() -> Nil {
+  rt_state.seed(StateDecl(
+    mem: rt_mem.fresh(1, Some(1), big_cap),
+    globals: [],
+    table: dynamic.nil(),
+  ))
+}
+
+// A successful `fill` persists in the cell and charges `count` fuel (R9); a trapping `fill`
+// mutates nothing and charges nothing.
+pub fn cell_fill_persists_and_charges_fuel_test() {
+  rt_meter.reset_fuel()
+  seed_cell_1page()
+  rt_mem.fill(0, 0, 0xFF, 16) |> should.equal(Ok(Nil))
+  rt_mem.load_at(0, 4, False, 32, 0, 0) |> should.equal(Ok(0xFFFFFFFF))
+  // The frozen index-0 head observes the SAME cell (byte-identity).
+  rt_mem.load(4, False, 32, 12, 0) |> should.equal(Ok(0xFFFFFFFF))
+  rt_meter.fuel_consumed() |> should.equal(16)
+  // A trapping fill (straddling byte_len) charges nothing and leaves the filled bytes intact.
+  rt_mem.fill(0, page - 1, 0x00, 4) |> should.equal(Error(MemoryOutOfBounds))
+  rt_meter.fuel_consumed() |> should.equal(16)
+  rt_mem.load_at(0, 1, False, 32, 0, 0) |> should.equal(Ok(0xFF))
+}
+
+// Same-memory `copy` through the cell wrapper is overlap-correct and charges `count` fuel.
+pub fn cell_copy_same_memory_overlap_test() {
+  rt_meter.reset_fuel()
+  seed_cell_1page()
+  rt_mem.init_data_at(0, 0, <<0, 1, 2, 3, 4, 5, 6, 7>>)
+  |> should.equal(Ok(Nil))
+  rt_mem.copy(0, 0, 1, 0, 3) |> should.equal(Ok(Nil))
+  // [0,0,1,2,4,5,6,7].
+  rt_mem.load_at(0, 1, False, 32, 2, 0) |> should.equal(Ok(1))
+  rt_mem.load_at(0, 1, False, 32, 3, 0) |> should.equal(Ok(2))
+  rt_meter.fuel_consumed() |> should.equal(3)
+}
+
+// `init` from a dropped (ε) segment traps for n>0 and no-ops for n=0; a trap charges no fuel.
+pub fn cell_init_dropped_segment_test() {
+  rt_meter.reset_fuel()
+  seed_cell_1page()
+  rt_mem.init(0, <<>>, 0, 0, 1) |> should.equal(Error(MemoryOutOfBounds))
+  rt_meter.fuel_consumed() |> should.equal(0)
+  rt_mem.init(0, <<>>, 0, 0, 0) |> should.equal(Ok(Nil))
+  // A real init from a segment charges `count`.
+  rt_mem.init(0, <<9, 8, 7>>, 4, 0, 3) |> should.equal(Ok(Nil))
+  rt_mem.load_at(0, 1, False, 32, 4, 0) |> should.equal(Ok(9))
+  rt_meter.fuel_consumed() |> should.equal(3)
+}
+
+// Metered parity: a cell `fill` and a threaded `t_fill` of the same count debit IDENTICAL fuel.
+pub fn cell_threaded_fill_metered_parity_test() {
+  rt_meter.reset_fuel()
+  seed_cell_1page()
+  let assert Ok(Nil) = rt_mem.fill(0, 0, 0x01, 20)
+  let cell_fuel = rt_meter.fuel_consumed()
+
+  rt_meter.reset_fuel()
+  let st =
+    rt_state.fresh(StateDecl(
+      mem: rt_mem.fresh(1, Some(1), big_cap),
+      globals: [],
+      table: dynamic.nil(),
+    ))
+  let assert Ok(_st) = rt_mem.t_fill(st, 0, 0, 0x01, 20)
+  let threaded_fuel = rt_meter.fuel_consumed()
+
+  cell_fuel |> should.equal(20)
+  threaded_fuel |> should.equal(cell_fuel)
 }

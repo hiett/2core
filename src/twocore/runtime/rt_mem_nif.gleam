@@ -235,3 +235,176 @@ pub fn t_init_data(
 pub fn to_flat(mem: Dynamic) -> BitArray {
   rt_mem.to_flat(mem)
 }
+
+// ───────────────────────────── multi-memory + bulk memory skeleton (P5-08, delegating) ─────────────────────────────
+//
+// The Phase-5 additive surface — the index-routed `_at` load/store/size/grow/init_data variants and
+// the bulk ops (`fill`/`copy`/`init`) — each delegating to `rt_mem` (spec-correct by construction,
+// NOT the native ceiling; the deferred C NIF drops in behind these byte-identical heads). Coercion
+// soundness holds unchanged: under `mem_tier == Nif` the `mem` slot is produced solely by this
+// module's `fresh` (→ `rt_mem.fresh`), so delegating to `rt_mem`'s coercing entry points is sound.
+
+/// `load` from memory `mem_idx` (read-only). Delegates to `rt_mem.load_at`.
+pub fn load_at(
+  mem_idx: Int,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Result(Int, TrapReason) {
+  rt_mem.load_at(mem_idx, bytes, signed, result_width, addr, offset)
+}
+
+/// `store` into memory `mem_idx`. Delegates to `rt_mem.store_at`.
+pub fn store_at(
+  mem_idx: Int,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> Result(Nil, TrapReason) {
+  rt_mem.store_at(mem_idx, bytes, addr, value, offset)
+}
+
+/// `memory.size` of memory `mem_idx`. Delegates to `rt_mem.size_at`.
+pub fn size_at(mem_idx: Int) -> Int {
+  rt_mem.size_at(mem_idx)
+}
+
+/// `memory.grow` memory `mem_idx` by `delta` pages (charges `delta * page_bytes` fuel on success).
+/// Delegates to `rt_mem.grow_at`.
+pub fn grow_at(mem_idx: Int, delta: Int) -> Int {
+  rt_mem.grow_at(mem_idx, delta)
+}
+
+/// Active DATA-segment write into memory `mem_idx` at instantiation. Delegates to
+/// `rt_mem.init_data_at`.
+pub fn init_data_at(
+  mem_idx: Int,
+  offset: Int,
+  bytes: BitArray,
+) -> Result(Nil, TrapReason) {
+  rt_mem.init_data_at(mem_idx, offset, bytes)
+}
+
+/// `memory.fill` on memory `mem_idx` (eager bounds, `count` fuel on success). Delegates to
+/// `rt_mem.fill`.
+pub fn fill(
+  mem_idx: Int,
+  dest: Int,
+  value: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  rt_mem.fill(mem_idx, dest, value, count)
+}
+
+/// `memory.copy` from memory `src_mem` to `dst_mem` (memmove, cross-memory-capable, `count` fuel on
+/// success). Delegates to `rt_mem.copy`.
+pub fn copy(
+  dst_mem: Int,
+  src_mem: Int,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  rt_mem.copy(dst_mem, src_mem, dst, src, count)
+}
+
+/// `memory.init` into memory `mem_idx` from segment bytes `seg` (ε if dropped; eager bounds,
+/// `count` fuel on success). Delegates to `rt_mem.init`.
+pub fn init(
+  mem_idx: Int,
+  seg: BitArray,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  rt_mem.init(mem_idx, seg, dst, src, count)
+}
+
+/// Threaded `load` from memory `mem_idx` (read-only). Delegates to `rt_mem.t_load_at`.
+pub fn t_load_at(
+  st: InstanceState,
+  mem_idx: Int,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Result(Int, TrapReason) {
+  rt_mem.t_load_at(st, mem_idx, bytes, signed, result_width, addr, offset)
+}
+
+/// Threaded `store` into memory `mem_idx`. Delegates to `rt_mem.t_store_at`.
+pub fn t_store_at(
+  st: InstanceState,
+  mem_idx: Int,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> Result(InstanceState, TrapReason) {
+  rt_mem.t_store_at(st, mem_idx, bytes, addr, value, offset)
+}
+
+/// Threaded `memory.size` of memory `mem_idx`. Delegates to `rt_mem.t_size_at`.
+pub fn t_size_at(st: InstanceState, mem_idx: Int) -> Int {
+  rt_mem.t_size_at(st, mem_idx)
+}
+
+/// Threaded `memory.grow` of memory `mem_idx`. Delegates to `rt_mem.t_grow_at`.
+pub fn t_grow_at(
+  st: InstanceState,
+  mem_idx: Int,
+  delta: Int,
+) -> #(Int, InstanceState) {
+  rt_mem.t_grow_at(st, mem_idx, delta)
+}
+
+/// Threaded active DATA-segment write into memory `mem_idx`. Delegates to `rt_mem.t_init_data_at`.
+pub fn t_init_data_at(
+  st: InstanceState,
+  mem_idx: Int,
+  offset: Int,
+  bytes: BitArray,
+) -> Result(InstanceState, TrapReason) {
+  rt_mem.t_init_data_at(st, mem_idx, offset, bytes)
+}
+
+/// Threaded `memory.fill` on memory `mem_idx`. Delegates to `rt_mem.t_fill`.
+pub fn t_fill(
+  st: InstanceState,
+  mem_idx: Int,
+  dest: Int,
+  value: Int,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  rt_mem.t_fill(st, mem_idx, dest, value, count)
+}
+
+/// Threaded `memory.copy` from memory `src_mem` to `dst_mem` (memmove, cross-memory-capable).
+/// Delegates to `rt_mem.t_copy`.
+pub fn t_copy(
+  st: InstanceState,
+  dst_mem: Int,
+  src_mem: Int,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  rt_mem.t_copy(st, dst_mem, src_mem, dst, src, count)
+}
+
+/// Threaded `memory.init` into memory `mem_idx` from segment bytes `seg` (ε if dropped). Delegates
+/// to `rt_mem.t_init`.
+pub fn t_init(
+  st: InstanceState,
+  mem_idx: Int,
+  seg: BitArray,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  rt_mem.t_init(st, mem_idx, seg, dst, src, count)
+}

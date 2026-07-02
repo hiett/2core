@@ -29,6 +29,19 @@
 //// byte. A word's value is `Σ_{k=0..7} byte[8w+k]·256^k`. A multi-byte access of `n <= 8` bytes
 //// spans word `w` and, iff `p + n > 8`, word `w+1` — at most two words. Alignment is a hint;
 //// unaligned and word-boundary-crossing accesses are fully supported.
+////
+//// **Phase-5 additive surface (bulk memory + multi-memory, P5-08).** Additive to the frozen
+//// Phase-4 heads: the pure `a_fill`/`a_copy`/`a_init` core and the index-routed cell/threaded
+//// wrappers (`fill`/`copy`/`init` + the `_at` load/store/size/grow/init_data variants). Because
+//// the backing array mutates IN PLACE, the bulk ops must be overlap-correct on the mutable store:
+//// they GATHER the source region into an immutable `BitArray` snapshot FIRST, then SCATTER —
+//// memmove-correct in either direction and cross-memory-correct (a distinct `ref`), byte-identical
+//// to the `paged`/oracle result (the differential proves it). Eager bounds (trap-before-write,
+//// R10) → ZERO mutation on trap; each bulk-op wrapper charges `count` fuel on success (R9/§F). The
+//// index-0 `_at` heads are byte-identical to the frozen heads (H7). **memory64 + atomics:** a
+//// 64-bit memory's effective max almost always exceeds `atomics_reserve_cap_pages`, so it is
+//// fail-closed rejected at link time — the runtime is deferred to Phase 6 (R12), so only 32-bit
+//// memories reach here regardless.
 
 import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
@@ -267,6 +280,80 @@ pub fn a_init_data(
   }
 }
 
+/// Pure `memory.fill` (same contract as `rt_mem.mem_fill`): eager bounds
+/// (`dest >= 0 && count >= 0 && dest + count <= byte_len`, R10 — checked UNCONDITIONALLY), then
+/// scatter `value & 0xFF` across `[dest, dest+count)` byte-by-byte. Returns `Ok(a)` (the SAME
+/// handle — mutated in place) or `Error(MemoryOutOfBounds)` with ZERO mutation. Charge-free.
+pub fn a_fill(
+  a: Atomics,
+  dest: Int,
+  value: Int,
+  count: Int,
+) -> Result(Atomics, TrapReason) {
+  case dest >= 0 && count >= 0 && dest + count <= byte_len(a) {
+    False -> Error(MemoryOutOfBounds)
+    True -> {
+      fill_loop(a, dest, int.bitwise_and(value, 0xFF), count)
+      Ok(a)
+    }
+  }
+}
+
+/// Pure `memory.copy` (memmove, R11; same contract as `rt_mem.mem_copy`): eager bounds on BOTH
+/// ranges, then GATHER the whole `src` region from `src_a` into an immutable `BitArray` snapshot
+/// and SCATTER it into `dst_a` — snapshot-first, so overlap is correct even when `dst_a` and
+/// `src_a` are the SAME handle, and cross-memory copy (distinct handles) shares the path. Returns
+/// `Ok(dst_a)` (mutated in place) or `Error(MemoryOutOfBounds)` with ZERO mutation. Charge-free.
+pub fn a_copy(
+  dst_a: Atomics,
+  src_a: Atomics,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Atomics, TrapReason) {
+  case
+    src >= 0
+    && dst >= 0
+    && count >= 0
+    && src + count <= byte_len(src_a)
+    && dst + count <= byte_len(dst_a)
+  {
+    False -> Error(MemoryOutOfBounds)
+    True -> {
+      let region = gather_bytes(src_a, src, count)
+      write_data_loop(dst_a, dst, region)
+      Ok(dst_a)
+    }
+  }
+}
+
+/// Pure `memory.init` from `seg`'s current bytes (ε if dropped, R2; same contract as
+/// `rt_mem.mem_init`): eager bounds on BOTH the segment (`src + count <= byte_size(seg)`) and the
+/// memory (`dst + count <= byte_len`), then scatter `seg[src..src+count)` at `dst`. A dropped/ε
+/// segment traps for `count > 0` and no-ops for `count = 0`. Returns `Ok(a)` (mutated in place) or
+/// `Error(MemoryOutOfBounds)` with ZERO mutation. Charge-free.
+pub fn a_init(
+  a: Atomics,
+  seg: BitArray,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Atomics, TrapReason) {
+  case
+    src >= 0
+    && dst >= 0
+    && count >= 0
+    && src + count <= bit_array.byte_size(seg)
+    && dst + count <= byte_len(a)
+  {
+    False -> Error(MemoryOutOfBounds)
+    True -> {
+      write_data_loop(a, dst, take(seg, src, count))
+      Ok(a)
+    }
+  }
+}
+
 /// The whole in-bounds byte image (`pages * page_bytes` bytes, little-endian) — the differential
 /// reference mirrored on `rt_mem.to_flat`/`o_flat` for the oracle to compare byte-for-byte.
 /// Gathers the `AtomicsBacked` words word-by-word. O(byte_len); tests only.
@@ -356,6 +443,147 @@ fn current_atomics() -> Atomics {
   dynamic_to_atomics(rt_state.mem_get())
 }
 
+// ───────────────────────────── multi-memory + bulk cell wrappers (Cell strategy, R6/R7/R9) ─────────────────────────────
+//
+// The index-routed cell family: each op projects memory `mem_idx` from the memories vector via
+// `rt_state.mem_at` (index 0 = the default memory, so `load_at(0,…) ≡ load(…)`). Because the `ref`
+// mutates IN PLACE, a mutator writes back NO `mem_put` — the handle value is unchanged — EXCEPT
+// `grow_at`, which moves the `pages` watermark (the handle value changes). The bulk ops charge
+// `count` fuel on the SUCCESS path (R9/§F).
+
+/// Read memory `mem_idx`'s `Atomics` out of this process's cell. Fail-closed on an un-seeded cell /
+/// out-of-range index (via `rt_state.mem_at`).
+fn current_atomics_at(mem_idx: Int) -> Atomics {
+  dynamic_to_atomics(rt_state.mem_at(mem_idx))
+}
+
+/// `load` from memory `mem_idx` (read-only). Index-routed twin of `load`. See `a_load`.
+pub fn load_at(
+  mem_idx: Int,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Result(Int, TrapReason) {
+  a_load(current_atomics_at(mem_idx), bytes, signed, result_width, addr, offset)
+}
+
+/// `store` into memory `mem_idx`. The `ref` mutates IN PLACE (no `mem_put`); returns `Ok(Nil)` or
+/// `Error(MemoryOutOfBounds)` (zero mutation). Index-routed twin of `store`. See `a_store`.
+pub fn store_at(
+  mem_idx: Int,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> Result(Nil, TrapReason) {
+  case a_store(current_atomics_at(mem_idx), bytes, addr, value, offset) {
+    Ok(_a) -> Ok(Nil)
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// `memory.size` of memory `mem_idx`. Index-routed twin of `size`.
+pub fn size_at(mem_idx: Int) -> Int {
+  a_size(current_atomics_at(mem_idx))
+}
+
+/// `memory.grow` memory `mem_idx` by `delta` pages. Returns the PREVIOUS size, or `-1` past the
+/// cap (nothing allocated / charged). On success charges `delta * page_bytes` fuel and writes the
+/// new watermark record back (the `pages` field changed). Index-routed twin of `grow`.
+pub fn grow_at(mem_idx: Int, delta: Int) -> Int {
+  let #(result, updated) = a_grow(current_atomics_at(mem_idx), delta)
+  case result {
+    -1 -> -1
+    old -> {
+      rt_meter.charge(delta * rt_mem.page_bytes)
+      rt_state.with_mem_at(mem_idx, atomics_to_dynamic(updated))
+      old
+    }
+  }
+}
+
+/// Write an active DATA segment into memory `mem_idx` at instantiation. The `ref` mutates in place
+/// (no `mem_put`); returns `Ok(Nil)` or `Error(MemoryOutOfBounds)` (nothing written). Index-routed
+/// twin of `init_data`. See `a_init_data`.
+pub fn init_data_at(
+  mem_idx: Int,
+  offset: Int,
+  bytes: BitArray,
+) -> Result(Nil, TrapReason) {
+  case a_init_data(current_atomics_at(mem_idx), offset, bytes) {
+    Ok(_a) -> Ok(Nil)
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// `memory.fill` on memory `mem_idx`. Eager bounds (R10); on success mutates in place (no
+/// `mem_put`), charges `count` fuel (R9/§F), and returns `Ok(Nil)`, else `Error(MemoryOutOfBounds)`
+/// with ZERO mutation and NO charge. See `a_fill`.
+pub fn fill(
+  mem_idx: Int,
+  dest: Int,
+  value: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  case a_fill(current_atomics_at(mem_idx), dest, value, count) {
+    Ok(_a) -> {
+      rt_meter.charge(count)
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// `memory.copy` from memory `src_mem` to `dst_mem` (memmove, R11; cross-memory when the indices
+/// differ — two `ref`s projected independently). Eager bounds on BOTH ranges (R10); on success
+/// mutates `dst_mem`'s `ref` in place, charges `count` fuel ONCE (R9), returns `Ok(Nil)`, else
+/// `Error(MemoryOutOfBounds)` with ZERO mutation. See `a_copy`.
+pub fn copy(
+  dst_mem: Int,
+  src_mem: Int,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  case
+    a_copy(
+      current_atomics_at(dst_mem),
+      current_atomics_at(src_mem),
+      dst,
+      src,
+      count,
+    )
+  {
+    Ok(_a) -> {
+      rt_meter.charge(count)
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// `memory.init` into memory `mem_idx` from segment bytes `seg` (ε if dropped, R2). Eager bounds on
+/// BOTH the segment and the memory (R10) — dropped segment traps for `count > 0`, no-ops for
+/// `count = 0`. On success mutates in place, charges `count` fuel (R9), returns `Ok(Nil)`, else
+/// `Error(MemoryOutOfBounds)` with ZERO mutation. See `a_init`.
+pub fn init(
+  mem_idx: Int,
+  seg: BitArray,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  case a_init(current_atomics_at(mem_idx), seg, dst, src, count) {
+    Ok(_a) -> {
+      rt_meter.charge(count)
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
 // ───────────────────────────── threaded wrappers (state_strategy: Threaded) ─────────────────────────────
 
 /// Threaded load (read-only): projects `st.mem`, drives `a_load`, leaves `st` UNCHANGED.
@@ -416,6 +644,149 @@ pub fn t_init_data(
 ) -> Result(InstanceState, TrapReason) {
   case a_init_data(project(st), offset, bytes) {
     Ok(_a) -> Ok(st)
+    Error(reason) -> Error(reason)
+  }
+}
+
+// ───────────────────────────── multi-memory + bulk threaded twins (Threaded strategy, R6/R7/R9) ─────────────────────────────
+//
+// The purely-functional twins: project memory `mem_idx` from the threaded record (`rt_state.
+// t_mem_at`) and drive the SAME pure `a_*` core (so cell ≡ threaded, including fuel). Because the
+// `ref` mutates IN PLACE, a mutator returns the SAME `st` (nothing to re-inject) — EXCEPT
+// `t_grow_at`, which moves the watermark and rebinds slot `mem_idx`. `t_*_at(st, 0, …)` is
+// byte-identical to the frozen `t_*` heads.
+
+/// Project memory `mem_idx`'s `Atomics` out of the threaded record (read-only). Fail-closed `panic`
+/// on an out-of-range index (via `rt_state.t_mem_at`).
+fn project_at(st: InstanceState, mem_idx: Int) -> Atomics {
+  dynamic_to_atomics(rt_state.t_mem_at(st, mem_idx))
+}
+
+/// Threaded `load` from memory `mem_idx` (read-only): `st` unchanged. See `a_load`.
+pub fn t_load_at(
+  st: InstanceState,
+  mem_idx: Int,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Result(Int, TrapReason) {
+  a_load(project_at(st, mem_idx), bytes, signed, result_width, addr, offset)
+}
+
+/// Threaded `store` into memory `mem_idx`: the `ref` mutates in place → returns the SAME `st`, or
+/// `Error(MemoryOutOfBounds)` (zero mutation). See `a_store`.
+pub fn t_store_at(
+  st: InstanceState,
+  mem_idx: Int,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> Result(InstanceState, TrapReason) {
+  case a_store(project_at(st, mem_idx), bytes, addr, value, offset) {
+    Ok(_a) -> Ok(st)
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `memory.size` of memory `mem_idx` (read-only). See `a_size`.
+pub fn t_size_at(st: InstanceState, mem_idx: Int) -> Int {
+  a_size(project_at(st, mem_idx))
+}
+
+/// Threaded `memory.grow` of memory `mem_idx`. Returns `#(prev_pages, st')` (slot `mem_idx` rebound
+/// to the new watermark record + `delta * page_bytes` fuel charged on success), or `#(-1, st)` past
+/// the cap (unchanged, no charge). See `a_grow`.
+pub fn t_grow_at(
+  st: InstanceState,
+  mem_idx: Int,
+  delta: Int,
+) -> #(Int, InstanceState) {
+  let #(result, updated) = a_grow(project_at(st, mem_idx), delta)
+  case result {
+    -1 -> #(-1, st)
+    old -> {
+      rt_meter.charge(delta * rt_mem.page_bytes)
+      #(old, rt_state.t_with_mem_at(st, mem_idx, atomics_to_dynamic(updated)))
+    }
+  }
+}
+
+/// Threaded active-data-segment write into memory `mem_idx`: the `ref` mutates in place → returns
+/// the SAME `st`, or `Error(MemoryOutOfBounds)` (nothing written). See `a_init_data`.
+pub fn t_init_data_at(
+  st: InstanceState,
+  mem_idx: Int,
+  offset: Int,
+  bytes: BitArray,
+) -> Result(InstanceState, TrapReason) {
+  case a_init_data(project_at(st, mem_idx), offset, bytes) {
+    Ok(_a) -> Ok(st)
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `memory.fill` on memory `mem_idx`. Eager bounds (R10); on success mutates in place,
+/// charges `count` fuel (R9), returns the SAME `st`, else `Error(MemoryOutOfBounds)` with ZERO
+/// mutation and NO charge. See `a_fill`.
+pub fn t_fill(
+  st: InstanceState,
+  mem_idx: Int,
+  dest: Int,
+  value: Int,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  case a_fill(project_at(st, mem_idx), dest, value, count) {
+    Ok(_a) -> {
+      rt_meter.charge(count)
+      Ok(st)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `memory.copy` from memory `src_mem` to `dst_mem` (memmove, R11; cross-memory when the
+/// indices differ). Eager bounds on BOTH ranges (R10); on success mutates `dst_mem`'s `ref` in
+/// place, charges `count` fuel ONCE (R9), returns the SAME `st`, else `Error(MemoryOutOfBounds)`
+/// with ZERO mutation. See `a_copy`.
+pub fn t_copy(
+  st: InstanceState,
+  dst_mem: Int,
+  src_mem: Int,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  case
+    a_copy(project_at(st, dst_mem), project_at(st, src_mem), dst, src, count)
+  {
+    Ok(_a) -> {
+      rt_meter.charge(count)
+      Ok(st)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `memory.init` into memory `mem_idx` from segment bytes `seg` (ε if dropped, R2). Eager
+/// bounds on BOTH the segment and the memory (R10); on success mutates in place, charges `count`
+/// fuel (R9), returns the SAME `st`, else `Error(MemoryOutOfBounds)` with ZERO mutation. See
+/// `a_init`.
+pub fn t_init(
+  st: InstanceState,
+  mem_idx: Int,
+  seg: BitArray,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  case a_init(project_at(st, mem_idx), seg, dst, src, count) {
+    Ok(_a) -> {
+      rt_meter.charge(count)
+      Ok(st)
+    }
     Error(reason) -> Error(reason)
   }
 }
@@ -552,8 +923,8 @@ fn write_field(a: Atomics, ix: Int, pos: Int, len: Int, bits: Int) -> Nil {
 }
 
 /// Write an arbitrary-length `bytes` BitArray into memory starting at `ea`, one byte per
-/// single-byte `scatter`. Callers MUST have bounds-checked the whole range (`a_init_data`).
-/// Instantiation-time only; O(len). Empty `bytes` is a no-op.
+/// single-byte `scatter`. Callers MUST have bounds-checked the whole range (`a_init_data`/
+/// `a_copy`/`a_init`). O(len). Empty `bytes` is a no-op.
 fn write_data_loop(a: Atomics, ea: Int, bytes: BitArray) -> Nil {
   case bytes {
     <<b:size(8), rest:bits>> -> {
@@ -561,6 +932,49 @@ fn write_data_loop(a: Atomics, ea: Int, bytes: BitArray) -> Nil {
       write_data_loop(a, ea + 1, rest)
     }
     _ -> Nil
+  }
+}
+
+/// Scatter `count` copies of `byte` (`0..255`) starting at `ea`, one single-byte `scatter` each —
+/// the `a_fill` body. Callers MUST have bounds-checked. O(count). `count <= 0` is a no-op.
+fn fill_loop(a: Atomics, ea: Int, byte: Int, count: Int) -> Nil {
+  case count <= 0 {
+    True -> Nil
+    False -> {
+      scatter(a, ea, byte, 1)
+      fill_loop(a, ea + 1, byte, count - 1)
+    }
+  }
+}
+
+/// Gather `count` bytes starting at `ea` into an immutable little-endian `BitArray` snapshot — the
+/// source snapshot `a_copy` takes BEFORE writing (so overlap is memmove-correct). Reads one byte
+/// per single-byte `gather`. Callers MUST have bounds-checked. O(count); `count <= 0` yields `<<>>`.
+fn gather_bytes(a: Atomics, ea: Int, count: Int) -> BitArray {
+  gather_loop(a, ea, count, <<>>)
+}
+
+fn gather_loop(a: Atomics, ea: Int, remaining: Int, acc: BitArray) -> BitArray {
+  case remaining <= 0 {
+    True -> acc
+    False ->
+      gather_loop(a, ea + 1, remaining - 1, <<
+        acc:bits,
+        { gather(a, ea, 1) }:size(8),
+      >>)
+  }
+}
+
+/// Slice `len` bytes from `bin` at byte offset `at` (zero-copy sub-binary) — the segment slice
+/// `a_init` splices. Short-circuits `len <= 0` to `<<>>`. Callers MUST guarantee `at + len` is in
+/// range (the eager bounds check does).
+fn take(bin: BitArray, at: Int, len: Int) -> BitArray {
+  case len <= 0 {
+    True -> <<>>
+    False -> {
+      let assert Ok(slice) = bit_array.slice(bin, at, len)
+      slice
+    }
   }
 }
 

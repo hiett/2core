@@ -33,6 +33,29 @@
 //// explicit spec-corner tests and differentially tested against `paged`. Memory is a BEAM
 //// immutable binary, so a bounds bug's worst case is a wrong/missing trap or a node-safe
 //// crash — never a host out-of-bounds read. Tier P/O, never NIF.
+////
+//// **Phase-5 additive surface (bulk memory + multi-memory).** This unit (P5-08) adds — WITHOUT
+//// touching the frozen Phase-2/4 heads — the finalized bulk-memory ops (`memory.fill`/`copy`/
+//// `init`; the bulk-memory proposal / exec §4.4.9) and the multi-memory index routing. The new
+//// capability is:
+//// - **Pure paged core** `mem_fill`/`mem_copy`/`mem_init` — value-threaded, charge-free, the
+////   testable algebra. Every bulk op checks its WHOLE range up front (strict `>` bounds, R10) and
+////   mutates ZERO bytes on a trap (all-or-nothing). `mem_copy` is memmove (snapshot-then-write, so
+////   overlap is correct in either direction and same-vs-cross-memory copy share one path, R11).
+//// - **Index-routed cell/threaded wrappers** `fill`/`copy`/`init` + the `_at` load/store/size/
+////   grow/init_data variants — they project memory `mem_idx` from the `rt_state` memories vector
+////   (`mem_at(i)`/`with_mem_at(i,_)` cell; `t_mem_at(st,i)`/`t_with_mem_at(st,i,_)` threaded),
+////   drive the pure core, and persist. The frozen non-indexed heads are the byte-identical
+////   index-0 path (H7): a single-memory-index-0 module emits the SAME calls and runs identically.
+//// - **Fuel (R9/§F):** each O(count) bulk-op WRAPPER charges `rt_meter.charge(count)` on the
+////   SUCCESS path, identically on cell and threaded (so metered+threaded is byte-identical to
+////   metered+cell); the pure cores stay charge-free. A trapping op charges nothing.
+//// - **Data-segment payload (R2):** `mem_init`/`init` take the segment's CURRENT bytes as a
+////   `BitArray` argument (ε when dropped) — `emit_core` (06) projects them and does the drop-check;
+////   `rt_mem` stays a pure byte-mover and never reads `rt_state` drop-state.
+//// - **memory64 (R12):** the runtime is DEFERRED to Phase 6 — `lower` rejects `Idx64`, so only
+////   32-bit memories reach here; no i64 page cap / `fresh64` is implemented (it would slot into
+////   `fresh`/`effective_max` as a per-width `hard_cap`).
 
 import gleam/bit_array
 import gleam/dict.{type Dict}
@@ -195,6 +218,156 @@ fn current_mem() -> Mem {
   dynamic_to_mem(rt_state.mem_get())
 }
 
+// ───────────────────────────── multi-memory + bulk cell wrappers (Cell strategy, R6/R7/R9) ─────────────────────────────
+//
+// The index-routed cell family: each op projects memory `mem_idx` from the memories vector via
+// `rt_state.mem_at`/`with_mem_at` (index 0 = the default memory, so `load_at(0,…) ≡ load(…)` — the
+// frozen heads above are the byte-identical index-0 path), drives the SAME pure `mem_*` core the
+// frozen heads use, and — for a mutator — rebinds slot `mem_idx` to the NEW `Mem` (paged memory is
+// immutable). The bulk ops (`fill`/`copy`/`init`) charge `count` fuel on the SUCCESS path (R9/§F).
+
+/// Read memory `mem_idx`'s `Mem` out of this process's cell. Fail-closed on an un-seeded cell (via
+/// `rt_state`); an out-of-range index is an internal invariant violation (unreachable
+/// post-validation) that `rt_state.mem_at` `panic`s on.
+fn current_mem_at(mem_idx: Int) -> Mem {
+  dynamic_to_mem(rt_state.mem_at(mem_idx))
+}
+
+/// `load` on memory `mem_idx` (read-only). The index-routed twin of `load`; `load_at(0,…)` is
+/// byte-identical to `load(…)`. Returns `Ok(bits)` or `Error(MemoryOutOfBounds)`. See `mem_load`.
+pub fn load_at(
+  mem_idx: Int,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Result(Int, TrapReason) {
+  mem_load(current_mem_at(mem_idx), bytes, signed, result_width, addr, offset)
+}
+
+/// `store` on memory `mem_idx`. Bounds-checks first (trap-before-write); on success rebinds slot
+/// `mem_idx` to the new `Mem` and returns `Ok(Nil)`, else `Error(MemoryOutOfBounds)` (zero
+/// mutation). The index-routed twin of `store`. See `mem_store`.
+pub fn store_at(
+  mem_idx: Int,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> Result(Nil, TrapReason) {
+  case mem_store(current_mem_at(mem_idx), bytes, addr, value, offset) {
+    Ok(updated) -> {
+      rt_state.with_mem_at(mem_idx, mem_to_dynamic(updated))
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// `memory.size` of memory `mem_idx`, in 64 KiB pages. The index-routed twin of `size`.
+pub fn size_at(mem_idx: Int) -> Int {
+  mem_size(current_mem_at(mem_idx))
+}
+
+/// `memory.grow` memory `mem_idx` by `delta` pages. Returns the PREVIOUS size, or `-1` past the
+/// max/cap (allocating nothing, charging nothing). On success charges `delta * page_bytes` fuel
+/// (parity with `grow`) and rebinds slot `mem_idx`. The index-routed twin of `grow`.
+pub fn grow_at(mem_idx: Int, delta: Int) -> Int {
+  let #(result, updated) = mem_grow(current_mem_at(mem_idx), delta)
+  case result {
+    -1 -> -1
+    old -> {
+      rt_meter.charge(delta * page_bytes)
+      rt_state.with_mem_at(mem_idx, mem_to_dynamic(updated))
+      old
+    }
+  }
+}
+
+/// Write an active DATA segment's `bytes` into memory `mem_idx` at `offset`, at instantiation.
+/// Whole-range bounds-checked (no-wrap). On success rebinds slot `mem_idx`; else
+/// `Error(MemoryOutOfBounds)` (nothing written). The index-routed twin of `init_data`.
+pub fn init_data_at(
+  mem_idx: Int,
+  offset: Int,
+  bytes: BitArray,
+) -> Result(Nil, TrapReason) {
+  case mem_init_data(current_mem_at(mem_idx), offset, bytes) {
+    Ok(updated) -> {
+      rt_state.with_mem_at(mem_idx, mem_to_dynamic(updated))
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// `memory.fill` on memory `mem_idx`: fill `count` bytes at `dest` with `value & 0xFF`. Eager
+/// bounds (trap-before-write, R10). On success charges `count` fuel (R9/§F) and rebinds slot
+/// `mem_idx`; else `Error(MemoryOutOfBounds)` with ZERO mutation and NO charge. See `mem_fill`.
+pub fn fill(
+  mem_idx: Int,
+  dest: Int,
+  value: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  case mem_fill(current_mem_at(mem_idx), dest, value, count) {
+    Ok(updated) -> {
+      rt_meter.charge(count)
+      rt_state.with_mem_at(mem_idx, mem_to_dynamic(updated))
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// `memory.copy` from memory `src_mem` to memory `dst_mem` (memmove, R11): copy `count` bytes
+/// `src → dst`. Cross-memory when `dst_mem != src_mem` (the two slots are projected independently);
+/// same-index when equal (the same handle drives both operands, still memmove-correct because the
+/// source region is snapshotted first). Eager bounds on BOTH ranges (R10). On success charges
+/// `count` fuel ONCE (R9) and rebinds slot `dst_mem`; else `Error(MemoryOutOfBounds)` with ZERO
+/// mutation. See `mem_copy`.
+pub fn copy(
+  dst_mem: Int,
+  src_mem: Int,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  case
+    mem_copy(current_mem_at(dst_mem), current_mem_at(src_mem), dst, src, count)
+  {
+    Ok(updated) -> {
+      rt_meter.charge(count)
+      rt_state.with_mem_at(dst_mem, mem_to_dynamic(updated))
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// `memory.init` into memory `mem_idx` from data segment bytes `seg` (ε if dropped, R2 — supplied
+/// by `emit_core`): copy `count` bytes `src → dst`. Eager bounds on BOTH the segment and the
+/// memory (R10) — a dropped segment traps for `count > 0`, no-ops for `count = 0`. On success
+/// charges `count` fuel (R9) and rebinds slot `mem_idx`; else `Error(MemoryOutOfBounds)` with ZERO
+/// mutation. See `mem_init`.
+pub fn init(
+  mem_idx: Int,
+  seg: BitArray,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  case mem_init(current_mem_at(mem_idx), seg, dst, src, count) {
+    Ok(updated) -> {
+      rt_meter.charge(count)
+      rt_state.with_mem_at(mem_idx, mem_to_dynamic(updated))
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
 // ───────────────────────────── tier-P threaded wrappers (state_strategy: Threaded) ─────────────────────────────
 //
 // The purely-functional twin of the cell-backed API above (Phase-4 keystone §A.2, owner unit
@@ -278,6 +451,164 @@ pub fn t_init_data(
 ) -> Result(rt_state.InstanceState, TrapReason) {
   case mem_init_data(from_dynamic(rt_state.mem(st)), offset, bytes) {
     Ok(updated) -> Ok(rt_state.with_mem(st, mem_to_dynamic(updated)))
+    Error(reason) -> Error(reason)
+  }
+}
+
+// ───────────────────────────── multi-memory + bulk threaded twins (Threaded strategy, R6/R7/R9) ─────────────────────────────
+//
+// The purely-functional twins of the cell family above: project memory `mem_idx` from the threaded
+// record's memories vector (`rt_state.t_mem_at`), drive the SAME pure `mem_*` core, and re-inject
+// via `rt_state.t_with_mem_at` — so cell ≡ threaded byte-for-byte (G7), including fuel. `t_*_at(st,
+// 0, …)` is byte-identical to the frozen `t_*` heads. Reads leave `st` untouched; a mutator returns
+// the rebound record (paged memory is immutable → a new `Mem` in slot `mem_idx`).
+
+/// Project memory `mem_idx`'s `Mem` out of the threaded record (read-only). Fail-closed `panic` on
+/// an out-of-range index (via `rt_state.t_mem_at`).
+fn project_mem_at(st: rt_state.InstanceState, mem_idx: Int) -> Mem {
+  from_dynamic(rt_state.t_mem_at(st, mem_idx))
+}
+
+/// Threaded `load` on memory `mem_idx` (read-only): `st` unchanged. See `mem_load`.
+pub fn t_load_at(
+  st: rt_state.InstanceState,
+  mem_idx: Int,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Result(Int, TrapReason) {
+  mem_load(
+    project_mem_at(st, mem_idx),
+    bytes,
+    signed,
+    result_width,
+    addr,
+    offset,
+  )
+}
+
+/// Threaded `store` on memory `mem_idx`. Bounds-checks first; on success returns `Ok(st')` with
+/// slot `mem_idx` rebound to the new `Mem`, else `Error(MemoryOutOfBounds)` (`st` untouched, zero
+/// mutation). See `mem_store`.
+pub fn t_store_at(
+  st: rt_state.InstanceState,
+  mem_idx: Int,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> Result(rt_state.InstanceState, TrapReason) {
+  case mem_store(project_mem_at(st, mem_idx), bytes, addr, value, offset) {
+    Ok(updated) ->
+      Ok(rt_state.t_with_mem_at(st, mem_idx, mem_to_dynamic(updated)))
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `memory.size` of memory `mem_idx` (read-only). See `mem_size`.
+pub fn t_size_at(st: rt_state.InstanceState, mem_idx: Int) -> Int {
+  mem_size(project_mem_at(st, mem_idx))
+}
+
+/// Threaded `memory.grow` of memory `mem_idx`. Returns `#(prev_pages, st')` (slot `mem_idx`
+/// rebound + `delta * page_bytes` fuel charged on success), or `#(-1, st)` past the cap
+/// (unchanged, no charge). See `mem_grow`.
+pub fn t_grow_at(
+  st: rt_state.InstanceState,
+  mem_idx: Int,
+  delta: Int,
+) -> #(Int, rt_state.InstanceState) {
+  let #(result, updated) = mem_grow(project_mem_at(st, mem_idx), delta)
+  case result {
+    -1 -> #(-1, st)
+    old -> {
+      rt_meter.charge(delta * page_bytes)
+      #(old, rt_state.t_with_mem_at(st, mem_idx, mem_to_dynamic(updated)))
+    }
+  }
+}
+
+/// Threaded active-data-segment write into memory `mem_idx` at instantiation. On success returns
+/// `Ok(st')` (slot rebound), else `Error(MemoryOutOfBounds)` (nothing written). See `mem_init_data`.
+pub fn t_init_data_at(
+  st: rt_state.InstanceState,
+  mem_idx: Int,
+  offset: Int,
+  bytes: BitArray,
+) -> Result(rt_state.InstanceState, TrapReason) {
+  case mem_init_data(project_mem_at(st, mem_idx), offset, bytes) {
+    Ok(updated) ->
+      Ok(rt_state.t_with_mem_at(st, mem_idx, mem_to_dynamic(updated)))
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `memory.fill` on memory `mem_idx`. Eager bounds (R10); on success returns `Ok(st')`
+/// (slot rebound) charging `count` fuel (R9), else `Error(MemoryOutOfBounds)` with ZERO mutation
+/// and NO charge. See `mem_fill`.
+pub fn t_fill(
+  st: rt_state.InstanceState,
+  mem_idx: Int,
+  dest: Int,
+  value: Int,
+  count: Int,
+) -> Result(rt_state.InstanceState, TrapReason) {
+  case mem_fill(project_mem_at(st, mem_idx), dest, value, count) {
+    Ok(updated) -> {
+      rt_meter.charge(count)
+      Ok(rt_state.t_with_mem_at(st, mem_idx, mem_to_dynamic(updated)))
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `memory.copy` from memory `src_mem` to `dst_mem` (memmove, R11; cross-memory when the
+/// indices differ). Eager bounds on BOTH ranges (R10); on success returns `Ok(st')` (slot `dst_mem`
+/// rebound) charging `count` fuel ONCE (R9), else `Error(MemoryOutOfBounds)` with ZERO mutation.
+/// See `mem_copy`.
+pub fn t_copy(
+  st: rt_state.InstanceState,
+  dst_mem: Int,
+  src_mem: Int,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(rt_state.InstanceState, TrapReason) {
+  case
+    mem_copy(
+      project_mem_at(st, dst_mem),
+      project_mem_at(st, src_mem),
+      dst,
+      src,
+      count,
+    )
+  {
+    Ok(updated) -> {
+      rt_meter.charge(count)
+      Ok(rt_state.t_with_mem_at(st, dst_mem, mem_to_dynamic(updated)))
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `memory.init` into memory `mem_idx` from segment bytes `seg` (ε if dropped, R2). Eager
+/// bounds on BOTH the segment and the memory (R10); on success returns `Ok(st')` (slot rebound)
+/// charging `count` fuel (R9), else `Error(MemoryOutOfBounds)` with ZERO mutation. See `mem_init`.
+pub fn t_init(
+  st: rt_state.InstanceState,
+  mem_idx: Int,
+  seg: BitArray,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(rt_state.InstanceState, TrapReason) {
+  case mem_init(project_mem_at(st, mem_idx), seg, dst, src, count) {
+    Ok(updated) -> {
+      rt_meter.charge(count)
+      Ok(rt_state.t_with_mem_at(st, mem_idx, mem_to_dynamic(updated)))
+    }
     Error(reason) -> Error(reason)
   }
 }
@@ -377,6 +708,92 @@ pub fn mem_init_data(
   case offset >= 0 && offset + len <= byte_len(m) {
     False -> Error(MemoryOutOfBounds)
     True -> Ok(write_bytes(m, offset, bytes))
+  }
+}
+
+/// Pure `memory.fill`: set `count` bytes at `dest` to the LOW byte of `value` (`value & 0xFF`).
+///
+/// - `dest`: the destination byte offset.
+/// - `value`: an i32; only `value & 0xFF` is written (e.g. `fill(d, 0x12345678, 4)` writes
+///   `78 78 78 78`).
+/// - `count`: the number of bytes to write.
+/// - Eager bounds (spec §4.4.9, R10): traps `Error(MemoryOutOfBounds)` iff `dest < 0`,
+///   `count < 0`, or `dest + count > byte_len(m)` — checked UNCONDITIONALLY (`dest = byte_len,
+///   count = 0` succeeds; `dest > byte_len, count = 0` traps). No `count == 0` short-circuit.
+/// - Returns `Ok(new_mem)` on success (the input `Mem` returned untouched on trap — ZERO mutation,
+///   including any in-bounds prefix). Charge-free (the cell/threaded wrapper charges `count` fuel).
+pub fn mem_fill(
+  m: Mem,
+  dest: Int,
+  value: Int,
+  count: Int,
+) -> Result(Mem, TrapReason) {
+  case dest >= 0 && count >= 0 && dest + count <= byte_len(m) {
+    False -> Error(MemoryOutOfBounds)
+    True ->
+      Ok(write_bytes(m, dest, repeat_byte(int.bitwise_and(value, 0xFF), count)))
+  }
+}
+
+/// Pure `memory.copy` (memmove, R11): copy `count` bytes from `src` in `src_m` to `dst` in
+/// `dst_m`.
+///
+/// - `dst_m`/`src_m`: the destination and source memories. They are the SAME value for a
+///   same-index copy, and DISTINCT for a cross-memory copy (`memory.copy dstmemidx srcmemidx`);
+///   the wrapper projects both from the memories vector. Overlap is correct in either direction
+///   because the source region is snapshotted from the immutable `src_m` BEFORE any destination
+///   byte is rebuilt (snapshot-then-write ≡ memmove).
+/// - `dst`/`src`/`count`: destination offset, source offset, byte count.
+/// - Eager bounds (spec §4.4.9, R10): traps `Error(MemoryOutOfBounds)` iff any of `dst`, `src`,
+///   `count` is negative, `src + count > byte_len(src_m)`, or `dst + count > byte_len(dst_m)` —
+///   BEFORE any write (ZERO mutation on trap).
+/// - Returns `Ok(new_dst_m)` (the rebuilt destination). Charge-free.
+pub fn mem_copy(
+  dst_m: Mem,
+  src_m: Mem,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Mem, TrapReason) {
+  case
+    src >= 0
+    && dst >= 0
+    && count >= 0
+    && src + count <= byte_len(src_m)
+    && dst + count <= byte_len(dst_m)
+  {
+    False -> Error(MemoryOutOfBounds)
+    True -> Ok(write_bytes(dst_m, dst, read_bytes(src_m, src, count)))
+  }
+}
+
+/// Pure `memory.init` from a data segment's CURRENT bytes `seg` (ε when the segment was dropped,
+/// R2): copy `count` bytes from `src` in `seg` to `dst` in `m`.
+///
+/// - `seg`: the segment's current bytes — supplied by `emit_core` (06) after its drop-check, NOT
+///   read from `rt_state` (rt_mem stays a pure byte-mover). A dropped segment arrives as `<<>>`.
+/// - `dst`/`src`/`count`: destination memory offset, source segment offset, byte count.
+/// - Eager bounds (spec §4.4.9, R10): traps `Error(MemoryOutOfBounds)` iff any of `dst`, `src`,
+///   `count` is negative, `src + count > byte_size(seg)` (the segment bound — so `init` from a
+///   dropped/ε segment with `count > 0` TRAPS and with `count = 0` is a no-op), or
+///   `dst + count > byte_len(m)` — BEFORE any write (ZERO mutation on trap).
+/// - Returns `Ok(new_mem)`. Charge-free.
+pub fn mem_init(
+  m: Mem,
+  seg: BitArray,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Mem, TrapReason) {
+  case
+    src >= 0
+    && dst >= 0
+    && count >= 0
+    && src + count <= bit_array.byte_size(seg)
+    && dst + count <= byte_len(m)
+  {
+    False -> Error(MemoryOutOfBounds)
+    True -> Ok(write_bytes(m, dst, take(seg, src, count)))
   }
 }
 
@@ -497,6 +914,82 @@ pub fn o_init_data(
   }
 }
 
+/// Oracle `memory.fill` (same contract as `mem_fill`): bounds-check, then splice `count` copies of
+/// `value & 0xFF` into the flat binary. Trivially memmove-/eager-bounds-correct by construction.
+pub fn o_fill(
+  o: OMem,
+  dest: Int,
+  value: Int,
+  count: Int,
+) -> Result(OMem, TrapReason) {
+  let limit = o.pages * page_bytes
+  case dest >= 0 && count >= 0 && dest + count <= limit {
+    False -> Error(MemoryOutOfBounds)
+    True -> {
+      let new_bytes = repeat_byte(int.bitwise_and(value, 0xFF), count)
+      let pre = take(o.data, 0, dest)
+      let post = take(o.data, dest + count, limit - dest - count)
+      Ok(OMem(..o, data: <<pre:bits, new_bytes:bits, post:bits>>))
+    }
+  }
+}
+
+/// Oracle `memory.copy` (same contract as `mem_copy`): slice the source region from the OLD
+/// `src_o` binary (→ memmove-correct), then splice it into `dst_o`.
+pub fn o_copy(
+  dst_o: OMem,
+  src_o: OMem,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(OMem, TrapReason) {
+  let dst_limit = dst_o.pages * page_bytes
+  let src_limit = src_o.pages * page_bytes
+  case
+    src >= 0
+    && dst >= 0
+    && count >= 0
+    && src + count <= src_limit
+    && dst + count <= dst_limit
+  {
+    False -> Error(MemoryOutOfBounds)
+    True -> {
+      let region = take(src_o.data, src, count)
+      let pre = take(dst_o.data, 0, dst)
+      let post = take(dst_o.data, dst + count, dst_limit - dst - count)
+      Ok(OMem(..dst_o, data: <<pre:bits, region:bits, post:bits>>))
+    }
+  }
+}
+
+/// Oracle `memory.init` from `seg`'s current bytes (same contract as `mem_init`): slice
+/// `seg[src..src+count)` and splice it into the flat binary. A dropped/ε segment traps for
+/// `count > 0` (the `src + count <= byte_size(seg)` bound) and no-ops for `count = 0`.
+pub fn o_init(
+  o: OMem,
+  seg: BitArray,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(OMem, TrapReason) {
+  let limit = o.pages * page_bytes
+  case
+    src >= 0
+    && dst >= 0
+    && count >= 0
+    && src + count <= bit_array.byte_size(seg)
+    && dst + count <= limit
+  {
+    False -> Error(MemoryOutOfBounds)
+    True -> {
+      let region = take(seg, src, count)
+      let pre = take(o.data, 0, dst)
+      let post = take(o.data, dst + count, limit - dst - count)
+      Ok(OMem(..o, data: <<pre:bits, region:bits, post:bits>>))
+    }
+  }
+}
+
 /// Oracle `memory.size`.
 pub fn o_size(o: OMem) -> Int {
   o.pages
@@ -513,6 +1006,25 @@ pub fn o_flat(o: OMem) -> BitArray {
 /// `2^n` as a BEAM bignum (used for sign-extension widths beyond 62 bits).
 fn pow2(n: Int) -> Int {
   int.bitwise_shift_left(1, n)
+}
+
+/// Build a `count`-byte `BitArray` every byte of which is `byte` (`0..255`) — the constant fill
+/// payload `mem_fill` splices. A DOUBLING builder (O(log count) concatenations of off-heap REFC
+/// binaries) so a large fill does not do `count` small allocations. `count <= 0` yields `<<>>`
+/// (so `write_bytes` is a no-op → the spec `n = 0` case). The builder doubles `acc` until it is
+/// at least `count` bytes, then slices to exactly `count` (a zero-copy sub-binary).
+fn repeat_byte(byte: Int, count: Int) -> BitArray {
+  case count <= 0 {
+    True -> <<>>
+    False -> repeat_double(<<byte:size(8)>>, count)
+  }
+}
+
+fn repeat_double(acc: BitArray, count: Int) -> BitArray {
+  case bit_array.byte_size(acc) >= count {
+    True -> take(acc, 0, count)
+    False -> repeat_double(<<acc:bits, acc:bits>>, count)
+  }
 }
 
 /// The effective max in pages baked at `fresh` time: the smallest of the declared max (when
