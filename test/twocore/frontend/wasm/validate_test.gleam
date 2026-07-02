@@ -13,6 +13,7 @@
 //// fault, exactly what `validate` must catch.
 
 import gleam/option.{None, Some}
+import gleam/set
 import gleeunit/should
 import twocore/frontend/wasm/ast
 import twocore/frontend/wasm/decode
@@ -63,6 +64,16 @@ fn mem(min: Int, max: option.Option(Int)) -> ast.MemType {
 /// A (funcref) table type with `min` entries and optional `max`.
 fn tbl(min: Int, max: option.Option(Int)) -> ast.TableType {
   ast.TableType(ast.FuncRef, ast.Limits(min, max))
+}
+
+/// A reference-typed table with element reftype `ref_ty` (`FuncRef`/`ExternRef`).
+fn rtbl(ref_ty: ast.ValType, min: Int) -> ast.TableType {
+  ast.TableType(ref_ty, ast.Limits(min, option.None))
+}
+
+/// A 64-bit (memory64) memory type with `min` pages and optional `max`.
+fn mem64(min: Int, max: option.Option(Int)) -> ast.MemType {
+  ast.MemType(ast.Limits(min, max), ast.Idx64)
 }
 
 /// An otherwise-empty module; callers override the fields they exercise.
@@ -609,8 +620,10 @@ pub fn reject_global_set_out_of_range_test() {
   |> should.equal(Error(validate.UnknownGlobal(2)))
 }
 
-/// More than one memory (MVP: at most one) — rejected (spec/MVP module limits).
-pub fn reject_multiple_memories_test() {
+/// More than one memory is now VALID (H3 lifts the Phase-2 `≤1 memory` MVP cap — the
+/// multi-memory proposal is merged into the core spec). Each memory's limits are still
+/// validated (spec `valid/modules`).
+pub fn accept_multiple_memories_test() {
   module(
     types: [],
     tables: [],
@@ -622,11 +635,14 @@ pub fn reject_multiple_memories_test() {
     data: [],
   )
   |> validate.validate()
-  |> should.equal(Error(validate.TooManyMemories))
+  |> is_ok()
+  |> should.equal(True)
 }
 
-/// More than one table (MVP: at most one) — rejected (spec/MVP module limits).
-pub fn reject_multiple_tables_test() {
+/// More than one table is now VALID (H3 lifts the Phase-2 `≤1 table` MVP cap — the
+/// reference-types proposal permits multiple tables). Each table's limits are still
+/// validated (spec `valid/modules`).
+pub fn accept_multiple_tables_test() {
   module(
     types: [],
     tables: [tbl(1, None), tbl(1, None)],
@@ -638,7 +654,8 @@ pub fn reject_multiple_tables_test() {
     data: [],
   )
   |> validate.validate()
-  |> should.equal(Error(validate.TooManyTables))
+  |> is_ok()
+  |> should.equal(True)
 }
 
 /// A memory limit with `min > max` is invalid (spec `valid/types`: `min <= max`).
@@ -712,6 +729,955 @@ pub fn reject_element_func_out_of_range_test() {
   )
   |> validate.validate()
   |> should.equal(Error(validate.UnknownFunc(5)))
+}
+
+// ═════════════════════════ Phase-5 (unit P5-04) acceptance ═════════════════════════
+// Spec `valid/instructions` + `valid/modules` + the reference-types / bulk-memory /
+// multi-memory / memory64 proposals. Well-typed modules over the completed surface
+// must be ACCEPTED. Hand-built so we control reftypes / index spaces / segment modes.
+
+/// `ref.null func` / `ref.null extern` each push their reftype; `ref.is_null` pops a
+/// reference and pushes `i32` (spec `valid/instructions` §reference; `ref_null.wast`,
+/// `ref_is_null.wast`). Body: `ref.null func; ref.is_null; ref.null extern; ref.is_null;
+/// i32.add` → `i32`.
+pub fn accept_ref_null_is_null_test() {
+  module(
+    types: [ft([], [ast.I32])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.RefNull(ast.FuncRef),
+        ast.RefIsNull,
+        ast.RefNull(ast.ExternRef),
+        ast.RefIsNull,
+        ast.I32Add,
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// `ref.func x` of a **declared** function (declared via a function export → `C.refs`)
+/// is valid and pushes `funcref` (spec `valid/instructions` ref.func; `ref_func.wast`).
+pub fn accept_ref_func_declared_test() {
+  ast.Module(
+    imported_func_count: 0,
+    types: [ft([], [ast.FuncRef])],
+    imports: [],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.RefFunc(0), ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+    data_count: None,
+    exports: [ast.Export("f", ast.ExportFunc, 0)],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// A `ref.func` declared by a **declarative** element segment is in `C.refs` even
+/// though the segment materializes no table entry (spec: declarative segments exist
+/// solely to add funcidxs to `C.refs`; `elem.wast`).
+pub fn accept_ref_func_via_declarative_elem_test() {
+  module(
+    types: [ft([], [ast.FuncRef])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.RefFunc(0), ast.End])],
+    start: None,
+    elements: [
+      ast.ElementSegment(ast.ElemDeclarative, ast.FuncRef, ast.ElemFuncs([0])),
+    ],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// Typed `select (result funcref)` of two `funcref`s: annotation length 1, signature
+/// `[t t i32] → [t]` (spec parametric typed-select; `select.wast`). Reference operands
+/// are LEGAL for the typed form (unlike untyped `select`).
+pub fn accept_select_t_funcref_test() {
+  module(
+    types: [ft([], [ast.FuncRef])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.RefNull(ast.FuncRef),
+        ast.RefNull(ast.FuncRef),
+        ast.I32Const(0),
+        ast.SelectT([ast.FuncRef]),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// `table.get`/`table.set` on a `funcref` table AND on an `externref` table, routed by
+/// index — a module with TWO tables of DIFFERENT reftypes. `table.get x` pushes table
+/// x's reftype; `table.set x` pops it (spec `valid/instructions` §table;
+/// `table_get.wast`/`table_set.wast`).
+pub fn accept_table_get_set_two_reftypes_test() {
+  module(
+    types: [ft([], [])],
+    tables: [rtbl(ast.FuncRef, 1), rtbl(ast.ExternRef, 1)],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [
+        // table 0 (funcref): get then set back
+        ast.I32Const(0),
+        ast.TableGet(0),
+        ast.Drop,
+        ast.I32Const(0),
+        ast.RefNull(ast.FuncRef),
+        ast.TableSet(0),
+        // table 1 (externref): get then set back
+        ast.I32Const(0),
+        ast.TableGet(1),
+        ast.Drop,
+        ast.I32Const(0),
+        ast.RefNull(ast.ExternRef),
+        ast.TableSet(1),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// `table.size`/`table.grow`/`table.fill` with the correct init reftype (spec
+/// `valid/instructions` §table; `table_grow.wast`/`table_fill.wast`/`table_size.wast`).
+pub fn accept_table_size_grow_fill_test() {
+  module(
+    types: [ft([], [])],
+    tables: [rtbl(ast.ExternRef, 1)],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.TableSize(0),
+        ast.Drop,
+        // table.grow: [externref i32] -> [i32]
+        ast.RefNull(ast.ExternRef),
+        ast.I32Const(1),
+        ast.TableGrow(0),
+        ast.Drop,
+        // table.fill: [i32 externref i32] -> []
+        ast.I32Const(0),
+        ast.RefNull(ast.ExternRef),
+        ast.I32Const(1),
+        ast.TableFill(0),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// `memory.init`/`data.drop`/`memory.copy`/`memory.fill` on a 32-bit memory with a
+/// passive data segment (spec `valid/instructions` §memory; `bulk.wast`,
+/// `memory_init/copy/fill.wast`). All address/count operands are `i32`.
+pub fn accept_bulk_memory_32_test() {
+  module(
+    types: [ft([], [])],
+    tables: [],
+    memories: [mem(1, None)],
+    globals: [],
+    funcs: [
+      func_(0, [
+        // memory.init d=0 m=0 : [i32 i32 i32] -> []
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.MemoryInit(0, 0),
+        ast.DataDrop(0),
+        // memory.copy : [i32 i32 i32] -> []
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.MemoryCopy(0, 0),
+        // memory.fill : [i32 i32 i32] -> []
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.MemoryFill(0),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [ast.DataSegment(ast.DataPassive, <<1, 2, 3>>)],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// `table.init`/`elem.drop`/`table.copy` with matching reftypes (spec
+/// `valid/instructions` §table; `table_init.wast`/`table_copy.wast`). All operands
+/// `i32`; the passive element segment's reftype matches the target table.
+pub fn accept_bulk_table_matching_reftypes_test() {
+  module(
+    types: [ft([], [])],
+    tables: [rtbl(ast.FuncRef, 1), rtbl(ast.FuncRef, 1)],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [
+        // table.init e=0 t=0 : [i32 i32 i32] -> []
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.TableInit(0, 0),
+        ast.ElemDrop(0),
+        // table.copy dst=0 src=1 : [i32 i32 i32] -> []
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.TableCopy(0, 1),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [
+      ast.ElementSegment(ast.ElemPassive, ast.FuncRef, ast.ElemFuncs([])),
+    ],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// A module with **two memories** uses `memidx 1` on a load (spec/multi-memory
+/// proposal; `memory.wast`). The single-memory case is byte-identical (H7); routing
+/// by index is what multi-memory adds.
+pub fn accept_multi_memory_memidx1_test() {
+  module(
+    types: [ft([], [])],
+    tables: [],
+    memories: [mem(1, None), mem(1, None)],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I32Const(0),
+        ast.I32Load(ast.MemArg(align: 2, offset: 0, mem: 1)),
+        ast.Drop,
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// A **memory64** module: `i64.load`, `memory.size`/`memory.grow` all use `i64`
+/// addresses (spec/memory64 proposal). Validate ACCEPTS a valid memory64 module even
+/// though its runtime is deferred (R12).
+pub fn accept_memory64_i64_addressing_test() {
+  module(
+    types: [ft([], [])],
+    tables: [],
+    memories: [mem64(1, None)],
+    globals: [],
+    funcs: [
+      func_(0, [
+        // i64.load : address is i64 on a 64-bit memory
+        ast.I64Const(0),
+        ast.I64Load(ast.MemArg(align: 3, offset: 0, mem: 0)),
+        ast.Drop,
+        // memory.size : [] -> [i64]
+        ast.MemorySize(0),
+        ast.Drop,
+        // memory.grow : [i64] -> [i64]
+        ast.I64Const(1),
+        ast.MemoryGrow(0),
+        ast.Drop,
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// A `memory.copy` between a 64-bit (dst) and a 32-bit (src) memory: the count is typed
+/// as the **minimum** index type (`i32`), dst address `i64`, src address `i32`
+/// (spec/memory64 copy rule). Operand order bottom→top: dest(i64), src(i32), count(i32).
+pub fn accept_memory64_copy_min_index_type_test() {
+  module(
+    types: [ft([], [])],
+    tables: [],
+    memories: [mem64(1, None), mem(1, None)],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I64Const(0),
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.MemoryCopy(0, 1),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// A 64-bit memory limit of exactly `2^48` pages is in range (spec/memory64 limit
+/// range is `2^48` pages = `2^64` bytes ÷ 64 KiB).
+pub fn accept_memory64_limit_at_max_test() {
+  module(
+    types: [],
+    tables: [],
+    memories: [mem64(281_474_976_710_656, None)],
+    globals: [],
+    funcs: [],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// A passive element segment and a passive data segment type-check (only their
+/// reftype / const-init are checked; they carry no table/memory/offset — spec
+/// `valid/modules`).
+pub fn accept_passive_segments_test() {
+  module(
+    types: [ft([], [])],
+    tables: [rtbl(ast.FuncRef, 1)],
+    memories: [mem(1, None)],
+    globals: [],
+    funcs: [func_(0, [ast.End])],
+    start: None,
+    elements: [
+      ast.ElementSegment(
+        ast.ElemPassive,
+        ast.ExternRef,
+        ast.ElemExprs([[ast.RefNull(ast.ExternRef)]]),
+      ),
+    ],
+    data: [ast.DataSegment(ast.DataPassive, <<9>>)],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// A module importing a global/table/memory validates; the index spaces resolve
+/// imports-first, and a `global.get` of an **imported immutable** global is a legal
+/// constant expression in a later global's init (spec `valid/modules`/const-exprs;
+/// `imports.wast`, `global.wast`). The `TypedModule` carries the imports-first counts.
+pub fn accept_non_function_imports_test() {
+  let assert Ok(tm) =
+    ast.Module(
+      imported_func_count: 0,
+      types: [],
+      imports: [
+        ast.Import("env", "g", ast.ImportGlobal(ast.I32, False)),
+        ast.Import("env", "t", ast.ImportTable(rtbl(ast.FuncRef, 1))),
+        ast.Import("env", "m", ast.ImportMemory(mem(1, None))),
+      ],
+      tables: [],
+      memories: [],
+      // a defined global whose init reads the imported immutable global 0
+      globals: [
+        ast.Global(ty: ast.I32, mutable: False, init: [ast.GlobalGet(0)]),
+      ],
+      funcs: [],
+      start: None,
+      elements: [],
+      data: [],
+      data_count: None,
+      exports: [],
+    )
+    |> validate.validate()
+  tm.imported_global_count
+  |> should.equal(1)
+}
+
+// ── TypedModule facts lowering consumes ──
+
+/// The `TypedModule` carries the reftype of each table by tableidx and each memory's
+/// address width — the facts lowering (P5-05) cannot cheaply re-derive (deliverable §2).
+pub fn typed_module_carries_table_and_mem_facts_test() {
+  let assert Ok(tm) =
+    module(
+      types: [],
+      tables: [rtbl(ast.FuncRef, 1), rtbl(ast.ExternRef, 1)],
+      memories: [mem(1, None), mem64(1, None)],
+      globals: [],
+      funcs: [],
+      start: None,
+      elements: [],
+      data: [],
+    )
+    |> validate.validate()
+  tm.table_types
+  |> should.equal([ast.FuncRef, ast.ExternRef])
+  tm.memory_idx_types
+  |> should.equal([ast.Idx32, ast.Idx64])
+}
+
+/// `C.refs` collects funcidxs declared by function exports and element segments (spec
+/// appendix `funcidx(module)`); `start` does NOT join. Here func 0 is exported → `refs`
+/// contains 0.
+pub fn typed_module_refs_from_export_test() {
+  let assert Ok(tm) =
+    ast.Module(
+      imported_func_count: 0,
+      types: [ft([], [])],
+      imports: [],
+      tables: [],
+      memories: [],
+      globals: [],
+      funcs: [func_(0, [ast.End])],
+      start: None,
+      elements: [],
+      data: [],
+      data_count: None,
+      exports: [ast.Export("f", ast.ExportFunc, 0)],
+    )
+    |> validate.validate()
+  set.contains(tm.refs, 0)
+  |> should.equal(True)
+}
+
+/// Conformance-neutral (H7): a Phase-1 module (no tables/memories/segments/imports)
+/// validates with all the new `TypedModule` fields empty/zero — a Phase-4 module is
+/// byte-identical.
+pub fn typed_module_phase4_neutral_test() {
+  let assert Ok(tm) = validated(add_wasm)
+  tm.imported_global_count
+  |> should.equal(0)
+  tm.imported_table_count
+  |> should.equal(0)
+  tm.imported_memory_count
+  |> should.equal(0)
+  tm.table_types
+  |> should.equal([])
+  tm.memory_idx_types
+  |> should.equal([])
+  tm.elem_types
+  |> should.equal([])
+}
+
+// ═════════════════════════ Phase-5 (unit P5-04) rejection ═════════════════════════
+// Each rejects with the spec-cited `ValidateError` (never accepted, never a panic).
+
+/// `ref.func x` where `x` is a valid funcidx but NOT in `C.refs` (not exported, not in
+/// any segment or global) → `UndeclaredFunctionRef` (spec ref.func rule; `ref_func.wast`
+/// `assert_invalid`).
+pub fn reject_ref_func_undeclared_test() {
+  module(
+    types: [ft([], [ast.FuncRef])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.RefFunc(0), ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UndeclaredFunctionRef(0)))
+}
+
+/// `ref.func x` past the funcidx space → `UnknownFunc` (spec ref.func rule).
+pub fn reject_ref_func_out_of_range_test() {
+  module(
+    types: [ft([], [ast.FuncRef])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.RefFunc(7), ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownFunc(7)))
+}
+
+/// `ref.is_null` on an `i32` operand → `TypeMismatch` (spec: it accepts only a
+/// reference type; `ref_is_null.wast`).
+pub fn reject_ref_is_null_on_i32_test() {
+  module(
+    types: [ft([], [ast.I32])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.I32Const(0), ast.RefIsNull, ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.TypeMismatch))
+}
+
+/// Untyped `select` (0x1B) of two `funcref`s → `BadSelectType` (spec: untyped select is
+/// number-typed only; `select.wast` `assert_invalid`).
+pub fn reject_untyped_select_of_refs_test() {
+  module(
+    types: [ft([], [ast.FuncRef])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.RefNull(ast.FuncRef),
+        ast.RefNull(ast.FuncRef),
+        ast.I32Const(0),
+        ast.Select,
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.BadSelectType))
+}
+
+/// Typed `select t` whose annotation vector is not length 1 → `BadSelectType` (spec:
+/// the current core spec fixes the annotation at length 1; `select.wast`).
+pub fn reject_select_t_bad_arity_test() {
+  module(
+    types: [ft([], [ast.I32])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I32Const(1),
+        ast.I32Const(2),
+        ast.I32Const(0),
+        ast.SelectT([ast.I32, ast.I32]),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.BadSelectType))
+}
+
+/// `table.set` fed the WRONG reftype (an `externref` into a `funcref` table) — an
+/// operand-stack mismatch → `TypeMismatch` (spec `valid/instructions` table.set).
+pub fn reject_table_set_wrong_reftype_test() {
+  module(
+    types: [ft([], [])],
+    tables: [rtbl(ast.FuncRef, 1)],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I32Const(0),
+        ast.RefNull(ast.ExternRef),
+        ast.TableSet(0),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.TypeMismatch))
+}
+
+/// `table.get` past the table space → `UnknownTable(tableidx)` with the REAL index
+/// (spec `valid/instructions` table.get).
+pub fn reject_table_get_out_of_range_test() {
+  module(
+    types: [ft([], [])],
+    tables: [rtbl(ast.FuncRef, 1)],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.I32Const(0), ast.TableGet(3), ast.Drop, ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownTable(3)))
+}
+
+/// `call_indirect` through an `externref` table → `RefTypeMismatch` (an externref
+/// table cannot back an indirect call; spec `valid/instructions` call_indirect).
+pub fn reject_call_indirect_externref_table_test() {
+  module(
+    types: [ft([], [])],
+    tables: [rtbl(ast.ExternRef, 1)],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.I32Const(0), ast.CallIndirect(0, 0), ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.RefTypeMismatch))
+}
+
+/// `memory.init` with a `dataidx` past the data segments → `UnknownData` (spec
+/// `valid/instructions`; `bulk.wast`). The anti-swap test below confirms the `data`
+/// field is checked against the DATA space, not the memory space (R3).
+pub fn reject_memory_init_bad_data_test() {
+  module(
+    types: [ft([], [])],
+    tables: [],
+    memories: [mem(1, None)],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.MemoryInit(5, 0),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownData(5)))
+}
+
+/// R3 anti-swap: `MemoryInit(data: 1, mem: 0)` with **1 data segment** and **1 memory**
+/// must be rejected as `UnknownData(1)` — the `data` field (1) is bounds-checked
+/// against the DATA space (size 1 → out of range), NOT the memory space. A field swap
+/// would instead reject `mem: 1` as `UnknownMemory`, so this pins the wire order.
+pub fn reject_memory_init_immediate_order_test() {
+  module(
+    types: [ft([], [])],
+    tables: [],
+    memories: [mem(1, None)],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.MemoryInit(1, 0),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [ast.DataSegment(ast.DataPassive, <<0>>)],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownData(1)))
+}
+
+/// R3 anti-swap for `table.init`: `TableInit(elem: 1, table: 0)` with **1 element
+/// segment** and **2 tables** must reject `UnknownElem(1)` — the `elem` field is checked
+/// against the ELEMENT space (size 1 → out of range), NOT the table space (size 2, where
+/// index 1 would be valid). A swap would have accepted it.
+pub fn reject_table_init_immediate_order_test() {
+  module(
+    types: [ft([], [])],
+    tables: [rtbl(ast.FuncRef, 1), rtbl(ast.FuncRef, 1)],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.TableInit(1, 0),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [
+      ast.ElementSegment(ast.ElemPassive, ast.FuncRef, ast.ElemFuncs([])),
+    ],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownElem(1)))
+}
+
+/// `table.init` across mismatched reftypes (an `externref` segment into a `funcref`
+/// table) → `RefTypeMismatch` (spec `valid/instructions` table.init; `table_init.wast`).
+pub fn reject_table_init_reftype_mismatch_test() {
+  module(
+    types: [ft([], [])],
+    tables: [rtbl(ast.FuncRef, 1)],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.TableInit(0, 0),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [
+      ast.ElementSegment(
+        ast.ElemPassive,
+        ast.ExternRef,
+        ast.ElemExprs([[ast.RefNull(ast.ExternRef)]]),
+      ),
+    ],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.RefTypeMismatch))
+}
+
+/// `table.copy` across mismatched reftypes (`funcref` dst, `externref` src) →
+/// `RefTypeMismatch` (spec `valid/instructions` table.copy; `table_copy.wast`).
+pub fn reject_table_copy_reftype_mismatch_test() {
+  module(
+    types: [ft([], [])],
+    tables: [rtbl(ast.FuncRef, 1), rtbl(ast.ExternRef, 1)],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.I32Const(0),
+        ast.TableCopy(0, 1),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.RefTypeMismatch))
+}
+
+/// A load with a `memidx` past the memories → `UnknownMemory(memidx)` with the real
+/// index (spec/multi-memory; `memory.wast`).
+pub fn reject_load_bad_memidx_test() {
+  module(
+    types: [ft([], [])],
+    tables: [],
+    memories: [mem(1, None)],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I32Const(0),
+        ast.I32Load(ast.MemArg(align: 2, offset: 0, mem: 1)),
+        ast.Drop,
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownMemory(1)))
+}
+
+/// A memory64 `i32.load` address on a 64-bit memory (which wants `i64`) → `TypeMismatch`
+/// (spec/memory64 address typing).
+pub fn reject_memory64_i32_address_test() {
+  module(
+    types: [ft([], [ast.I64])],
+    tables: [],
+    memories: [mem64(1, None)],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I32Const(0),
+        ast.I64Load(ast.MemArg(align: 3, offset: 0, mem: 0)),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.TypeMismatch))
+}
+
+/// A 64-bit memory limit above `2^48` pages → `BadLimits` (spec/memory64 limit range).
+pub fn reject_memory64_over_range_test() {
+  module(
+    types: [],
+    tables: [],
+    memories: [mem64(281_474_976_710_657, None)],
+    globals: [],
+    funcs: [],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.BadLimits))
+}
+
+/// An active element segment whose reftype ≠ its target table's → `RefTypeMismatch`
+/// (spec `valid/modules` elements; `elem.wast`).
+pub fn reject_active_elem_reftype_mismatch_test() {
+  module(
+    types: [ft([], [])],
+    tables: [rtbl(ast.FuncRef, 1)],
+    memories: [],
+    globals: [],
+    funcs: [],
+    start: None,
+    elements: [
+      ast.ElementSegment(
+        ast.ElemActive(0, [ast.I32Const(0)]),
+        ast.ExternRef,
+        ast.ElemExprs([[ast.RefNull(ast.ExternRef)]]),
+      ),
+    ],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.RefTypeMismatch))
+}
+
+/// A `table.init`/`elem.drop` with an `elemidx` past the element segments →
+/// `UnknownElem` (spec `valid/instructions`).
+pub fn reject_elem_drop_out_of_range_test() {
+  module(
+    types: [ft([], [])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.ElemDrop(2), ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownElem(2)))
+}
+
+/// A `global.get` of a defined/mutable global in a global init is NOT constant →
+/// `NonConstantExpr` (spec constant expressions). Here the imported global 0 is
+/// **mutable**, so referencing it is not a constant expression.
+pub fn reject_const_global_get_mutable_import_test() {
+  ast.Module(
+    imported_func_count: 0,
+    types: [],
+    imports: [ast.Import("env", "g", ast.ImportGlobal(ast.I32, True))],
+    tables: [],
+    memories: [],
+    globals: [ast.Global(ty: ast.I32, mutable: False, init: [ast.GlobalGet(0)])],
+    funcs: [],
+    start: None,
+    elements: [],
+    data: [],
+    data_count: None,
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.NonConstantExpr))
+}
+
+/// Duplicate export names are forbidden (spec `valid/modules`) → the chosen
+/// `UnknownImportKind("duplicate export")` rejection.
+pub fn reject_duplicate_export_test() {
+  ast.Module(
+    imported_func_count: 0,
+    types: [ft([], [])],
+    imports: [],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+    data_count: None,
+    exports: [
+      ast.Export("dup", ast.ExportFunc, 0),
+      ast.Export("dup", ast.ExportFunc, 0),
+    ],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownImportKind("duplicate export")))
+}
+
+/// An export whose index is out of range of the space its kind selects → the matching
+/// `Unknown*` (spec `valid/modules` exports). Here a memory export past the memories.
+pub fn reject_export_out_of_range_test() {
+  ast.Module(
+    imported_func_count: 0,
+    types: [],
+    imports: [],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [],
+    start: None,
+    elements: [],
+    data: [],
+    data_count: None,
+    exports: [ast.Export("m", ast.ExportMemory, 0)],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownMemory(0)))
 }
 
 /// `True` if a `Result` is `Ok`, discarding both payloads (for acceptance asserts on

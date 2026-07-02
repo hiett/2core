@@ -16,6 +16,7 @@ import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/option
+import gleam/set
 import gleeunit/should
 import twocore/backend/build_beam
 import twocore/backend/core_printer
@@ -562,9 +563,16 @@ pub fn nonconst_init_fail_closed_test() {
     validate.TypedModule(
       module: m,
       imported_func_count: 0,
+      imported_global_count: 0,
+      imported_table_count: 0,
+      imported_memory_count: 0,
       func_types: [],
       func_locals: [],
       global_types: [ast.I32],
+      table_types: [],
+      memory_idx_types: [],
+      elem_types: [],
+      refs: set.new(),
     )
   case lower.lower(tm) {
     Error(lower.NonConstInitExpr(_)) -> True

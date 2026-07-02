@@ -23,14 +23,32 @@
 //// indices, the `start` signature) and **constant-expression** validation for global
 //// initializers and element/data segment offsets.
 ////
+//// Phase 5 (unit P5-04) completes the standardized surface (minus SIMD) — again
+//// keeping the polymorphic-stack machinery verbatim. It types the **reference**
+//// instructions (`ref.null`/`ref.func` + the `C.refs` declared-reference set /
+//// `ref.is_null`), **typed `select t`** and the untyped-`select` reference
+//// restriction, **reftype-typed tables** with `table.get/set/size/grow/fill` and
+//// **multiple tables**, the **bulk memory & table** ops (`memory.init/copy/fill`,
+//// `data.drop`, `table.init/copy`, `elem.drop`) with their `dataidx`/`elemidx`/
+//// `memidx`/`tableidx` bounds and reftype-match rules, **multi-memory** `memidx`
+//// routing (the Phase-2 `≤1 memory / ≤1 table` caps are LIFTED per H3), **memory64**
+//// `i64`-address typing (decode/validate-only — runtime deferred to Phase 6, R12),
+//// **non-function imports** wired into the `imports ++ defined` index spaces, and the
+//// passive/declarative element + passive data segment grammar. The `TypedModule` now
+//// also carries the reftypes of tables/element-segments, the memories' address
+//// widths, the per-kind imported counts, and `C.refs`, so lowering (P5-05) never
+//// re-derives them.
+////
 //// Strength: **`full`** (the only Phase-1 strength — required for untrusted input;
 //// `subset`/`assume_valid` are deferred and are NOT a default, D9).
 
 import gleam/list
 import gleam/option
 import gleam/result
+import gleam/set.{type Set}
 import twocore/frontend/wasm/ast.{
-  type FuncType, type Instr, type Limits, type MemArg, type Module, type ValType,
+  type FuncType, type IdxType, type Instr, type Limits, type MemArg, type Module,
+  type ValType,
 }
 
 // ─────────────────────────────── public types ───────────────────────────────
@@ -50,6 +68,21 @@ pub const max_locals: Int = 50_000
 /// range `2^16` for memories).
 pub const memory_page_limit: Int = 65_536
 
+/// The hard architectural cap on a **64-bit** (memory64) memory, in 64KiB pages
+/// (`2^48`). A 64-bit linear memory addresses `2^64` bytes; dividing by the 64 KiB
+/// (`2^16`) page size gives `2^48` pages (spec/memory64 proposal, limit range for an
+/// `i64`-indexed memory). A 64-bit `memory` whose `min`/`max` exceeds this is invalid
+/// (`Error(BadLimits)`). memory64 is decode/validate-only in Phase 5 (its runtime is
+/// deferred to Phase 6, R12) — but the typing here is spec-correct regardless.
+pub const memory64_page_limit: Int = 281_474_976_710_656
+
+/// The static memarg-offset ceiling for a 32-bit (`Idx32`) memory: an offset must be
+/// `< 2^32` (spec `valid/instructions` memarg rule). Decode reads the offset as a
+/// `u64` (the memory64 width), so this is the check that rejects an over-range offset
+/// on a 32-bit memory (`align.wast`'s "offset out of range"). A 64-bit memory's
+/// offset may be any `u64`, so no ceiling applies there.
+const offset32_limit: Int = 4_294_967_296
+
 /// The hard cap on a table's size, in entries (`2^32 - 1`). The spec limit range for
 /// a table is `2^32 - 1` (spec `valid/types`). Since the decoder reads `min`/`max`
 /// as `u32`, this bound is only meaningful as an upper edge; the load-bearing table
@@ -68,18 +101,41 @@ pub const table_entry_limit: Int = 4_294_967_295
 /// - `func_locals`: for each **defined** function (in order), its fully-expanded
 ///   local types — `params ++ declared` — indexed from `0`.
 /// - `global_types`: the value type of each global indexed by **globalidx** (imports
-///   then defined; no imports yet). This is the one typing fact lowering cannot
-///   trivially re-derive from the AST and that validate must compute anyway (for the
-///   `global.set` mutability check), so it is carried here. Load result types live on
-///   the load opcode and `call_indirect`/`global.get` result types are recoverable
-///   from `module.types`/`global_types`, so no per-instruction annotation map is needed.
+///   then defined). This is the one typing fact lowering cannot trivially re-derive
+///   from the AST and that validate must compute anyway (for the `global.set`
+///   mutability check), so it is carried here. Load result types live on the load
+///   opcode and `call_indirect`/`global.get` result types are recoverable from
+///   `module.types`/`global_types`, so no per-instruction annotation map is needed.
+/// - `imported_global_count` / `imported_table_count` / `imported_memory_count`
+///   (Phase 5): the number of *imported* globals/tables/memories — the offset at
+///   which the corresponding *defined* items begin in each index space (imports
+///   precede definitions). `0` for an import-free module (byte-identical to Phase 4).
+/// - `table_types` (Phase 5): the element **reftype** (`FuncRef`/`ExternRef`, the
+///   AST's reftype subset of `ValType`) of each table by **tableidx** (imports then
+///   defined). Lowering reads it for `table.get` result types and the table's
+///   reference storage kind. Empty for a module with no tables.
+/// - `memory_idx_types` (Phase 5): the address width (`Idx32`/`Idx64`) of each memory
+///   by **memidx** (imports then defined). Lowering reads it for the address operand
+///   width; `Idx32` for a Phase-4 module.
+/// - `elem_types` (Phase 5): the **reftype** of each element segment by **elemidx**,
+///   consumed by `table.init`/`elem.drop` lowering.
+/// - `refs` (Phase 5): `C.refs`, the set of function indices *declared* in the module
+///   (element segments of any mode, global inits, and function exports) — the funcs a
+///   body may legally `ref.func`. Lowering reads it for the `ref.func` lowering guard.
 pub type TypedModule {
   TypedModule(
     module: Module,
     imported_func_count: Int,
+    imported_global_count: Int,
+    imported_table_count: Int,
+    imported_memory_count: Int,
     func_types: List(FuncType),
     func_locals: List(List(ValType)),
     global_types: List(ValType),
+    table_types: List(ValType),
+    memory_idx_types: List(IdxType),
+    elem_types: List(ValType),
+    refs: Set(Int),
   )
 }
 
@@ -101,11 +157,14 @@ pub type TypedModule {
 ///   range of the module's type section.
 /// - `UnknownLabel(index)`: a `br`/`br_if`/`br_table` relative depth exceeds the
 ///   control-frame stack.
-/// - `UnknownMemory(index)`: a memory op (load/store/`memory.size`/`memory.grow`/an
-///   active data segment) but the module declares no memory (spec: `C.mems[0]` must
-///   exist).
-/// - `UnknownTable(index)`: a `call_indirect`/active element segment but the module
-///   declares no table (spec: `C.tables[0]` must exist).
+/// - `UnknownMemory(index)`: a memory op (load/store/`memory.*`/a bulk-memory op/an
+///   active data segment/a memory export) whose `memidx` is out of range of the
+///   module's memories (imports ++ defined). Phase 5 carries the **real** `memidx`
+///   (not always `0`) and fires on any out-of-range index (spec: `C.mems[memidx]`
+///   must exist).
+/// - `UnknownTable(index)`: a `call_indirect`/`table.*`/active element segment/a table
+///   export whose `tableidx` is out of range of the module's tables (imports ++
+///   defined). Phase 5 carries the **real** `tableidx` (spec: `C.tables[tableidx]`).
 /// - `ImmutableGlobal(index)`: a `global.set` on a `const` (immutable) global — a
 ///   validation error (spec `valid/instructions` `global.set` rule).
 /// - `BadAlignment`: a memarg whose `2^align` exceeds the access's natural byte width
@@ -117,8 +176,13 @@ pub type TypedModule {
 /// - `BadLimits`: a memory/table `limits` with `min > max`, or `min`/`max` exceeding
 ///   the type's range (`2^16` pages for a memory; `2^32 - 1` entries for a table).
 ///   Spec `valid/types` limits rule.
-/// - `TooManyMemories`: the module declares more than one memory (MVP: at most one).
-/// - `TooManyTables`: the module declares more than one table (MVP: at most one).
+/// - `TooManyMemories`: **retained in the type but no longer produced** — Phase 5
+///   lifts the Phase-2 MVP `≤1 memory` cap (multi-memory is valid, H3). Kept so its
+///   removal is not an API break and a future "single-memory profile" flag could
+///   reuse it. (An unused public constructor does not warn in Gleam, so DoD "zero
+///   warnings" holds.)
+/// - `TooManyTables`: likewise retained-but-unproduced — Phase 5 lifts the `≤1 table`
+///   cap (multi-table is valid, H3).
 /// - `BadStartType`: the `start` function's type is not `[] -> []` (spec `valid/modules`
 ///   start rule).
 /// - `BranchArityMismatch`: a `br_table` whose targets/default do not all share the
@@ -128,13 +192,36 @@ pub type TypedModule {
 /// - `UnexpectedEnd`: an `end`/`else` with no matching open control frame, or a body
 ///   that did not close cleanly.
 /// - `TooManyLocals(count)`: the function's local count exceeds `max_locals`.
-/// - `Unsupported(detail)`: a construct outside the validation surface (Phase 5:
-///   typed `select_t`, reference-type/bulk ops, reference-type globals/tables,
-///   non-function imports, memory64, passive/expr segments). Rejected fail-closed
-///   rather than waved through — P5-04 replaces these with real typing rules.
-/// - `OffsetOutOfRange`: a load/store memarg static offset `>= 2^32` on a 32-bit
-///   memory (spec `valid/instructions` memarg). Reachable now that decode reads the
-///   offset as a `u64` (P5-03); routed from `align.wast`'s "offset out of range".
+/// - `Unsupported(detail)`: a construct outside the validation surface. Phase 5 types
+///   the whole standardized surface (minus SIMD), so this is now reserved for a genuine
+///   out-of-scope construct (a `v128`/SIMD leaf, a GC-proposal reftype) — never a
+///   Phase-5-in-scope op. Rejected fail-closed rather than waved through.
+/// - `OffsetOutOfRange`: a load/store memarg static offset `>= 2^32` on a **32-bit**
+///   (`Idx32`) memory (spec `valid/instructions` memarg). Reachable now that decode
+///   reads the offset as a `u64` (P5-03); routed from `align.wast`'s "offset out of
+///   range". A 64-bit (`Idx64`) memory's offset may be any `u64`, so this never fires
+///   there.
+/// - `UnknownData(index)`: a `memory.init`/`data.drop` `dataidx` out of range of the
+///   module's data segments (spec `valid/instructions`; `bulk.wast`). The data-count
+///   *section presence* rule is decode's (R13); this checks `dataidx < data_count`.
+/// - `UnknownElem(index)`: a `table.init`/`elem.drop` `elemidx` out of range of the
+///   module's element segments (spec `valid/instructions`; `table_init.wast`).
+/// - `UndeclaredFunctionRef(index)`: a `ref.func x` whose `x` is a valid funcidx but
+///   **not** in `C.refs` (the module's declared-reference set). The spec requires
+///   `x ∈ C.refs` (spec `valid/instructions` ref.func; `ref_func.wast`
+///   `assert_invalid`). Distinct from `UnknownFunc` (which is x out of range).
+/// - `RefTypeMismatch`: a **reference-type** disagreement that is not an operand-stack
+///   pop mismatch — `table.init`/`table.copy` across mismatched reftypes, an active
+///   element segment whose reftype ≠ its target table's, or `call_indirect` through a
+///   non-`funcref` table (spec `valid/instructions`/`valid/modules`). Operand-stack
+///   reftype mismatches (e.g. `table.set` fed the wrong reftype) use `TypeMismatch`.
+/// - `BadSelectType`: an untyped `select` (0x1B) on a **reference** operand (invalid —
+///   untyped select is number-typed only), or a typed `select t` (0x1C) whose
+///   annotation vector is not exactly length 1 (spec parametric rule; `select.wast`).
+/// - `UnknownImportKind(detail)`: an import/export whose referent index is out of the
+///   space its kind selects, where no more specific `Unknown*` fits, or a **duplicate
+///   export name** (spec `valid/modules` forbids duplicate export names). Carries a
+///   human-readable detail.
 pub type ValidateError {
   TypeMismatch
   Underflow
@@ -158,30 +245,54 @@ pub type ValidateError {
   TooManyLocals(count: Int)
   Unsupported(detail: String)
   OffsetOutOfRange
+  UnknownData(index: Int)
+  UnknownElem(index: Int)
+  UndeclaredFunctionRef(index: Int)
+  RefTypeMismatch
+  BadSelectType
+  UnknownImportKind(detail: String)
 }
 
 // ─────────────────────────────── validation context ───────────────────────────────
 
 /// The module-level facts every instruction typing rule may need, threaded into
 /// `validate_instr` as one record (the Phase-1 `types, func_types, locals` triple
-/// generalized; the abstract-stack algorithm is otherwise untouched).
+/// generalized to the full Phase-5 index spaces; the abstract-stack algorithm is
+/// otherwise untouched).
+///
+/// Every index space is built **imports first** (in import order) then definitions,
+/// so a `funcidx`/`globalidx`/`tableidx`/`memidx` addresses the combined space
+/// directly (spec `valid/modules`).
 ///
 /// - `types`: the module's type section (resolved by blocktype/`call_indirect`).
-/// - `func_types`: per-funcidx signatures (imports `++` defined; no imports yet).
-/// - `globals`: `(value type, mutable?)` indexed by globalidx — drives `global.get`/
-///   `global.set` typing and the mutability check.
-/// - `has_memory`: whether the module declares memory 0 (a load/store/`memory.*`
-///   requires it, else `UnknownMemory(0)`).
-/// - `has_table`: whether the module declares table 0 (a `call_indirect`/element
-///   requires it, else `UnknownTable(0)`).
+/// - `func_types`: per-funcidx signatures (imports `++` defined).
+/// - `globals`: `(value type, mutable?)` by globalidx (imports `++` defined) — drives
+///   `global.get`/`global.set` typing and the mutability check.
+/// - `imported_global_count`: the number of imported globals — a `global.get` in a
+///   constant expression is only constant when its index is an *imported* immutable
+///   global, i.e. `x < imported_global_count` (spec constant expressions).
+/// - `tables`: `(element reftype, limits)` by tableidx (imports `++` defined) — drives
+///   the `table.*` operand/result reftypes and the `call_indirect` funcref check.
+/// - `memories`: the address width (`Idx32`/`Idx64`) by memidx (imports `++` defined)
+///   — drives the `i32`/`i64` address typing of every memory op.
+/// - `data_count`: the number of data segments (the `dataidx` bound for
+///   `memory.init`/`data.drop`).
+/// - `elem_types`: the reftype of each element segment by elemidx (the `elemidx` bound
+///   and reftype for `table.init`/`elem.drop`).
+/// - `refs`: `C.refs`, the module's declared function references (`ref.func x` is valid
+///   only if `x ∈ refs`).
 /// - `locals`: the current function's expanded local types (`params ++ declared`).
 type Ctx {
   Ctx(
     types: List(FuncType),
     func_types: List(FuncType),
     globals: List(#(ValType, Bool)),
-    has_memory: Bool,
-    has_table: Bool,
+    imported_global_count: Int,
+    tables: List(#(ValType, Limits)),
+    memories: List(IdxType),
+    data_count: Int,
+    elem_types: List(ValType),
+    refs: Set(Int),
     locals: List(ValType),
   )
 }
@@ -389,25 +500,64 @@ fn blocktype_types(
 /// Proves `module` well-typed per WASM `full` validation and returns the typing
 /// information lowering needs.
 ///
-/// `Ok(TypedModule)` ⇒ every memory/table limit is in range, there is at most one
-/// memory and one table, every function body type-checks under the abstract stack
-/// algorithm, every local/global/func/type/label index is in bounds, every branch
-/// arity matches, every function's local count is within `max_locals`, every global
-/// init / element offset / data offset is a well-typed constant expression, every
-/// element funcidx is in range, and any `start` function has type `[] -> []`.
+/// `Ok(TypedModule)` ⇒ every memory/table limit is in range (per the memory's address
+/// width — `2^16` pages for a 32-bit memory, `2^48` for a 64-bit one), every function
+/// body type-checks under the abstract stack algorithm, every local/global/func/type/
+/// label/memory/table/data/elem index is in bounds, every branch arity matches, every
+/// function's local count is within `max_locals`, every reference/table/bulk op is
+/// correctly typed (reftypes match; `ref.func` targets a declared function), every
+/// `select t` annotation is length 1 and untyped `select` is number-typed, every
+/// global init / element offset / element item / data offset is a well-typed constant
+/// expression, every export index is in range and export names are unique, and any
+/// `start` function has type `[] -> []`. Multiple memories/tables are permitted (H3);
+/// memory64 is typed (i64 addresses) even though its runtime is deferred (R12).
 /// `Error(ValidateError)` ⇒ the module is invalid; the security boundary REJECTS it
 /// (fail-closed). Total over any decoded AST — never panics or diverges.
 pub fn validate(module: Module) -> Result(TypedModule, ValidateError) {
-  // Phase-1/2 funcidx & globalidx space is `imports ++ defined`; imports are not
-  // decoded yet (count `0`), so defined index == absolute index.
-  let imported = module.imported_func_count
-  use func_types <- result.try(resolve_func_types(module))
-  let globals = list.map(module.globals, fn(g) { #(g.ty, g.mutable) })
-  let global_types = list.map(module.globals, fn(g) { g.ty })
+  // Build every index space `imports ++ defined` (imports precede definitions, in
+  // import order) so a funcidx/globalidx/tableidx/memidx addresses the combined
+  // space directly (spec `valid/modules`). A module with no import section keeps the
+  // Phase-4 shape (imports contribute nothing → byte-identical).
+  use imp_funcs <- result.try(imported_func_types(module))
+  let imp_globals = imported_globals(module)
+  let imp_tables = imported_tables(module)
+  let imp_memtypes = imported_memtypes(module)
+  let imported_func_count = list.length(imp_funcs)
+  let imported_global_count = list.length(imp_globals)
+  let imported_table_count = list.length(imp_tables)
+  let imported_memory_count = list.length(imp_memtypes)
 
-  // Module-level structural checks (spec `valid/modules` / `valid/types`).
-  use _ <- result.try(check_memories(module.memories))
-  use _ <- result.try(check_tables(module.tables))
+  use def_funcs <- result.try(resolve_func_types(module))
+  let func_types = list.append(imp_funcs, def_funcs)
+  let globals =
+    list.append(
+      imp_globals,
+      list.map(module.globals, fn(g) { #(g.ty, g.mutable) }),
+    )
+  let global_types = list.map(globals, fn(g) { g.0 })
+  let tables =
+    list.append(
+      imp_tables,
+      list.map(module.tables, fn(t) { #(t.elem_type, t.limits) }),
+    )
+  let table_types = list.map(tables, fn(t) { t.0 })
+  // Full MemType list (imports ++ defined) for the limit check; the idx-type-only
+  // projection feeds the context (address typing needs only the width).
+  let all_memtypes = list.append(imp_memtypes, module.memories)
+  let memories = list.map(all_memtypes, fn(m) { m.idx_type })
+  let elem_types = list.map(module.elements, fn(e) { e.ref_ty })
+  let data_count = list.length(module.data)
+
+  // Module-level structural checks (spec `valid/modules` / `valid/types`). Multi-
+  // memory / multi-table caps are LIFTED (H3): every memory/table limit is validated.
+  use _ <- result.try(list.try_each(all_memtypes, check_memory))
+  use _ <- result.try(
+    list.try_each(tables, fn(t) { check_limits(t.1, table_entry_limit) }),
+  )
+
+  // `C.refs` — the module's declared function references (spec `funcidx(module)`):
+  // computed once, up front, before validating any body or const-expr (§C.1).
+  let refs = compute_refs(module)
 
   // A module-wide context; `locals` is filled per function in `validate_func`.
   let ctx =
@@ -415,8 +565,12 @@ pub fn validate(module: Module) -> Result(TypedModule, ValidateError) {
       types: module.types,
       func_types: func_types,
       globals: globals,
-      has_memory: module.memories != [],
-      has_table: module.tables != [],
+      imported_global_count: imported_global_count,
+      tables: tables,
+      memories: memories,
+      data_count: data_count,
+      elem_types: elem_types,
+      refs: refs,
       locals: [],
     )
 
@@ -424,24 +578,83 @@ pub fn validate(module: Module) -> Result(TypedModule, ValidateError) {
     list.try_map(module.funcs, fn(f) { validate_func(f, module, ctx) }),
   )
 
-  // Constant-expression validation: global inits, element & data segment offsets,
-  // element funcidx range, and the `start` signature (spec `valid/modules`).
-  use _ <- result.try(check_global_inits(module.globals))
+  // Constant-expression validation (globals, element & data segments), export
+  // range/uniqueness, and the `start` signature (spec `valid/modules`).
+  use _ <- result.try(check_global_inits(module.globals, ctx))
   use _ <- result.try(check_elements(module, ctx))
-  use _ <- result.try(check_data(module.data))
+  use _ <- result.try(check_data(module, ctx))
+  use _ <- result.try(check_exports(module, ctx))
   use _ <- result.try(check_start(module, func_types))
 
   Ok(TypedModule(
     module: module,
-    imported_func_count: imported,
+    imported_func_count: imported_func_count,
+    imported_global_count: imported_global_count,
+    imported_table_count: imported_table_count,
+    imported_memory_count: imported_memory_count,
     func_types: func_types,
     func_locals: func_locals,
     global_types: global_types,
+    table_types: table_types,
+    memory_idx_types: memories,
+    elem_types: elem_types,
+    refs: refs,
   ))
 }
 
-/// The signature of every defined function by funcidx (no imports). Each function's
-/// `type_idx` must be in range, else `Error(UnknownType(_))`.
+/// The signature of every **imported** function by import order — each `ImportFunc`'s
+/// `type_idx` resolved against the type section (`Error(UnknownType(_))` if out of
+/// range). Non-function imports are skipped (they populate the other index spaces).
+fn imported_func_types(
+  module: Module,
+) -> Result(List(FuncType), ValidateError) {
+  list.try_fold(module.imports, [], fn(acc, imp) {
+    case imp.desc {
+      ast.ImportFunc(type_idx) ->
+        case nth(module.types, type_idx) {
+          Ok(ft) -> Ok([ft, ..acc])
+          Error(_) -> Error(UnknownType(type_idx))
+        }
+      _ -> Ok(acc)
+    }
+  })
+  |> result.map(list.reverse)
+}
+
+/// The `(value type, mutable?)` of every **imported** global, in import order.
+fn imported_globals(module: Module) -> List(#(ValType, Bool)) {
+  list.filter_map(module.imports, fn(imp) {
+    case imp.desc {
+      ast.ImportGlobal(ty, mutable) -> Ok(#(ty, mutable))
+      _ -> Error(Nil)
+    }
+  })
+}
+
+/// The `(element reftype, limits)` of every **imported** table, in import order.
+fn imported_tables(module: Module) -> List(#(ValType, Limits)) {
+  list.filter_map(module.imports, fn(imp) {
+    case imp.desc {
+      ast.ImportTable(tt) -> Ok(#(tt.elem_type, tt.limits))
+      _ -> Error(Nil)
+    }
+  })
+}
+
+/// The `MemType` (limits + address width) of every **imported** memory, in import
+/// order. Imported memories occupy the low `memidx` slots and are limit-checked and
+/// address-typed exactly like defined ones.
+fn imported_memtypes(module: Module) -> List(ast.MemType) {
+  list.filter_map(module.imports, fn(imp) {
+    case imp.desc {
+      ast.ImportMemory(mt) -> Ok(mt)
+      _ -> Error(Nil)
+    }
+  })
+}
+
+/// The signature of every **defined** function. Each function's `type_idx` must be in
+/// range, else `Error(UnknownType(_))`.
 fn resolve_func_types(module: Module) -> Result(List(FuncType), ValidateError) {
   list.try_map(module.funcs, fn(f) {
     case nth(module.types, f.type_idx) {
@@ -451,38 +664,16 @@ fn resolve_func_types(module: Module) -> Result(List(FuncType), ValidateError) {
   })
 }
 
-/// At most one memory (MVP), whose `limits` lie within the `2^16`-page range with
-/// `min <= max` (spec `valid/types`). `Error(TooManyMemories)` / `Error(BadLimits)`.
-fn check_memories(mems: List(ast.MemType)) -> Result(Nil, ValidateError) {
-  case mems {
-    [] -> Ok(Nil)
-    // A 64-bit (memory64) memory is decode/validate-only in Phase 5; its runtime is
-    // deferred to Phase 6 (R12), so this Phase-2 gate rejects it fail-closed (P5-04
-    // implements the real i64-address typing).
-    [m] ->
-      case m.idx_type {
-        ast.Idx32 -> check_limits(m.limits, memory_page_limit)
-        ast.Idx64 ->
-          Error(Unsupported("memory64 (runtime deferred to Phase 6)"))
-      }
-    _ -> Error(TooManyMemories)
+/// Validate one memory's address-width-relative limits: a 32-bit (`Idx32`) memory's
+/// range is `2^16` pages, a 64-bit (`Idx64`) memory's is `2^48` (spec `valid/types` /
+/// the memory64 proposal). `Error(BadLimits)` on any violation. memory64 is typed here
+/// even though its runtime is deferred (R12) — an over-range 64-bit limit still fails.
+fn check_memory(m: ast.MemType) -> Result(Nil, ValidateError) {
+  let range = case m.idx_type {
+    ast.Idx32 -> memory_page_limit
+    ast.Idx64 -> memory64_page_limit
   }
-}
-
-/// At most one table (MVP), whose `limits` lie within the `2^32 - 1`-entry range with
-/// `min <= max` (spec `valid/types`). `Error(TooManyTables)` / `Error(BadLimits)`.
-fn check_tables(tabs: List(ast.TableType)) -> Result(Nil, ValidateError) {
-  case tabs {
-    [] -> Ok(Nil)
-    // Phase-2 tables are funcref; a reference-typed (externref) table is P5-04's,
-    // rejected fail-closed here.
-    [t] ->
-      case t.elem_type {
-        ast.FuncRef -> check_limits(t.limits, table_entry_limit)
-        _ -> Error(Unsupported("non-funcref table (Phase 5 surface)"))
-      }
-    _ -> Error(TooManyTables)
-  }
+  check_limits(m.limits, range)
 }
 
 /// A `limits` is valid within range `k` iff `min <= k`, and (when present) `max <= k`
@@ -554,8 +745,11 @@ fn validate_func(
 
 /// Type-check one instruction against the current state, returning the advanced state
 /// (spec: the typing rule for each instruction). `ctx` carries the module-level facts
-/// (types, per-funcidx signatures, globals, memory/table presence) plus the current
-/// function's expanded local types. Any violation is a typed `ValidateError`.
+/// (types, the func/global/table/memory index spaces, the data/elem segment counts,
+/// `C.refs`) plus the current function's expanded local types. Every reference/table/
+/// bulk op has an EXPLICIT arm before the numeric fallthrough, so an unhandled opcode
+/// can only be an unreachable decode state (fail-closed). Any violation is a typed
+/// `ValidateError`.
 fn validate_instr(
   st: VState,
   instr: Instr,
@@ -635,18 +829,21 @@ fn validate_instr(
       use st2 <- result.try(pop_vals(st, sig.params))
       Ok(push_vals(st2, sig.results))
     }
-    // `call_indirect y x`: the static `typeidx y` must be in range and a table must
-    // exist (spec `valid/instructions`). Operand order: the i32 table index is on
-    // top (popped first), then the type's params; the type's results are pushed. The
-    // per-call structural type check is purely DYNAMIC (runtime), not validation.
-    ast.CallIndirect(type_idx, _table) -> {
+    // `call_indirect y x`: the static `typeidx y` must be in range and the target
+    // table `x` must be in range and hold `funcref` (an `externref` table cannot back
+    // an indirect call → `RefTypeMismatch`) (spec `valid/instructions`). Operand
+    // order: the i32 table index is on top (popped first), then the type's params;
+    // the type's results are pushed. The per-call structural type check is purely
+    // DYNAMIC (runtime), not validation.
+    ast.CallIndirect(type_idx, table) -> {
       use sig <- result.try(case nth(ctx.types, type_idx) {
         Ok(s) -> Ok(s)
         Error(_) -> Error(UnknownType(type_idx))
       })
-      use _ <- result.try(case ctx.has_table {
-        True -> Ok(Nil)
-        False -> Error(UnknownTable(0))
+      use #(ref_ty, _) <- result.try(table_entry(ctx, table))
+      use _ <- result.try(case ref_ty {
+        ast.FuncRef -> Ok(Nil)
+        _ -> Error(RefTypeMismatch)
       })
       use st2 <- result.try(pop_expect(st, ast.I32))
       use st3 <- result.try(pop_vals(st2, sig.params))
@@ -658,8 +855,11 @@ fn validate_instr(
       use #(_, st2) <- result.try(pop_val(st))
       Ok(st2)
     }
-    // `select` (untyped, 0x1B): `t t i32 -> t`; the two values must share a type
-    // (spec). `select_t` (0x1C, typed) is deferred with reference types (Phase 3).
+    // `select` (untyped, 0x1B): `t t i32 -> t` where `t` is a **number** type; the two
+    // values must share a type (spec parametric rule). Phase 5 adds the restriction
+    // that a resolved *reference* operand is invalid for untyped select → `BadSelectType`
+    // (a `funcref`/`externref` select must use the typed `select t` form). A fully
+    // polymorphic pair (both `Unknown`, post-`unreachable`) stays polymorphic.
     ast.Select -> {
       use st2 <- result.try(pop_expect(st, ast.I32))
       use #(t1, st3) <- result.try(pop_val(st2))
@@ -672,9 +872,152 @@ fn validate_instr(
             Known(_) -> t1
             Unknown -> t2
           }
-          Ok(VState(..st4, vals: [t, ..st4.vals]))
+          case t {
+            Known(vt) ->
+              case is_reftype(vt) {
+                True -> Error(BadSelectType)
+                False -> Ok(VState(..st4, vals: [t, ..st4.vals]))
+              }
+            Unknown -> Ok(VState(..st4, vals: [t, ..st4.vals]))
+          }
         }
       }
+    }
+    // `select t` (typed, 0x1C): the annotation vector must be exactly length 1 (spec
+    // parametric rule; a length ≠ 1 → `BadSelectType`); signature `[t t i32] → [t]`
+    // with `t` the annotated type — which MAY be a reference type. Pop i32, pop t,
+    // pop t, push t.
+    ast.SelectT(types) ->
+      case types {
+        [t] -> {
+          use st1 <- result.try(pop_expect(st, ast.I32))
+          use st2 <- result.try(pop_expect(st1, t))
+          use st3 <- result.try(pop_expect(st2, t))
+          Ok(push_val(st3, t))
+        }
+        _ -> Error(BadSelectType)
+      }
+
+    // reference instructions (spec `valid/instructions` §reference) ---------------
+    ast.RefNull(rt) -> Ok(push_val(st, rt))
+    // `ref.is_null` is reference-polymorphic: pop one operand, which must be a
+    // reference type (`FuncRef`/`ExternRef`) or `Unknown`; a numeric operand →
+    // `TypeMismatch`. Push i32.
+    ast.RefIsNull -> {
+      use #(t, st2) <- result.try(pop_val(st))
+      case t {
+        Unknown -> Ok(push_val(st2, ast.I32))
+        Known(vt) ->
+          case is_reftype(vt) {
+            True -> Ok(push_val(st2, ast.I32))
+            False -> Error(TypeMismatch)
+          }
+      }
+    }
+    // `ref.func x`: `x` must be a valid funcidx AND declared (`x ∈ C.refs`) — else
+    // `UnknownFunc(x)` (out of range) / `UndeclaredFunctionRef(x)` (in range, not
+    // declared). Push `funcref`.
+    ast.RefFunc(x) -> {
+      use _ <- result.try(check_ref_declared(ctx, x))
+      Ok(push_val(st, ast.FuncRef))
+    }
+
+    // table instructions (spec `valid/instructions` §table) -----------------------
+    // `table.get x`: `[i32] → [t]` where `t` is table x's reftype.
+    ast.TableGet(x) -> {
+      use #(t, _) <- result.try(table_entry(ctx, x))
+      use st2 <- result.try(pop_expect(st, ast.I32))
+      Ok(push_val(st2, t))
+    }
+    // `table.set x`: `[i32 t] → []` — pop the value `t` (top), then the i32 index.
+    ast.TableSet(x) -> {
+      use #(t, _) <- result.try(table_entry(ctx, x))
+      use st2 <- result.try(pop_expect(st, t))
+      pop_expect(st2, ast.I32)
+    }
+    // `table.size x`: `[] → [i32]`.
+    ast.TableSize(x) -> {
+      use #(_, _) <- result.try(table_entry(ctx, x))
+      Ok(push_val(st, ast.I32))
+    }
+    // `table.grow x`: `[t i32] → [i32]` — pop the i32 delta (top), then the init value
+    // `t`; push i32 (old size / −1 at runtime).
+    ast.TableGrow(x) -> {
+      use #(t, _) <- result.try(table_entry(ctx, x))
+      use st2 <- result.try(pop_expect(st, ast.I32))
+      use st3 <- result.try(pop_expect(st2, t))
+      Ok(push_val(st3, ast.I32))
+    }
+    // `table.fill x`: `[i32 t i32] → []` — pop the i32 count (top), the value `t`,
+    // then the i32 offset.
+    ast.TableFill(x) -> {
+      use #(t, _) <- result.try(table_entry(ctx, x))
+      use st2 <- result.try(pop_expect(st, ast.I32))
+      use st3 <- result.try(pop_expect(st2, t))
+      pop_expect(st3, ast.I32)
+    }
+
+    // bulk memory & table (spec `valid/instructions` §memory/§table) --------------
+    // `memory.init d m`: `[at(m) i32 i32] → []` — d indexes a data segment (always
+    // i32 src/len); m in memory range. Pop len(i32), src(i32), then dest(at(m)).
+    ast.MemoryInit(d, m) -> {
+      use at <- result.try(mem_addr_type(ctx, m))
+      use _ <- result.try(check_data_idx(ctx, d))
+      use st2 <- result.try(pop_expect(st, ast.I32))
+      use st3 <- result.try(pop_expect(st2, ast.I32))
+      pop_expect(st3, at)
+    }
+    // `data.drop d`: `[] → []` — d indexes a data segment.
+    ast.DataDrop(d) -> {
+      use _ <- result.try(check_data_idx(ctx, d))
+      Ok(st)
+    }
+    // `memory.copy dm sm`: `[at(dm) at(sm) at3] → []`, `at3 = min(at(dm),at(sm))` (the
+    // count is bounded by the narrower memory). Pop count(at3), src(at(sm)), then
+    // dest(at(dm)).
+    ast.MemoryCopy(dm, sm) -> {
+      use at_dst <- result.try(mem_addr_type(ctx, dm))
+      use at_src <- result.try(mem_addr_type(ctx, sm))
+      let at_count = min_addr_type(at_dst, at_src)
+      use st2 <- result.try(pop_expect(st, at_count))
+      use st3 <- result.try(pop_expect(st2, at_src))
+      pop_expect(st3, at_dst)
+    }
+    // `memory.fill m`: `[at(m) i32 at(m)] → []` — the value byte is i32 even for a
+    // 64-bit memory. Pop count(at), value(i32), then dest(at).
+    ast.MemoryFill(m) -> {
+      use at <- result.try(mem_addr_type(ctx, m))
+      use st2 <- result.try(pop_expect(st, at))
+      use st3 <- result.try(pop_expect(st2, ast.I32))
+      pop_expect(st3, at)
+    }
+    // `table.init e t` (wire order elemidx,tableidx — R3): `[i32 i32 i32] → []`; e in
+    // elem range, t in table range; the element segment's reftype must equal the
+    // target table's (`RefTypeMismatch`). Tables are always i32-indexed.
+    ast.TableInit(e, t) -> {
+      use elem_rt <- result.try(elem_type(ctx, e))
+      use #(tbl_rt, _) <- result.try(table_entry(ctx, t))
+      use _ <- result.try(case elem_rt == tbl_rt {
+        True -> Ok(Nil)
+        False -> Error(RefTypeMismatch)
+      })
+      pop_three_i32(st)
+    }
+    // `elem.drop e`: `[] → []` — e indexes an element segment.
+    ast.ElemDrop(e) -> {
+      use _ <- result.try(elem_type(ctx, e))
+      Ok(st)
+    }
+    // `table.copy dt st` (wire order dst,src): `[i32 i32 i32] → []`; both tables in
+    // range; their reftypes must match (`RefTypeMismatch`).
+    ast.TableCopy(dt, stbl) -> {
+      use #(dst_rt, _) <- result.try(table_entry(ctx, dt))
+      use #(src_rt, _) <- result.try(table_entry(ctx, stbl))
+      use _ <- result.try(case dst_rt == src_rt {
+        True -> Ok(Nil)
+        False -> Error(RefTypeMismatch)
+      })
+      pop_three_i32(st)
     }
 
     // variable access -----------------------------------------------------------
@@ -744,17 +1087,17 @@ fn validate_instr(
     ast.I64Store16(m) -> check_store(st, ctx, m, ast.I64, 1)
     ast.I64Store32(m) -> check_store(st, ctx, m, ast.I64, 2)
 
-    // memory size/grow (require a memory) ---------------------------------------
-    // The memidx is threaded by P5-05; Phase-2 validation only requires memory 0.
-    ast.MemorySize(_) ->
-      case require_memory(ctx) {
-        Ok(_) -> Ok(push_val(st, ast.I32))
-        Error(e) -> Error(e)
-      }
-    ast.MemoryGrow(_) -> {
-      use _ <- result.try(require_memory(ctx))
-      use st2 <- result.try(pop_expect(st, ast.I32))
-      Ok(push_val(st2, ast.I32))
+    // memory size/grow — route by `memidx`; result/operand width is the memory's
+    // address type (`i32` for a 32-bit memory, `i64` for a 64-bit one) -----------
+    // `memory.size m`: `[] → [at(m)]`. `memory.grow m`: `[at(m)] → [at(m)]`.
+    ast.MemorySize(m) -> {
+      use at <- result.try(mem_addr_type(ctx, m))
+      Ok(push_val(st, at))
+    }
+    ast.MemoryGrow(m) -> {
+      use at <- result.try(mem_addr_type(ctx, m))
+      use st2 <- result.try(pop_expect(st, at))
+      Ok(push_val(st2, at))
     }
 
     // numeric / comparison / conversion / float leaves --------------------------
@@ -762,9 +1105,11 @@ fn validate_instr(
   }
 }
 
-/// Type a memory load: require a memory, check the memarg alignment, pop the `i32`
-/// address, push the load's `result` type. `max_align` is the log2 of the natural
-/// access byte-width (e.g. `2` for a 4-byte access).
+/// Type a memory load: resolve the memarg's memory (`memidx`) and its address width,
+/// check the memarg alignment + offset, pop the address (`i32`/`i64` per the memory),
+/// push the load's `result` type. `max_align` is the log2 of the natural access
+/// byte-width (e.g. `2` for a 4-byte access). `Error(UnknownMemory(memidx))` if the
+/// memidx is out of range.
 fn check_load(
   st: VState,
   ctx: Ctx,
@@ -772,15 +1117,16 @@ fn check_load(
   result: ValType,
   max_align: Int,
 ) -> Result(VState, ValidateError) {
-  use _ <- result.try(require_memory(ctx))
+  use at <- result.try(mem_addr_type(ctx, memarg.mem))
   use _ <- result.try(check_align(memarg, max_align))
-  use _ <- result.try(check_offset(memarg))
-  use st2 <- result.try(pop_expect(st, ast.I32))
+  use _ <- result.try(check_offset(memarg, at))
+  use st2 <- result.try(pop_expect(st, at))
   Ok(push_val(st2, result))
 }
 
-/// Type a memory store: require a memory, check the memarg alignment, pop the `value`
-/// (top of stack) then the `i32` address, push nothing. `max_align` is as `check_load`.
+/// Type a memory store: resolve the memory + address width, check the memarg
+/// alignment + offset, pop the `value` (top of stack) then the address, push nothing.
+/// `max_align` is as `check_load`.
 fn check_store(
   st: VState,
   ctx: Ctx,
@@ -788,27 +1134,19 @@ fn check_store(
   value: ValType,
   max_align: Int,
 ) -> Result(VState, ValidateError) {
-  use _ <- result.try(require_memory(ctx))
+  use at <- result.try(mem_addr_type(ctx, memarg.mem))
   use _ <- result.try(check_align(memarg, max_align))
-  use _ <- result.try(check_offset(memarg))
+  use _ <- result.try(check_offset(memarg, at))
   use st2 <- result.try(pop_expect(st, value))
-  pop_expect(st2, ast.I32)
-}
-
-/// The module must declare memory 0 for any memory op (load/store/`memory.*`/active
-/// data segment). `Error(UnknownMemory(0))` otherwise (spec: `C.mems[0]` must exist).
-fn require_memory(ctx: Ctx) -> Result(Nil, ValidateError) {
-  case ctx.has_memory {
-    True -> Ok(Nil)
-    False -> Error(UnknownMemory(0))
-  }
+  pop_expect(st2, at)
 }
 
 /// Validate a memarg's alignment (spec `valid/instructions` memarg rule): "the
 /// alignment `2^align` must not be larger than `N/8`". Since `N/8 = 2^max_align`,
 /// this is exactly `align <= max_align`; a larger `align` is `Error(BadAlignment)`.
-/// Alignment is a non-semantic hint — under-alignment is always legal and never
-/// rejected; the value is discarded after this check.
+/// The rule follows the *access* width, NOT the address width, so it is identical for
+/// 32- and 64-bit memories. Alignment is a non-semantic hint — under-alignment is
+/// always legal and never rejected; the value is discarded after this check.
 fn check_align(memarg: MemArg, max_align: Int) -> Result(Nil, ValidateError) {
   case memarg.align > max_align {
     True -> Error(BadAlignment)
@@ -817,16 +1155,156 @@ fn check_align(memarg: MemArg, max_align: Int) -> Result(Nil, ValidateError) {
 }
 
 /// The static memarg offset must fit the memory's address range (spec
-/// `valid/instructions` memarg rule). Decode reads the offset as a `u64` (the
-/// memory64 width, P5-03), and Phase-5 validate only accepts 32-bit (`Idx32`)
-/// memories (memory64's runtime is deferred — R12), so a valid offset is `< 2^32`.
-/// A larger offset (e.g. `align.wast`'s "offset out of range" case) is
-/// `Error(OffsetOutOfRange)`. P5-04 generalizes this to the memory's real idx_type.
-fn check_offset(memarg: MemArg) -> Result(Nil, ValidateError) {
-  case memarg.offset >= 4_294_967_296 {
-    True -> Error(OffsetOutOfRange)
-    False -> Ok(Nil)
+/// `valid/instructions` memarg rule). Decode reads the offset as a `u64` (the memory64
+/// width, P5-03). For a 32-bit (`Idx32`) memory a valid offset is `< 2^32`; a larger
+/// one (e.g. `align.wast`'s "offset out of range") is `Error(OffsetOutOfRange)`. A
+/// 64-bit (`Idx64`) memory's offset may be any `u64`, so it is always in range (R12).
+fn check_offset(memarg: MemArg, at: ValType) -> Result(Nil, ValidateError) {
+  case at {
+    ast.I32 ->
+      case memarg.offset >= offset32_limit {
+        True -> Error(OffsetOutOfRange)
+        False -> Ok(Nil)
+      }
+    _ -> Ok(Nil)
   }
+}
+
+// ─────────────────────────────── reference / index-space helpers ───────────────────────────────
+
+/// `True` iff `vt` is one of the two MVP reference types (`FuncRef`/`ExternRef`). Used
+/// by `ref.is_null`/untyped-`select` (which are reference-polymorphic / number-only).
+fn is_reftype(vt: ValType) -> Bool {
+  case vt {
+    ast.FuncRef | ast.ExternRef -> True
+    _ -> False
+  }
+}
+
+/// The address value type for a memory's index width: `i32` for a 32-bit (`Idx32`)
+/// memory, `i64` for a 64-bit (`Idx64`, memory64) one (spec/memory64 proposal).
+fn addr_type(it: IdxType) -> ValType {
+  case it {
+    ast.Idx32 -> ast.I32
+    ast.Idx64 -> ast.I64
+  }
+}
+
+/// The address value type of memory `memidx`, or `Error(UnknownMemory(memidx))` if the
+/// index is out of range of the module's memories (imports ++ defined).
+fn mem_addr_type(ctx: Ctx, memidx: Int) -> Result(ValType, ValidateError) {
+  case nth(ctx.memories, memidx) {
+    Ok(it) -> Ok(addr_type(it))
+    Error(_) -> Error(UnknownMemory(memidx))
+  }
+}
+
+/// The narrower of two address types (`i32 < i64`): a `memory.copy` between memories
+/// of different widths bounds its count to the narrower one (spec/memory64 copy rule).
+fn min_addr_type(a: ValType, b: ValType) -> ValType {
+  case a, b {
+    ast.I32, _ -> ast.I32
+    _, ast.I32 -> ast.I32
+    _, _ -> ast.I64
+  }
+}
+
+/// The `(element reftype, limits)` of table `tableidx`, or `Error(UnknownTable(_))` if
+/// out of range of the module's tables (imports ++ defined).
+fn table_entry(
+  ctx: Ctx,
+  tableidx: Int,
+) -> Result(#(ValType, Limits), ValidateError) {
+  case nth(ctx.tables, tableidx) {
+    Ok(entry) -> Ok(entry)
+    Error(_) -> Error(UnknownTable(tableidx))
+  }
+}
+
+/// The reftype of element segment `elemidx`, or `Error(UnknownElem(_))` if out of range
+/// of the module's element segments (`table.init`/`elem.drop`).
+fn elem_type(ctx: Ctx, elemidx: Int) -> Result(ValType, ValidateError) {
+  case nth(ctx.elem_types, elemidx) {
+    Ok(rt) -> Ok(rt)
+    Error(_) -> Error(UnknownElem(elemidx))
+  }
+}
+
+/// `dataidx` must be `< data_count` (spec `valid/instructions`; `memory.init`/
+/// `data.drop`), else `Error(UnknownData(dataidx))`. The data-count-section *presence*
+/// rule is decode's (R13); this checks only the index bound.
+fn check_data_idx(ctx: Ctx, dataidx: Int) -> Result(Nil, ValidateError) {
+  case dataidx >= 0 && dataidx < ctx.data_count {
+    True -> Ok(Nil)
+    False -> Error(UnknownData(dataidx))
+  }
+}
+
+/// A `ref.func x` reference is valid iff `x` is a funcidx in range AND `x ∈ C.refs`
+/// (the declared-reference set). Out of range → `UnknownFunc(x)`; in range but not
+/// declared → `UndeclaredFunctionRef(x)` (spec `valid/instructions` ref.func rule).
+fn check_ref_declared(ctx: Ctx, x: Int) -> Result(Nil, ValidateError) {
+  case x >= 0 && x < list.length(ctx.func_types) {
+    False -> Error(UnknownFunc(x))
+    True ->
+      case set.contains(ctx.refs, x) {
+        True -> Ok(Nil)
+        False -> Error(UndeclaredFunctionRef(x))
+      }
+  }
+}
+
+/// Pop three `i32` operands (the `dst, src, count` of a `table.init`/`table.copy` —
+/// tables are always `i32`-indexed regardless of memory64), returning the reduced
+/// state. Any operand that is not `i32` → `TypeMismatch`.
+fn pop_three_i32(st: VState) -> Result(VState, ValidateError) {
+  use st1 <- result.try(pop_expect(st, ast.I32))
+  use st2 <- result.try(pop_expect(st1, ast.I32))
+  pop_expect(st2, ast.I32)
+}
+
+/// Compute `C.refs`: the set of funcidx *declared* in the module (spec appendix
+/// `funcidx(module)` free-occurrence collection). A funcidx joins `C.refs` when it
+/// occurs OUTSIDE a function body — specifically in a global initializer, an element
+/// segment (any mode: active offset/init, passive, declarative), or a **function**
+/// export. `start` does NOT join (it is a call, not a reference). Function bodies do
+/// not contribute (a `ref.func` in a body *requires* membership, it does not declare).
+/// Computed once, up front, before any body/const-expr is validated (§C.1).
+fn compute_refs(module: Module) -> Set(Int) {
+  let from_globals =
+    list.fold(module.globals, set.new(), fn(acc, g) {
+      collect_ref_funcs(acc, g.init)
+    })
+  let from_elems =
+    list.fold(module.elements, from_globals, fn(acc, e) {
+      let acc2 = case e.mode {
+        ast.ElemActive(_, offset) -> collect_ref_funcs(acc, offset)
+        _ -> acc
+      }
+      case e.init {
+        ast.ElemFuncs(funcs) ->
+          list.fold(funcs, acc2, fn(a, x) { set.insert(a, x) })
+        ast.ElemExprs(exprs) ->
+          list.fold(exprs, acc2, fn(a, expr) { collect_ref_funcs(a, expr) })
+      }
+    })
+  list.fold(module.exports, from_elems, fn(acc, ex) {
+    case ex.kind {
+      ast.ExportFunc -> set.insert(acc, ex.index)
+      _ -> acc
+    }
+  })
+}
+
+/// Add every funcidx referenced by a `ref.func x` in `instrs` to `acc` (used by
+/// `compute_refs` over const-expression instruction lists).
+fn collect_ref_funcs(acc: Set(Int), instrs: List(Instr)) -> Set(Int) {
+  list.fold(instrs, acc, fn(a, instr) {
+    case instr {
+      ast.RefFunc(x) -> set.insert(a, x)
+      _ -> a
+    }
+  })
 }
 
 /// The control frame at relative depth `l` (0 = innermost), or `Error(UnknownLabel)`.
@@ -878,27 +1356,64 @@ fn validate_br_table(
 
 // ─────────────────────────────── constant expressions & module items ───────────────────────────────
 
-/// A constant expression (global init / element offset / data offset) is valid iff it
-/// reduces to a single `t.const` of `expected` (spec `valid/instructions`, constant
-/// expressions). `global.get x` is valid only against an immutable IMPORTED global —
-/// none exist in Phase 2, so it is rejected; extended-const forms (`i32.add`, …) and
-/// any other instruction are also rejected (`NonConstantExpr`). A const of the wrong
-/// type is `TypeMismatch`. (When imports land in Phase 3, the deferred `global.get`
-/// case will consult the imported-global table here.)
+/// A constant expression (global init / element offset / element item / data offset)
+/// is valid iff it is a single producing instruction from the Phase-5 constant grammar
+/// (spec `valid/instructions`, constant expressions):
+///
+/// - `t.const c` → `t`; `ref.null t` → the reftype `t`; `ref.func x` → `funcref`
+///   (valid iff `x` is a funcidx in range AND `x ∈ C.refs`); `global.get x` →
+///   `globals[x].0` (valid ONLY when `x` is an **imported, immutable** global).
+///
+/// Everything else — extended-const `i32.add`/… chains, a `global.get` of a *defined*
+/// or *mutable* global — is `Error(NonConstantExpr)`. The produced type must equal
+/// `expected`, else `Error(TypeMismatch)` (numeric or reference). `ctx` supplies the
+/// `C.refs` set and imported-global lookup.
 fn validate_const_expr(
   init: List(Instr),
   expected: ValType,
+  ctx: Ctx,
 ) -> Result(Nil, ValidateError) {
   case init {
     [ast.I32Const(_)] -> expect_const_type(ast.I32, expected)
     [ast.I64Const(_)] -> expect_const_type(ast.I64, expected)
     [ast.F32Const(_)] -> expect_const_type(ast.F32, expected)
     [ast.F64Const(_)] -> expect_const_type(ast.F64, expected)
+    [ast.RefNull(rt)] -> expect_const_type(rt, expected)
+    [ast.RefFunc(x)] -> {
+      use _ <- result.try(check_ref_declared(ctx, x))
+      expect_const_type(ast.FuncRef, expected)
+    }
+    [ast.GlobalGet(x)] -> const_global_get(ctx, x, expected)
     _ -> Error(NonConstantExpr)
   }
 }
 
+/// A `global.get x` in a constant expression is constant ONLY when `x` refers to an
+/// **imported, immutable** global (spec constant expressions): `x < imported_global_count`
+/// and `globals[x].mutable == False`. Otherwise (a defined or mutable global) it is
+/// `Error(NonConstantExpr)`. On success the referenced global's type must equal
+/// `expected`, else `Error(TypeMismatch)`.
+fn const_global_get(
+  ctx: Ctx,
+  x: Int,
+  expected: ValType,
+) -> Result(Nil, ValidateError) {
+  case x >= 0 && x < ctx.imported_global_count {
+    False -> Error(NonConstantExpr)
+    True ->
+      case nth(ctx.globals, x) {
+        Ok(#(ty, False)) -> expect_const_type(ty, expected)
+        // an imported MUTABLE global is not a constant referent
+        Ok(#(_, True)) -> Error(NonConstantExpr)
+        Error(_) -> Error(NonConstantExpr)
+      }
+  }
+}
+
 /// `Ok(Nil)` if a const-expr's produced type matches `expected`, else `TypeMismatch`.
+/// (A reference-type disagreement in a const-expr is a plain operand mismatch — the
+/// dedicated `RefTypeMismatch` is reserved for `table.init`/`table.copy`/active-elem/
+/// `call_indirect` reftype disagreements, per the error vocabulary in §B.1.)
 fn expect_const_type(
   actual: ValType,
   expected: ValType,
@@ -911,52 +1426,107 @@ fn expect_const_type(
 
 /// Every global's init expr is a constant expression of the global's declared type
 /// (spec `valid/modules` globals). `Error(NonConstantExpr)`/`Error(TypeMismatch)`.
-fn check_global_inits(globals: List(ast.Global)) -> Result(Nil, ValidateError) {
-  list.try_each(globals, fn(g) { validate_const_expr(g.init, g.ty) })
+fn check_global_inits(
+  globals: List(ast.Global),
+  ctx: Ctx,
+) -> Result(Nil, ValidateError) {
+  list.try_each(globals, fn(g) { validate_const_expr(g.init, g.ty, ctx) })
 }
 
-/// Every active element segment: a table must exist, its offset is an `i32` constant
-/// expression, and every funcidx it writes is in the function index space (spec
-/// `valid/modules` elements). `Error(UnknownTable(0))`/`NonConstantExpr`/`TypeMismatch`/
-/// `UnknownFunc(_)`.
+/// Validate every element segment (spec `valid/modules` elements). For every mode each
+/// init item is a constant expression producing the segment's reftype; an active
+/// segment additionally requires its target table in range, that table's reftype to
+/// equal the segment's (`RefTypeMismatch`), and an `i32` offset const-expr (tables are
+/// `i32`-indexed). Passive/declarative segments carry no table/offset. `Error(_)` on
+/// any index/type/const violation.
 fn check_elements(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
-  let func_count = module.imported_func_count + list.length(module.funcs)
   list.try_each(module.elements, fn(e) {
-    // Phase-2 case: an active funcref segment into table 0 with a funcidx list.
-    // Passive/declarative modes, expr-init, explicit tableidx, and externref
-    // segments are P5-04's — rejected fail-closed here.
-    case e.mode, e.init, e.ref_ty {
-      ast.ElemActive(0, offset), ast.ElemFuncs(funcs), ast.FuncRef -> {
-        use _ <- result.try(case ctx.has_table {
+    use _ <- result.try(check_elem_init(e, ctx))
+    case e.mode {
+      ast.ElemActive(table, offset) -> {
+        use #(tbl_rt, _) <- result.try(table_entry(ctx, table))
+        use _ <- result.try(case tbl_rt == e.ref_ty {
           True -> Ok(Nil)
-          False -> Error(UnknownTable(0))
+          False -> Error(RefTypeMismatch)
         })
-        use _ <- result.try(validate_const_expr(offset, ast.I32))
-        list.try_each(funcs, fn(idx) {
-          case idx >= 0 && idx < func_count {
-            True -> Ok(Nil)
-            False -> Error(UnknownFunc(idx))
-          }
-        })
+        validate_const_expr(offset, ast.I32, ctx)
       }
-      _, _, _ -> Error(Unsupported("element segment (Phase 5 surface)"))
+      ast.ElemPassive -> Ok(Nil)
+      ast.ElemDeclarative -> Ok(Nil)
     }
   })
 }
 
-/// Every active data segment's offset is an `i32` constant expression (spec
-/// `valid/modules` data). `Error(NonConstantExpr)`/`Error(TypeMismatch)`. (Memory
-/// presence is enforced when the segment is instantiated; the offset's i32-ness is
-/// the static rule here.)
-fn check_data(data: List(ast.DataSegment)) -> Result(Nil, ValidateError) {
-  list.try_each(data, fn(d) {
-    // Phase-2 case: an active segment at memory 0. Passive data and
-    // active-with-explicit-memidx are P5-04's — rejected fail-closed here.
+/// Validate a segment's init items against its reftype (spec `valid/modules`). An
+/// `ElemFuncs` funcidx vector is an implicit `ref.func` per entry — each funcidx must
+/// be in range and declared (`C.refs`) and the segment's reftype must be `funcref`;
+/// an `ElemExprs` vector is a list of constant expressions each producing the reftype.
+fn check_elem_init(
+  e: ast.ElementSegment,
+  ctx: Ctx,
+) -> Result(Nil, ValidateError) {
+  case e.init {
+    ast.ElemFuncs(funcs) -> {
+      use _ <- result.try(expect_const_type(ast.FuncRef, e.ref_ty))
+      list.try_each(funcs, fn(x) { check_ref_declared(ctx, x) })
+    }
+    ast.ElemExprs(exprs) ->
+      list.try_each(exprs, fn(expr) { validate_const_expr(expr, e.ref_ty, ctx) })
+  }
+}
+
+/// Validate every data segment (spec `valid/modules` data). An active segment's target
+/// memory must be in range and its offset is a constant expression of THAT memory's
+/// index type (`i32` for a 32-bit memory, `i64` for a 64-bit one — the one place a
+/// data offset is not `i32`). A passive segment carries no memory/offset.
+fn check_data(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
+  list.try_each(module.data, fn(d) {
     case d.mode {
-      ast.DataActive(0, offset) -> validate_const_expr(offset, ast.I32)
-      _ -> Error(Unsupported("data segment (Phase 5 surface)"))
+      ast.DataActive(mem, offset) -> {
+        use at <- result.try(mem_addr_type(ctx, mem))
+        validate_const_expr(offset, at, ctx)
+      }
+      ast.DataPassive -> Ok(Nil)
     }
   })
+}
+
+/// Validate the export section (spec `valid/modules`): every export name is distinct
+/// and every export index is in range of the space its kind selects. A duplicate name
+/// → `Error(UnknownImportKind("duplicate export"))`; an out-of-range index → the
+/// matching `Unknown*` variant. Function exports have already contributed to `C.refs`.
+fn check_exports(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
+  use _ <- result.try(check_export_names_unique(module.exports))
+  list.try_each(module.exports, fn(ex) {
+    let count = case ex.kind {
+      ast.ExportFunc -> list.length(ctx.func_types)
+      ast.ExportTable -> list.length(ctx.tables)
+      ast.ExportMemory -> list.length(ctx.memories)
+      ast.ExportGlobal -> list.length(ctx.globals)
+    }
+    case ex.index >= 0 && ex.index < count {
+      True -> Ok(Nil)
+      False ->
+        case ex.kind {
+          ast.ExportFunc -> Error(UnknownFunc(ex.index))
+          ast.ExportTable -> Error(UnknownTable(ex.index))
+          ast.ExportMemory -> Error(UnknownMemory(ex.index))
+          ast.ExportGlobal -> Error(UnknownGlobal(ex.index))
+        }
+    }
+  })
+}
+
+/// Reject a module with two exports sharing a name (spec `valid/modules`: export names
+/// must be distinct) → `Error(UnknownImportKind("duplicate export"))`. Total.
+fn check_export_names_unique(
+  exports: List(ast.Export),
+) -> Result(Nil, ValidateError) {
+  let names = list.map(exports, fn(ex) { ex.name })
+  case list.length(names) == set.size(set.from_list(names)) {
+    True -> Ok(Nil)
+    False -> Error(UnknownImportKind("duplicate export"))
+  }
 }
 
 /// If a `start` function is present, its funcidx is in range and its type is `[] -> []`
