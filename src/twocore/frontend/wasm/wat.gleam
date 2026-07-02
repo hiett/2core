@@ -108,6 +108,127 @@ pub type WatError {
 }
 
 // ===========================================================================
+// The `.wast` script command layer (pass 2, unit P5-10b) — public types
+// ===========================================================================
+//
+// Spec: the reference interpreter's SCRIPT grammar (WebAssembly/spec
+// `interpreter/README.md`, `test/core/`) — the command language `wast2json`
+// consumes and the conformance harness drives. `parse_script` produces this
+// SRC-side `Script`; unit 11's test-side adapter (`wat_fixture.gleam`) maps it
+// onto `fixture.Command`/`fixture.Action`/`fixture.SpecValue` (src cannot emit
+// test-side types). The two shapes are deliberately parallel so that adapter is
+// a clean, total map.
+
+/// A parsed `.wast` script: its commands in source order (`«WAT-API»`).
+pub type Script =
+  List(Command)
+
+/// One `.wast` script command.
+///
+/// - `WatModule(id, module)`: a `(module …)` definition — `text`/`binary`/`quote`
+///   (see `ModuleDef`). `id` is the optional `$name` (WITHOUT the leading `$`)
+///   later actions/`register` target it by.
+/// - `Register(name, module)`: `(register "name" $mod?)` — republishes `module`'s
+///   (or the current module's) exports under import-namespace `name`.
+/// - `AssertReturn(action, expected)`: the action's result list must match
+///   `expected` (exact bits or a NaN class — see `Expected`).
+/// - `AssertTrap(action, failure)` / `AssertExhaustion(action, failure)`: the
+///   action must trap; `failure` is the expected trap-message SUBSTRING
+///   (exhaustion is `"call stack exhausted"`).
+/// - `AssertInvalid(module, failure)`: `module` PARSES but fails **validate**.
+/// - `AssertMalformed(module, failure)`: `module` fails at **parse/decode**
+///   (usually a `quote`/`binary` form).
+/// - `AssertUnlinkable(module, failure)`: valid, but fails at **link**.
+/// - `AssertUninstantiable(module, failure)`: links, but traps at instantiation.
+/// - `ActionCmd(action)`: a bare `(invoke …)`/`(get …)` run for its effects.
+/// - `CmdSkipped(kind)`: an out-of-scope command head (e.g. a thread command) —
+///   CATEGORIZED, never silently dropped.
+pub type Command {
+  WatModule(id: Option(String), module: ModuleDef)
+  Register(name: String, module: Option(String))
+  AssertReturn(action: Action, expected: List(Expected))
+  AssertTrap(action: Action, failure: String)
+  AssertExhaustion(action: Action, failure: String)
+  AssertInvalid(module: ModuleDef, failure: String)
+  AssertMalformed(module: ModuleDef, failure: String)
+  AssertUnlinkable(module: ModuleDef, failure: String)
+  AssertUninstantiable(module: ModuleDef, failure: String)
+  ActionCmd(action: Action)
+  CmdSkipped(kind: String)
+}
+
+/// A module named in a script, in one of the `.wast`'s three forms. Which one a
+/// command carries decides how unit 11 realises it into an instance.
+///
+/// - `TextModule(module)`: `(module <fields>)` — already parsed via
+///   `parse_module` into an `ast.Module` (structurally equal to a decoded one),
+///   so unit 11 runs it straight through `validate`/`lower`.
+/// - `BinaryModule(bytes)`: `(module binary "…"*)` — the CONCATENATED
+///   string-literal bytes; unit 11 feeds them to `decode` directly (this is how
+///   the suite injects hand-crafted malformed/edge binaries).
+/// - `QuoteModule(source)`: `(module quote "…"*)` — the concatenated text, to be
+///   (re)parsed with `parse_module` when the command runs (used by
+///   `assert_malformed (module quote …)`).
+pub type ModuleDef {
+  TextModule(module: ast.Module)
+  BinaryModule(bytes: BitArray)
+  QuoteModule(source: String)
+}
+
+/// A `.wast` action: invoke an exported function or read an exported global.
+///
+/// - `Invoke(module, field, args)`: call export `field` with `args`.
+/// - `Get(module, field)`: read exported global `field`.
+///
+/// `module` is the TARGET module's script name (`$id`/registered name, WITHOUT
+/// the `$`), or `None` for the current (most-recently-defined) module. Resolving
+/// that name to an instance is unit 11's `registry` — this parser records the
+/// NAME only (the cleaner seam: the parser holds no cross-module runtime state).
+pub type Action {
+  Invoke(module: Option(String), field: String, args: List(WastValue))
+  Get(module: Option(String), field: String)
+}
+
+/// A concrete value: an action argument, or an EXACT-bits expected result.
+/// Numeric values carry RAW bits (D5 — the same unsigned bit pattern the
+/// conformance fixture stores, so BEAM doubles never destroy a NaN payload);
+/// reference values carry their reftype / host payload (R18).
+///
+/// - `WastI32(bits)` / `WastI64(bits)`: unsigned integer bit pattern in
+///   `[0, 2^32)` / `[0, 2^64)`.
+/// - `WastF32(bits)` / `WastF64(bits)`: raw IEEE-754 binary32/binary64 bits.
+/// - `RefNullVal(ty)`: `(ref.null func|extern)` — a null reference of reftype
+///   `ty` (`FuncRef`/`ExternRef`).
+/// - `RefFuncVal`: `(ref.func …)` — a (non-null) funcref (as an expected result,
+///   "any non-null funcref").
+/// - `RefExternVal(payload)`: `(ref.extern N)` — the host-constructible
+///   externref carrying host int `N`.
+pub type WastValue {
+  WastI32(bits: Int)
+  WastI64(bits: Int)
+  WastF32(bits: Int)
+  WastF64(bits: Int)
+  RefNullVal(ty: ast.ValType)
+  RefFuncVal
+  RefExternVal(payload: Int)
+}
+
+/// An expected result in an `assert_return`: either an exact `WastValue` or a
+/// NaN CLASS pattern. The two NaN forms are DISTINCT from an exact-bits expected
+/// so unit 11's oracle class-matches (a canonical/arithmetic NaN never compares
+/// by bit-equality — spec `assert_return_canonical_nan`/`_arithmetic_nan`).
+/// `width` is `32` (f32) or `64` (f64).
+///
+/// - `ExpectedValue(value)`: an exact `WastValue` (bit-equal / ref match).
+/// - `ExpectedNanCanonical(width)`: `(f32|f64.const nan:canonical)`.
+/// - `ExpectedNanArithmetic(width)`: `(f32|f64.const nan:arithmetic)`.
+pub type Expected {
+  ExpectedValue(value: WastValue)
+  ExpectedNanCanonical(width: Int)
+  ExpectedNanArithmetic(width: Int)
+}
+
+// ===========================================================================
 // A. The lexer
 // ===========================================================================
 
@@ -947,6 +1068,14 @@ type Env {
 /// to reject it). Total over any `String`.
 pub fn parse_module(source: String) -> Result(ast.Module, WatError) {
   use tokens <- result.try(lex(source))
+  parse_module_tokens(tokens)
+}
+
+/// Parse an already-lexed token stream into an `ast.Module` (the shared body of
+/// `parse_module` and the script layer's text-module command). `tokens` must be
+/// a `(module …)` group (or a bare field list). Same contract/failure modes as
+/// `parse_module`; never panics.
+fn parse_module_tokens(tokens: List(Token)) -> Result(ast.Module, WatError) {
   use fields0 <- result.try(extract_module_fields(tokens))
   let fields = list.filter(fields0, fn(f) { !is_annotation_field(f) })
   use #(env, types) <- result.try(phase_a(fields))
@@ -3652,5 +3781,337 @@ fn simple_instr(kw: String) -> Result(ast.Instr, Nil) {
     "i64.trunc_sat_f64_s" -> Ok(ast.I64TruncSatF64S)
     "i64.trunc_sat_f64_u" -> Ok(ast.I64TruncSatF64U)
     _ -> Error(Nil)
+  }
+}
+
+// ===========================================================================
+// H. The `.wast` script command parser (pass 2)
+// ===========================================================================
+//
+// A `.wast` script is a flat sequence of top-level `(command …)` s-expressions
+// (no outer wrapper). `parse_script` collects them and maps each head keyword to
+// a `Command`. Nested modules inside `assert_*` are parsed to a `ModuleDef` but
+// NOT type-checked (the parse-vs-validate split routes `assert_malformed` to
+// parse/decode and `assert_invalid` through parse into validate). Every step
+// returns `Result`; malformed script grammar → a typed `WatError`, never a panic
+// (a malformed *asserted* module is still `Ok` — its `ModuleDef` is carried for
+// the runner to reject at the right stage).
+
+/// Parse a `.wast` script `source` into an ordered `Script` (`«WAT-API»`).
+///
+/// Each top-level `(command …)` becomes one `Command`, in source order:
+/// `(module …)` in text/`binary`/`quote` form, `register`, the full `assert_*`
+/// family, and bare `(invoke …)`/`(get …)` actions are recognised; any other
+/// command head is a categorized `CmdSkipped(head)` (never dropped).
+///
+/// Returns `Ok(script)`, or a typed `WatError` for any malformation of the
+/// SCRIPT grammar itself (trailing junk, a truncated command, a bad action).
+/// Total over any `String`.
+pub fn parse_script(source: String) -> Result(Script, WatError) {
+  use tokens <- result.try(lex(source))
+  use #(groups, after) <- result.try(collect_groups(tokens))
+  case after {
+    [] -> list.try_map(groups, parse_command)
+    [t, ..] -> Error(UnexpectedToken(tok_pos(t), "script command", describe(t)))
+  }
+}
+
+/// Dispatch one command group (the tokens INSIDE its parens, head keyword first).
+fn parse_command(inside: List(Token)) -> Result(Command, WatError) {
+  case inside {
+    [Keyword(_, "module"), ..] -> {
+      use #(id, def) <- result.try(parse_module_def(inside))
+      Ok(WatModule(id, def))
+    }
+    [Keyword(_, "register"), ..rest] -> parse_register(rest)
+    [Keyword(_, "invoke"), ..] -> parse_bare_action(inside)
+    [Keyword(_, "get"), ..] -> parse_bare_action(inside)
+    [Keyword(_, "assert_return"), ..rest] -> parse_assert_return(rest)
+    [Keyword(_, "assert_trap"), ..rest] -> parse_assert_trap(rest)
+    [Keyword(_, "assert_exhaustion"), ..rest] ->
+      parse_assert_action_failure(rest, AssertExhaustion)
+    [Keyword(_, "assert_invalid"), ..rest] ->
+      parse_assert_module_failure(rest, AssertInvalid)
+    [Keyword(_, "assert_malformed"), ..rest] ->
+      parse_assert_module_failure(rest, AssertMalformed)
+    [Keyword(_, "assert_unlinkable"), ..rest] ->
+      parse_assert_module_failure(rest, AssertUnlinkable)
+    [Keyword(_, "assert_uninstantiable"), ..rest] ->
+      parse_assert_module_failure(rest, AssertUninstantiable)
+    [Keyword(_, other), ..] -> Ok(CmdSkipped(other))
+    [t, ..] -> Ok(CmdSkipped(describe(t)))
+    [] -> Error(UnexpectedEof("script command"))
+  }
+}
+
+fn parse_bare_action(inside: List(Token)) -> Result(Command, WatError) {
+  use action <- result.try(parse_action(inside))
+  Ok(ActionCmd(action))
+}
+
+/// Parse a `(module …)` group into `#(optional $id, ModuleDef)`. Detects the
+/// `binary`/`quote` heads BEFORE falling through to a text module (whose fields
+/// are reconstructed and handed to `parse_module_tokens`).
+fn parse_module_def(
+  inside: List(Token),
+) -> Result(#(Option(String), ModuleDef), WatError) {
+  case inside {
+    [Keyword(hp, "module"), ..rest] -> {
+      let #(id, rest1) = case rest {
+        [Id(_, n), ..r] -> #(Some(n), r)
+        _ -> #(None, rest)
+      }
+      case rest1 {
+        [Keyword(_, "binary"), ..strs] -> {
+          use bytes <- result.try(concat_strings(strs))
+          Ok(#(id, BinaryModule(bytes)))
+        }
+        [Keyword(_, "quote"), ..strs] -> {
+          use bytes <- result.try(concat_strings(strs))
+          use src <- result.try(str_to_name(bytes, hp))
+          Ok(#(id, QuoteModule(src)))
+        }
+        _ -> {
+          // A text module: rebuild `(module <fields>)` and parse the fields.
+          let toks = [
+            LParen(hp),
+            Keyword(hp, "module"),
+            ..list.append(rest1, [RParen(hp)])
+          ]
+          use m <- result.try(parse_module_tokens(toks))
+          Ok(#(id, TextModule(m)))
+        }
+      }
+    }
+    [t, ..] -> Error(UnexpectedToken(tok_pos(t), "(module …)", describe(t)))
+    [] -> Error(UnexpectedEof("(module …)"))
+  }
+}
+
+/// Parse a `(register "name" $mod?)` command's arguments (head already consumed).
+fn parse_register(rest: List(Token)) -> Result(Command, WatError) {
+  case rest {
+    [Str(sp, nb), ..r] -> {
+      use name <- result.try(str_to_name(nb, sp))
+      let modname = case r {
+        [Id(_, n), ..] -> Some(n)
+        _ -> None
+      }
+      Ok(Register(name, modname))
+    }
+    [t, ..] ->
+      Error(UnexpectedToken(tok_pos(t), "register name string", describe(t)))
+    [] -> Error(UnexpectedEof("register name"))
+  }
+}
+
+/// Parse an action group (the tokens inside a `(invoke …)`/`(get …)`).
+fn parse_action(inside: List(Token)) -> Result(Action, WatError) {
+  case inside {
+    [Keyword(_, "invoke"), ..rest] -> {
+      let #(modname, rest1) = take_action_module(rest)
+      case rest1 {
+        [Str(sp, fb), ..argtoks] -> {
+          use field <- result.try(str_to_name(fb, sp))
+          use args <- result.try(parse_wast_values(argtoks))
+          Ok(Invoke(modname, field, args))
+        }
+        [t, ..] ->
+          Error(UnexpectedToken(tok_pos(t), "invoke field name", describe(t)))
+        [] -> Error(UnexpectedEof("invoke field name"))
+      }
+    }
+    [Keyword(_, "get"), ..rest] -> {
+      let #(modname, rest1) = take_action_module(rest)
+      case rest1 {
+        [Str(sp, fb), ..] -> {
+          use field <- result.try(str_to_name(fb, sp))
+          Ok(Get(modname, field))
+        }
+        [t, ..] ->
+          Error(UnexpectedToken(tok_pos(t), "get field name", describe(t)))
+        [] -> Error(UnexpectedEof("get field name"))
+      }
+    }
+    [t, ..] -> Error(UnexpectedToken(tok_pos(t), "invoke or get", describe(t)))
+    [] -> Error(UnexpectedEof("action"))
+  }
+}
+
+/// A leading `$id` module reference in an action (before the field string).
+fn take_action_module(toks: List(Token)) -> #(Option(String), List(Token)) {
+  case toks {
+    [Id(_, n), ..r] -> #(Some(n), r)
+    _ -> #(None, toks)
+  }
+}
+
+/// Parse the argument groups of an action into `WastValue`s.
+fn parse_wast_values(toks: List(Token)) -> Result(List(WastValue), WatError) {
+  use #(groups, after) <- result.try(collect_groups(toks))
+  case after {
+    [] -> list.try_map(groups, parse_wast_value)
+    [t, ..] -> Error(UnexpectedToken(tok_pos(t), "value or )", describe(t)))
+  }
+}
+
+/// Parse one value group (tokens inside a single `( … )`) into a `WastValue`.
+/// Numeric consts reuse the pass-1 bit-exact number path (raw UNSIGNED bits for
+/// integers); reference values map to the R18 variants.
+fn parse_wast_value(inside: List(Token)) -> Result(WastValue, WatError) {
+  case inside {
+    [Keyword(_, "i32.const"), Num(p, lex)] -> {
+      use b <- result.try(const_int_bits(lex, 32, p))
+      Ok(WastI32(b))
+    }
+    [Keyword(_, "i64.const"), Num(p, lex)] -> {
+      use b <- result.try(const_int_bits(lex, 64, p))
+      Ok(WastI64(b))
+    }
+    [Keyword(_, "f32.const"), Num(p, lex)] -> {
+      use b <- result.try(float_bits(lex, f32_fmt(), p))
+      Ok(WastF32(b))
+    }
+    [Keyword(_, "f64.const"), Num(p, lex)] -> {
+      use b <- result.try(float_bits(lex, f64_fmt(), p))
+      Ok(WastF64(b))
+    }
+    [Keyword(_, "ref.null"), Keyword(_, "func")] -> Ok(RefNullVal(ast.FuncRef))
+    [Keyword(_, "ref.null"), Keyword(_, "extern")] ->
+      Ok(RefNullVal(ast.ExternRef))
+    [Keyword(_, "ref.extern"), Num(p, lex)] -> {
+      use v <- result.try(uint_value(lex, 32, p))
+      Ok(RefExternVal(v))
+    }
+    [Keyword(_, "ref.func"), ..] -> Ok(RefFuncVal)
+    [t, ..] -> Error(UnexpectedToken(tok_pos(t), "wast value", describe(t)))
+    [] -> Error(UnexpectedEof("wast value"))
+  }
+}
+
+/// Interpret an integer lexeme for a `t.const` value at bit `width` (32/64),
+/// returning the RAW UNSIGNED bit pattern in `[0, 2^width)` — the representation
+/// the conformance fixture stores. Accepts the combined signed∪unsigned range,
+/// else `NumberOutOfRange`. (Twin of `const_int_value`, which returns the signed
+/// value the AST stores.)
+fn const_int_bits(
+  lexeme: String,
+  width: Int,
+  pos: Pos,
+) -> Result(Int, WatError) {
+  case int_math_value(lexeme) {
+    Ok(v) -> {
+      let m = pow2(width)
+      let half = pow2(width - 1)
+      case v >= -half && v < m {
+        True -> Ok({ { v % m } + m } % m)
+        False -> Error(NumberOutOfRange(pos, lexeme))
+      }
+    }
+    Error(_) -> Error(NumberOutOfRange(pos, lexeme))
+  }
+}
+
+/// Parse the expected-result groups of an `assert_return`.
+fn parse_expecteds(toks: List(Token)) -> Result(List(Expected), WatError) {
+  use #(groups, after) <- result.try(collect_groups(toks))
+  case after {
+    [] -> list.try_map(groups, parse_expected)
+    [t, ..] ->
+      Error(UnexpectedToken(tok_pos(t), "expected value or )", describe(t)))
+  }
+}
+
+/// Parse one expected-result group: a `nan:canonical`/`nan:arithmetic` float
+/// pattern becomes a NaN CLASS; anything else is an exact `WastValue`.
+fn parse_expected(inside: List(Token)) -> Result(Expected, WatError) {
+  case inside {
+    [Keyword(_, "f32.const"), Num(p, lex)] -> nan_or_value(lex, 32, p)
+    [Keyword(_, "f64.const"), Num(p, lex)] -> nan_or_value(lex, 64, p)
+    _ -> {
+      use v <- result.try(parse_wast_value(inside))
+      Ok(ExpectedValue(v))
+    }
+  }
+}
+
+fn nan_or_value(
+  lex: String,
+  width: Int,
+  pos: Pos,
+) -> Result(Expected, WatError) {
+  case drop_sign(lex) {
+    "nan:canonical" -> Ok(ExpectedNanCanonical(width))
+    "nan:arithmetic" -> Ok(ExpectedNanArithmetic(width))
+    _ -> {
+      use b <- result.try(float_bits(lex, float_fmt_of(width), pos))
+      Ok(ExpectedValue(float_val_of(width, b)))
+    }
+  }
+}
+
+fn float_fmt_of(width: Int) -> FloatFmt {
+  case width {
+    32 -> f32_fmt()
+    _ -> f64_fmt()
+  }
+}
+
+fn float_val_of(width: Int, bits: Int) -> WastValue {
+  case width {
+    32 -> WastF32(bits)
+    _ -> WastF64(bits)
+  }
+}
+
+/// `(assert_return <action> <result>*)`.
+fn parse_assert_return(rest: List(Token)) -> Result(Command, WatError) {
+  use #(action_toks, after) <- result.try(take_group(rest))
+  use action <- result.try(parse_action(action_toks))
+  use expected <- result.try(parse_expecteds(after))
+  Ok(AssertReturn(action, expected))
+}
+
+/// `(assert_trap …)` — an ACTION that traps, OR (the reference interpreter's
+/// overload) a MODULE whose instantiation traps → `AssertUninstantiable`.
+fn parse_assert_trap(rest: List(Token)) -> Result(Command, WatError) {
+  case peek_group_head(rest) {
+    Some("module") -> parse_assert_module_failure(rest, AssertUninstantiable)
+    _ -> parse_assert_action_failure(rest, AssertTrap)
+  }
+}
+
+/// `(assert_* <action> "<failure>")` (trap / exhaustion).
+fn parse_assert_action_failure(
+  rest: List(Token),
+  ctor: fn(Action, String) -> Command,
+) -> Result(Command, WatError) {
+  use #(action_toks, after) <- result.try(take_group(rest))
+  use action <- result.try(parse_action(action_toks))
+  use failure <- result.try(take_failure(after))
+  Ok(ctor(action, failure))
+}
+
+/// `(assert_* <module> "<failure>")` (invalid / malformed / unlinkable /
+/// uninstantiable). Any leading `$id` on the asserted module is discarded — an
+/// asserted-reject module is never referenced by later commands.
+fn parse_assert_module_failure(
+  rest: List(Token),
+  ctor: fn(ModuleDef, String) -> Command,
+) -> Result(Command, WatError) {
+  use #(mod_toks, after) <- result.try(take_group(rest))
+  use #(_id, def) <- result.try(parse_module_def(mod_toks))
+  use failure <- result.try(take_failure(after))
+  Ok(ctor(def, failure))
+}
+
+/// The trailing failure-message string of an assert command. Tolerates its
+/// absence (empty string) so a text-less assert is still total; a non-string
+/// trailing token is a typed error.
+fn take_failure(toks: List(Token)) -> Result(String, WatError) {
+  case toks {
+    [Str(sp, b), ..] -> str_to_name(b, sp)
+    [] -> Ok("")
+    [t, ..] -> Error(UnexpectedToken(tok_pos(t), "failure string", describe(t)))
   }
 }
