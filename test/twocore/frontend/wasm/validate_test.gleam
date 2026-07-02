@@ -57,12 +57,12 @@ fn func_(type_idx: Int, body: List(ast.Instr)) -> ast.Func {
 
 /// A memory type with `min` pages and optional `max`.
 fn mem(min: Int, max: option.Option(Int)) -> ast.MemType {
-  ast.MemType(ast.Limits(min, max))
+  ast.MemType(ast.Limits(min, max), ast.Idx32)
 }
 
 /// A (funcref) table type with `min` entries and optional `max`.
 fn tbl(min: Int, max: option.Option(Int)) -> ast.TableType {
-  ast.TableType(ast.Limits(min, max))
+  ast.TableType(ast.FuncRef, ast.Limits(min, max))
 }
 
 /// An otherwise-empty module; callers override the fields they exercise.
@@ -79,6 +79,7 @@ fn module(
   ast.Module(
     imported_func_count: 0,
     types: types,
+    imports: [],
     tables: tables,
     memories: memories,
     globals: globals,
@@ -86,6 +87,7 @@ fn module(
     start: start,
     elements: elements,
     data: data,
+    data_count: None,
     exports: [],
   )
 }
@@ -282,10 +284,14 @@ pub fn accept_active_segments_test() {
     funcs: [func_(0, [ast.End])],
     start: None,
     elements: [
-      ast.ElementSegment(table: 0, offset: [ast.I32Const(0)], funcs: [0]),
+      ast.ElementSegment(
+        ast.ElemActive(0, [ast.I32Const(0)]),
+        ast.FuncRef,
+        ast.ElemFuncs([0]),
+      ),
     ],
     data: [
-      ast.DataSegment(mem: 0, offset: [ast.I32Const(0)], bytes: <<1, 2, 3>>),
+      ast.DataSegment(ast.DataActive(0, [ast.I32Const(0)]), <<1, 2, 3>>),
     ],
   )
   |> validate.validate()
@@ -309,7 +315,7 @@ pub fn reject_bad_align_i32_load_test() {
     funcs: [
       func_(0, [
         ast.LocalGet(0),
-        ast.I32Load(ast.MemArg(align: 3, offset: 0)),
+        ast.I32Load(ast.MemArg(align: 3, offset: 0, mem: 0)),
         ast.End,
       ]),
     ],
@@ -332,7 +338,7 @@ pub fn reject_bad_align_load8_test() {
     funcs: [
       func_(0, [
         ast.LocalGet(0),
-        ast.I32Load8S(ast.MemArg(align: 1, offset: 0)),
+        ast.I32Load8S(ast.MemArg(align: 1, offset: 0, mem: 0)),
         ast.End,
       ]),
     ],
@@ -418,7 +424,7 @@ pub fn reject_store_value_mismatch_test() {
       func_(0, [
         ast.LocalGet(0),
         ast.LocalGet(1),
-        ast.I64Store(ast.MemArg(align: 0, offset: 0)),
+        ast.I64Store(ast.MemArg(align: 0, offset: 0, mem: 0)),
         ast.End,
       ]),
     ],
@@ -441,7 +447,7 @@ pub fn reject_load_address_mismatch_test() {
     funcs: [
       func_(0, [
         ast.LocalGet(0),
-        ast.I32Load(ast.MemArg(align: 0, offset: 0)),
+        ast.I32Load(ast.MemArg(align: 0, offset: 0, mem: 0)),
         ast.End,
       ]),
     ],
@@ -540,7 +546,7 @@ pub fn reject_load_no_memory_test() {
     funcs: [
       func_(0, [
         ast.LocalGet(0),
-        ast.I32Load(ast.MemArg(align: 0, offset: 0)),
+        ast.I32Load(ast.MemArg(align: 0, offset: 0, mem: 0)),
         ast.End,
       ]),
     ],
@@ -560,7 +566,7 @@ pub fn reject_memory_size_no_memory_test() {
     tables: [],
     memories: [],
     globals: [],
-    funcs: [func_(0, [ast.MemorySize, ast.End])],
+    funcs: [func_(0, [ast.MemorySize(0), ast.End])],
     start: None,
     elements: [],
     data: [],
@@ -696,7 +702,11 @@ pub fn reject_element_func_out_of_range_test() {
     funcs: [func_(0, [ast.End])],
     start: None,
     elements: [
-      ast.ElementSegment(table: 0, offset: [ast.I32Const(0)], funcs: [5]),
+      ast.ElementSegment(
+        ast.ElemActive(0, [ast.I32Const(0)]),
+        ast.FuncRef,
+        ast.ElemFuncs([5]),
+      ),
     ],
     data: [],
   )

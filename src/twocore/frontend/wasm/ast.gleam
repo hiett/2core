@@ -1,8 +1,18 @@
-//// The decoded WebAssembly 1.0 module model. Originally the `«WASM-AST»` Phase-1
+//// The decoded WebAssembly module model. Originally the `«WASM-AST»` Phase-1
 //// slice (Unit 05); extended by Unit 07 to the full WASM 1.0 surface —
 //// `«WASM-AST2»` — adding the table/memory/global/element/data/start sections and
 //// the memory, float, and conversion instruction groups consumed by units 08
-//// (validate) and 09 (lower).
+//// (validate) and 09 (lower). Extended again by **Phase-5 Unit P5-03** to the full
+//// standardized surface (minus SIMD) — `«WASM-AST3»` — adding the two MVP
+//// reference value types (`funcref`/`externref`), the reference/table/bulk-memory
+//// instructions, a per-op memory index (multi-memory), the memory64 address-width
+//// axis (`IdxType`; runtime deferred to Phase 6 per R12), the full element-segment
+//// (flags 0–7) and data-segment (flags 0/1/2) grammar with passive/declarative
+//// modes, the import section (non-function imports), and the datacount section.
+//// `«WASM-AST3»` is consumed by units P5-04 (validate), P5-05 (lower), and P5-10
+//// (WAT text parser). The AST is deliberately WASM-shaped: a reftype is just the
+//// `FuncRef`/`ExternRef` subset of `ValType` (the IR's distinct `RefType` narrowing
+//// happens at lower, not here).
 ////
 //// This AST is deliberately **WASM-shaped**: it mirrors the binary format's
 //// structure (a flat instruction stream, an operand-stack op set, numeric
@@ -26,16 +36,22 @@
 
 import gleam/option.{type Option}
 
-/// A WebAssembly value type — the four Phase-1 number types.
+/// A WebAssembly value type — the four number types plus the two MVP reference
+/// types (Phase 5, `«WASM-AST3»`).
 ///
-/// In the binary format each is a single byte (the 1-byte signed-LEB of a small
-/// negative number): `i32 = 0x7F`, `i64 = 0x7E`, `f32 = 0x7D`, `f64 = 0x7C`.
-/// No reference types (`funcref`/`externref`) or vector types in Phase 1.
+/// In the binary format each is a single byte: `i32 = 0x7F`, `i64 = 0x7E`,
+/// `f32 = 0x7D`, `f64 = 0x7C`, `funcref = 0x70`, `externref = 0x6F`
+/// (spec binary/types.html#reference-types). There is **no separate `RefType`** in
+/// the AST — a reftype is exactly the `FuncRef`/`ExternRef` subset of `ValType`,
+/// validated positionally by `decode_reftype` (so one `decode_valtype` serves every
+/// valtype site). No `v128` (SIMD, Phase 6) and no GC-proposal reftypes.
 pub type ValType {
   I32
   I64
   F32
   F64
+  FuncRef
+  ExternRef
 }
 
 /// A function type (signature): the parameter value types and the result value
@@ -116,17 +132,37 @@ pub type Limits {
   Limits(min: Int, max: Option(Int))
 }
 
-/// A table type (table section, id 4). The MVP element type is always `funcref`
-/// (`0x70`); `externref` (`0x6F`) is rejected at decode (`BadRefType`), so no
-/// reftype field is needed yet — only the resizable `limits` (in entries).
+/// A table type (table section, id 4).
+///
+/// - `elem_type`: the element reference type — `FuncRef` (`0x70`) or `ExternRef`
+///   (`0x6F`), guaranteed a reftype by `decode_reftype`. A Phase-4 module's table is
+///   `FuncRef` (byte-identical). Tables stay i32-indexed (table64 is out of scope).
+/// - `limits`: the resizable size bounds, in entries.
+///
+/// Validate (unit 04) checks table element ↔ element-segment reftype agreement.
 pub type TableType {
-  TableType(limits: Limits)
+  TableType(elem_type: ValType, limits: Limits)
 }
 
-/// A memory type (memory section, id 5) — just its resizable `limits`, in 64KiB
-/// pages.
+/// A memory's address width, from the limits' index-type flag bit (bit 2, `0x04`).
+///
+/// - `Idx32`: a 32-bit-indexed memory (`i32` addresses, MVP). The default and only
+///   value for a Phase-4 module.
+/// - `Idx64`: a 64-bit-indexed memory (memory64). Decoded here so a 64-bit memory
+///   round-trips and validate can type it, but its runtime is deferred to Phase 6
+///   (R12): lower/link reject an `Idx64` memory.
+pub type IdxType {
+  Idx32
+  Idx64
+}
+
+/// A memory type (memory section, id 5): resizable `limits` (in 64KiB pages) plus
+/// the address width `idx_type` (`Idx64` iff the limits flag set the index-type
+/// bit). Validate (unit 04) owns `min <= max <= range` (range = 2^16 pages for
+/// `Idx32`, 2^48 for `Idx64`). The shared/threads bit is rejected by the flag
+/// decoder and never stored here.
 pub type MemType {
-  MemType(limits: Limits)
+  MemType(limits: Limits, idx_type: IdxType)
 }
 
 /// A global declaration (global section, id 6).
@@ -142,71 +178,141 @@ pub type Global {
   Global(ty: ValType, mutable: Bool, init: List(Instr))
 }
 
-/// An ACTIVE element segment (element section, id 9; binary flag `0`).
+/// An element segment (element section, id 9; binary flags 0–7 — Phase 5).
 ///
-/// - `table`: the target table index — always `0` for the flag-`0` form.
-/// - `offset`: the constant offset expression's instruction list (its trailing
-///   `End` is consumed, NOT stored). Structural only (const-ness is validate's).
-/// - `funcs`: the `funcidx` vector written into the table starting at `offset`.
+/// The reference-types proposal generalizes the element grammar along two axes,
+/// both modeled here faithfully (lower unifies them into IR3's `init: List(Expr)`):
 ///
-/// Passive/declarative forms (flags 1–7) and the expr-list forms are
-/// decode-rejected (`BadElemKind`) — reference types / bulk memory, Phase 3.
+/// - `mode`: active (a target table index + offset const-expr), passive, or
+///   declarative.
+/// - `ref_ty`: the element reference type (`FuncRef` for the funcidx / elemkind
+///   forms, the decoded reftype for the expression forms 5/6/7).
+/// - `init`: either a `funcidx` vector (`ElemFuncs`, flags 0–3; each funcidx is an
+///   implicit `ref.func`) or a vector of const-expressions (`ElemExprs`, flags 4–7).
+///
+/// A Phase-4 module's active flag-0 segment is
+/// `ElementSegment(ElemActive(0, offset), FuncRef, ElemFuncs(funcs))` (byte-identical).
 pub type ElementSegment {
-  ElementSegment(table: Int, offset: List(Instr), funcs: List(Int))
+  ElementSegment(mode: ElemMode, ref_ty: ValType, init: ElemInit)
 }
 
-/// An ACTIVE data segment (data section, id 11; binary forms `0x00`/`0x02`).
+/// The three element-segment modes (spec binary/modules.html#element-section).
 ///
-/// - `mem`: the target memory index — always `0` in the MVP (form `0x00` is mem 0;
-///   form `0x02` carries an explicit memidx that must be `0`, else
-///   `BadMemoryIndex`).
-/// - `offset`: the constant offset expression's instruction list (trailing `End`
-///   consumed, not stored).
+/// - `ElemActive(table, offset)`: written into table `table` at const `offset` at
+///   instantiation. Flags 0/4 imply `table 0`; flags 2/6 carry an explicit tableidx.
+/// - `ElemPassive`: a droppable runtime value consumed by `table.init`.
+/// - `ElemDeclarative`: carries no runtime state; only makes `ref.func` targets valid.
+pub type ElemMode {
+  ElemActive(table: Int, offset: List(Instr))
+  ElemPassive
+  ElemDeclarative
+}
+
+/// An element segment's init items.
+///
+/// - `ElemFuncs(funcs)`: the `funcidx` vector (flags 0–3, implicitly funcref; each
+///   funcidx denotes a `ref.func`).
+/// - `ElemExprs(exprs)`: a vector of const-expressions (flags 4–7), each terminated
+///   by its own depth-0 `End` (consumed, not stored) — typically `ref.func x` or
+///   `ref.null t`.
+pub type ElemInit {
+  ElemFuncs(List(Int))
+  ElemExprs(List(List(Instr)))
+}
+
+/// A data segment (data section, id 11; binary flags 0/1/2 — Phase 5).
+///
+/// - `mode`: active (a target memory index + offset const-expr) or passive.
 /// - `bytes`: the raw payload (`vec(byte)`), as a `BitArray`.
 ///
-/// Passive form `0x01` is decode-rejected (`BadDataKind`) — bulk memory, Phase 3.
+/// A Phase-4 module's active flag-0 segment is `DataSegment(DataActive(0, offset),
+/// bytes)` (byte-identical). The passive form (flag 1) has no memidx/offset.
 pub type DataSegment {
-  DataSegment(mem: Int, offset: List(Instr), bytes: BitArray)
+  DataSegment(mode: DataMode, bytes: BitArray)
 }
 
-/// A load/store memory immediate (`memarg`).
+/// The two data-segment modes (spec binary/modules.html#data-section).
 ///
-/// - `align`: the RAW log2 alignment EXPONENT (the actual alignment is `2^align`).
-///   Kept only so validate can enforce `2^align <= access-byte-width`; it is
-///   NON-SEMANTIC (never affects a result) and may be discarded after validation.
-/// - `offset`: the static byte offset added to the dynamic address operand.
+/// - `DataActive(mem, offset)`: written into memory index `mem` at const `offset` at
+///   instantiation. Flag 0 implies `mem 0`; flag 2 carries an explicit memidx (which
+///   under multi-memory may be non-zero).
+/// - `DataPassive`: a droppable runtime value consumed by `memory.init` (flag 1).
+pub type DataMode {
+  DataActive(mem: Int, offset: List(Instr))
+  DataPassive
+}
+
+/// A load/store memory immediate (`memarg`) — extended for multi-memory + memory64.
 ///
-/// Both are decoded as `u32` LEB128. The MVP form is exactly these two `u32`s;
-/// the memory64/multi-memory encodings (u64 offset, memidx in align bit 6) are
-/// out of scope.
+/// - `align`: the log2 alignment EXPONENT with the memidx flag bit (`0x40`) already
+///   stripped. NON-SEMANTIC (never affects a result); kept only so validate can
+///   enforce `2^align <= access-byte-width`.
+/// - `offset`: the static byte offset added to the dynamic address operand. Decoded
+///   as a `u64` (the memory64 width); for an i32 memory validate enforces `< 2^32`.
+///   Values that fit `u32` decode identically to Phase 4 (conformance-neutral).
+/// - `mem`: the memory index — `0` unless bit 6 of the alignment flags was set and
+///   an explicit memidx followed. Default `0` → byte-identical to Phase 4.
 pub type MemArg {
-  MemArg(align: Int, offset: Int)
+  MemArg(align: Int, offset: Int, mem: Int)
+}
+
+/// One import (import section, id 2 — Phase 5). Binary: `mod:name nm:name
+/// d:importdesc` (spec binary/modules.html#import-section).
+///
+/// - `module`: the two-level import's module (namespace) name.
+/// - `name`: the import's field name within `module`.
+/// - `desc`: what is imported (function type index / table / memory / global type).
+pub type Import {
+  Import(module: String, name: String, desc: ImportDesc)
+}
+
+/// An import descriptor (the four `importdesc` kinds).
+///
+/// - `ImportFunc(type_idx)`: `0x00 x:typeidx` — a function of the module's `types[x]`.
+/// - `ImportTable(TableType)`: `0x01 tt:tabletype` — a reference table.
+/// - `ImportMemory(MemType)`: `0x02 mt:memtype` — a linear memory.
+/// - `ImportGlobal(ty, mutable)`: `0x03 t:valtype m:mut` — a global (`mut` `0x00`
+///   const / `0x01` var).
+///
+/// Decode records declarations only; link/instantiation (unit 09) resolves them
+/// fail-closed. An importdesc byte outside `0x00..0x03` is `BadImportKind`.
+pub type ImportDesc {
+  ImportFunc(type_idx: Int)
+  ImportTable(TableType)
+  ImportMemory(MemType)
+  ImportGlobal(ty: ValType, mutable: Bool)
 }
 
 /// A whole decoded module.
 ///
-/// - `imported_func_count`: the number of *imported* functions. Always `0` in
-///   Phase 1/2 (import parsing is deferred to Phase 3), but kept EXPLICIT on
-///   purpose: a `funcidx` addresses the combined space `imports ++ defined`, so
-///   the funcidx of defined function `i` is `imported_func_count + i`. `funcidx ==
-///   defined index` holds ONLY because there are no imports yet — consumers (units
-///   08/09) must use this offset rather than assume `0`.
+/// - `imported_func_count`: the number of *imported* functions — now COMPUTED by
+///   `assemble` as the count of `ImportFunc` importdescs. A `funcidx` addresses the
+///   combined space `imports ++ defined`, so the funcidx of defined function `i` is
+///   `imported_func_count + i`. For a module with no import section this stays `0`
+///   (byte-identical to Phase 4). The imported table/memory/global counts (for the
+///   other index spaces) are derivable from `imports` by validate/lower.
 /// - `types`: the type section's function types, in declaration order.
-/// - `tables`: the table section's table types (section 4). MVP: at most one
-///   (validate enforces `<= 1`); always `funcref`.
-/// - `memories`: the memory section's memory types (section 5). MVP: at most one.
+/// - `imports`: the import section's entries (section 2), in order.
+/// - `tables`: the table section's table types (section 4), in order.
+/// - `memories`: the memory section's memory types (section 5), in order.
 /// - `globals`: the global section's global declarations (section 6), in order.
 /// - `funcs`: the defined functions, in order. `funcs[i]` pairs the function
 ///   section's `i`-th type index with the code section's `i`-th body.
 /// - `start`: the start section's funcidx (section 8), or `None` if absent — run
 ///   last at instantiation.
-/// - `elements`: the active element segments (section 9), in order.
-/// - `data`: the active data segments (section 11), in order.
+/// - `elements`: the element segments (section 9), in order.
+/// - `data`: the data segments (section 11), in order.
+/// - `data_count`: the datacount section's segment count (section 12), or `None` if
+///   absent. Decode owns the wellformedness rules (R13 / spec §5.5.14): a
+///   `memory.init`/`data.drop` present with no datacount section is
+///   `Error(DataCountMissing)`, and a present `data_count != length(data)` is
+///   `Error(DataCountMismatch)`.
 /// - `exports`: the export entries, in order.
 pub type Module {
   Module(
     imported_func_count: Int,
     types: List(FuncType),
+    imports: List(Import),
     tables: List(TableType),
     memories: List(MemType),
     globals: List(Global),
@@ -214,6 +320,7 @@ pub type Module {
     start: Option(Int),
     elements: List(ElementSegment),
     data: List(DataSegment),
+    data_count: Option(Int),
     exports: List(Export),
   )
 }
@@ -433,12 +540,12 @@ pub type Instr {
   I64Store32(MemArg)
 
   // 0x3E
-  // --- memory size/grow (0x3F/0x40) — NOT a memarg: a single 0x00 mem-index byte ---
-  MemorySize
-  // 0x3F 0x00 — current size in pages
-  MemoryGrow
+  // --- memory size/grow (0x3F/0x40) — a `u32` memidx (multi-memory; 0 in the MVP) ---
+  MemorySize(mem: Int)
+  // 0x3F <memidx> — current size in pages
+  MemoryGrow(mem: Int)
 
-  // 0x40 0x00 — grow by delta pages; result is old size or -1
+  // 0x40 <memidx> — grow by delta pages; result is old size or -1
   // --- float comparisons (0x5B..0x66) → i32 0/1 ---
   F32Eq
   // 0x5B
@@ -578,7 +685,49 @@ pub type Instr {
   F32ReinterpretI32
   // 0xBE
   F64ReinterpretI64
+
   // 0xBF
+  // ===================== Phase 5 («WASM-AST3») =====================
+  // --- reference instructions (0xD0..0xD2) — spec binary/instructions §reference ---
+  RefNull(ref_ty: ValType)
+  // 0xD0 <reftype byte 0x70|0x6F> — the null reference of a reftype
+  RefIsNull
+  // 0xD1 — pops a ref, pushes i32 (1 iff null)
+  RefFunc(func: Int)
+
+  // 0xD2 <funcidx u32> — a funcref to function `func`
+  // --- table access (0x25/0x26) ---
+  TableGet(table: Int)
+  // 0x25 <tableidx u32>
+  TableSet(table: Int)
+
+  // 0x26 <tableidx u32>
+  // --- typed select (0x1C) — a vec(valtype); untyped `select` is `Select` (0x1B) ---
+  SelectT(types: List(ValType))
+
+  // --- 0xFC bulk memory & table (sub-opcodes 8..17) — spec binary/instructions ---
+  // Immediate order is WIRE order and security-relevant (R3); the fields are named
+  // in the order the bytes appear so a swap is impossible to write accidentally.
+  MemoryInit(data: Int, mem: Int)
+  // 0xFC 8  — <dataidx> THEN <memidx>
+  DataDrop(data: Int)
+  // 0xFC 9  — <dataidx>
+  MemoryCopy(dst_mem: Int, src_mem: Int)
+  // 0xFC 10 — <memidx dst> THEN <memidx src>
+  MemoryFill(mem: Int)
+  // 0xFC 11 — <memidx>
+  TableInit(elem: Int, table: Int)
+  // 0xFC 12 — <elemidx> THEN <tableidx>
+  ElemDrop(elem: Int)
+  // 0xFC 13 — <elemidx>
+  TableCopy(dst_table: Int, src_table: Int)
+  // 0xFC 14 — <tableidx dst> THEN <tableidx src>
+  TableGrow(table: Int)
+  // 0xFC 15 — <tableidx>
+  TableSize(table: Int)
+  // 0xFC 16 — <tableidx>
+  TableFill(table: Int)
+  // 0xFC 17 — <tableidx>
 }
 
 /// Every reason the decoder rejects a binary. UNTRUSTED input maps to EXACTLY
@@ -615,18 +764,24 @@ pub type Instr {
 /// - `FuncCodeCountMismatch`: the function section and code section declared
 ///   different numbers of functions, so their entries cannot be paired. (Spec:
 ///   the binary module decoding requires the two vectors to have equal length.)
-/// - `BadRefType`: a table element-type byte is not `funcref` (`0x70`) — e.g.
-///   `externref` (`0x6F`), a reference-types feature deferred to Phase 3.
-/// - `BadLimitsFlag`: a limits flag byte is not `0x00`/`0x01` (e.g. the memory64
-///   `0x04`/`0x05` i64-indexed forms).
+/// - `BadHeapType`: a reftype/heaptype byte (in `ref.null`, a tabletype element, or
+///   an element segment's flag-5/6/7 reftype) is not `0x70`/`0x6F` — e.g. a number
+///   type, `v128`, or a GC-proposal heaptype (deferred to a later phase).
+/// - `BadLimitsFlag`: a limits flag byte is out of scope. For memories `0x00`/`0x01`
+///   (Idx32) and `0x04`/`0x05` (Idx64/memory64) are accepted; the shared/threads
+///   bits (`0x02`/`0x03`) and `>= 0x06` are rejected. For tables only `0x00`/`0x01`
+///   are accepted (table64 out of scope), so a table flag with the idx-type or
+///   shared bit is rejected.
 /// - `BadMutability`: a global `mut` byte is not `0x00` (const) / `0x01` (var).
-/// - `BadElemKind`: an element-segment leading flag is not `0` (passive /
-///   declarative / expr-list forms 1–7 — reference types / bulk memory, Phase 3).
-/// - `BadDataKind`: a data-segment leading flag is not `0x00`/`0x02` (the passive
-///   form `0x01` is bulk memory, Phase 3).
-/// - `BadMemoryIndex`: a reserved memory-index byte is non-zero where the MVP
-///   permits only memory 0 (`memory.size`/`memory.grow`'s `0x00` byte, or a data
-///   segment's `0x02` explicit memidx).
+/// - `BadElemKind`: an element-segment leading flag is `> 7`, or an `elemkind` byte
+///   (flags 1/2/3) is not `0x00` (funcref).
+/// - `BadDataKind`: a data-segment leading flag is not `0`/`1`/`2`.
+/// - `BadImportKind`: an importdesc kind byte is not `0x00..0x03`.
+/// - `DataCountMissing`: a `memory.init`/`data.drop` instruction is present but the
+///   module has no datacount section (R13 / spec §5.5.14 "data count section
+///   required" — an `assert_malformed`).
+/// - `DataCountMismatch`: the datacount section's count does not equal the number of
+///   data segments (spec §5.5.14 — an `assert_malformed`).
 pub type DecodeError {
   BadMagic
   BadVersion
@@ -644,10 +799,12 @@ pub type DecodeError {
   UnknownOpcode(Int)
   UnknownSatOpcode(Int)
   FuncCodeCountMismatch
-  BadRefType
+  BadHeapType
   BadLimitsFlag
   BadMutability
   BadElemKind
   BadDataKind
-  BadMemoryIndex
+  BadImportKind
+  DataCountMissing
+  DataCountMismatch
 }

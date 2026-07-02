@@ -496,8 +496,8 @@ fn go(
 
         // memory size/grow ----------------------------------------------------------
         // memory index 0 (the default memory); P5-05 threads a real index for multi-memory.
-        ast.MemorySize -> emit_nullary(ir.MemSize(0), ir.TI32, tail, ctx, st)
-        ast.MemoryGrow ->
+        ast.MemorySize(_) -> emit_nullary(ir.MemSize(0), ir.TI32, tail, ctx, st)
+        ast.MemoryGrow(_) ->
           emit_value_op_t(
             1,
             ir.TI32,
@@ -1411,13 +1411,17 @@ fn blocktype_io(
   }
 }
 
-/// Map a WASM value type to the IR value type.
+/// Map a WASM value type to the IR value type. The two MVP reference types map to
+/// the IR's reference value types (`FuncRef → TFuncRef`, `ExternRef → TExternRef`);
+/// the ref/table op lowering that consumes them is P5-05's.
 fn to_ir_vt(t: ast.ValType) -> ir.ValType {
   case t {
     ast.I32 -> ir.TI32
     ast.I64 -> ir.TI64
     ast.F32 -> ir.TF32
     ast.F64 -> ir.TF64
+    ast.FuncRef -> ir.TFuncRef
+    ast.ExternRef -> ir.TExternRef
   }
 }
 
@@ -1589,16 +1593,18 @@ fn lower_elements(
   module: ast.Module,
 ) -> Result(List(ir.ElementSegment), LowerError) {
   list.map(module.elements, fn(e) {
-    use offset <- result.try(lower_const_expr(e.offset))
-    // Active funcref segment (byte-identical to Phase-4): each funcidx becomes a `RefFunc`
-    // init item. Passive/declarative + externref/null items are P5-05's.
-    let init =
-      list.map(e.funcs, fn(idx) { ir.RefFunc("f" <> int.to_string(idx)) })
-    Ok(ir.ElementSegment(
-      ir.ElemActive(tname(e.table), offset),
-      ir.FuncRef,
-      init,
-    ))
+    // Active funcref segment into table 0 (byte-identical to Phase-4): each funcidx
+    // becomes a `RefFunc` init item. Passive/declarative, expr-init, explicit
+    // tableidx, and externref segments are P5-05's — rejected fail-closed here.
+    case e.mode, e.init, e.ref_ty {
+      ast.ElemActive(0, offset_expr), ast.ElemFuncs(funcs), ast.FuncRef -> {
+        use offset <- result.try(lower_const_expr(offset_expr))
+        let init =
+          list.map(funcs, fn(idx) { ir.RefFunc("f" <> int.to_string(idx)) })
+        Ok(ir.ElementSegment(ir.ElemActive(tname(0), offset), ir.FuncRef, init))
+      }
+      _, _, _ -> Error(Unsupported("element segment (Phase 5 surface)"))
+    }
   })
   |> result.all
 }
@@ -1607,9 +1613,15 @@ fn lower_elements(
 /// constant-literal offset expression. `Error(NonConstInitExpr(_))` on a non-constant offset.
 fn lower_data(module: ast.Module) -> Result(List(ir.DataSegment), LowerError) {
   list.map(module.data, fn(d) {
-    use offset <- result.try(lower_const_expr(d.offset))
-    // Active-at-memory-0 (byte-identical to Phase-4); passive data is P5-05's.
-    Ok(ir.DataSegment(ir.DataActive(0, offset), d.bytes))
+    // Active-at-memory-0 (byte-identical to Phase-4); passive data and
+    // active-with-explicit-memidx are P5-05's — rejected fail-closed here.
+    case d.mode {
+      ast.DataActive(0, offset_expr) -> {
+        use offset <- result.try(lower_const_expr(offset_expr))
+        Ok(ir.DataSegment(ir.DataActive(0, offset), d.bytes))
+      }
+      _ -> Error(Unsupported("data segment (Phase 5 surface)"))
+    }
   })
   |> result.all
 }

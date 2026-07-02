@@ -541,6 +541,7 @@ pub fn nonconst_init_fail_closed_test() {
     ast.Module(
       imported_func_count: 0,
       types: [],
+      imports: [],
       tables: [],
       memories: [],
       globals: [
@@ -554,6 +555,7 @@ pub fn nonconst_init_fail_closed_test() {
       start: option.None,
       elements: [],
       data: [],
+      data_count: option.None,
       exports: [],
     )
   let tm =

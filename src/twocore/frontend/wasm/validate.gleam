@@ -128,9 +128,13 @@ pub type TypedModule {
 /// - `UnexpectedEnd`: an `end`/`else` with no matching open control frame, or a body
 ///   that did not close cleanly.
 /// - `TooManyLocals(count)`: the function's local count exceeds `max_locals`.
-/// - `Unsupported(detail)`: a construct outside the validation surface (Phase 3:
-///   typed `select_t`, reference-type globals/tables, non-function imports). Rejected
-///   fail-closed rather than waved through. (No Phase-2 op reaches this any more.)
+/// - `Unsupported(detail)`: a construct outside the validation surface (Phase 5:
+///   typed `select_t`, reference-type/bulk ops, reference-type globals/tables,
+///   non-function imports, memory64, passive/expr segments). Rejected fail-closed
+///   rather than waved through — P5-04 replaces these with real typing rules.
+/// - `OffsetOutOfRange`: a load/store memarg static offset `>= 2^32` on a 32-bit
+///   memory (spec `valid/instructions` memarg). Reachable now that decode reads the
+///   offset as a `u64` (P5-03); routed from `align.wast`'s "offset out of range".
 pub type ValidateError {
   TypeMismatch
   Underflow
@@ -153,6 +157,7 @@ pub type ValidateError {
   UnexpectedEnd
   TooManyLocals(count: Int)
   Unsupported(detail: String)
+  OffsetOutOfRange
 }
 
 // ─────────────────────────────── validation context ───────────────────────────────
@@ -451,7 +456,15 @@ fn resolve_func_types(module: Module) -> Result(List(FuncType), ValidateError) {
 fn check_memories(mems: List(ast.MemType)) -> Result(Nil, ValidateError) {
   case mems {
     [] -> Ok(Nil)
-    [m] -> check_limits(m.limits, memory_page_limit)
+    // A 64-bit (memory64) memory is decode/validate-only in Phase 5; its runtime is
+    // deferred to Phase 6 (R12), so this Phase-2 gate rejects it fail-closed (P5-04
+    // implements the real i64-address typing).
+    [m] ->
+      case m.idx_type {
+        ast.Idx32 -> check_limits(m.limits, memory_page_limit)
+        ast.Idx64 ->
+          Error(Unsupported("memory64 (runtime deferred to Phase 6)"))
+      }
     _ -> Error(TooManyMemories)
   }
 }
@@ -461,7 +474,13 @@ fn check_memories(mems: List(ast.MemType)) -> Result(Nil, ValidateError) {
 fn check_tables(tabs: List(ast.TableType)) -> Result(Nil, ValidateError) {
   case tabs {
     [] -> Ok(Nil)
-    [t] -> check_limits(t.limits, table_entry_limit)
+    // Phase-2 tables are funcref; a reference-typed (externref) table is P5-04's,
+    // rejected fail-closed here.
+    [t] ->
+      case t.elem_type {
+        ast.FuncRef -> check_limits(t.limits, table_entry_limit)
+        _ -> Error(Unsupported("non-funcref table (Phase 5 surface)"))
+      }
     _ -> Error(TooManyTables)
   }
 }
@@ -726,12 +745,13 @@ fn validate_instr(
     ast.I64Store32(m) -> check_store(st, ctx, m, ast.I64, 2)
 
     // memory size/grow (require a memory) ---------------------------------------
-    ast.MemorySize ->
+    // The memidx is threaded by P5-05; Phase-2 validation only requires memory 0.
+    ast.MemorySize(_) ->
       case require_memory(ctx) {
         Ok(_) -> Ok(push_val(st, ast.I32))
         Error(e) -> Error(e)
       }
-    ast.MemoryGrow -> {
+    ast.MemoryGrow(_) -> {
       use _ <- result.try(require_memory(ctx))
       use st2 <- result.try(pop_expect(st, ast.I32))
       Ok(push_val(st2, ast.I32))
@@ -754,6 +774,7 @@ fn check_load(
 ) -> Result(VState, ValidateError) {
   use _ <- result.try(require_memory(ctx))
   use _ <- result.try(check_align(memarg, max_align))
+  use _ <- result.try(check_offset(memarg))
   use st2 <- result.try(pop_expect(st, ast.I32))
   Ok(push_val(st2, result))
 }
@@ -769,6 +790,7 @@ fn check_store(
 ) -> Result(VState, ValidateError) {
   use _ <- result.try(require_memory(ctx))
   use _ <- result.try(check_align(memarg, max_align))
+  use _ <- result.try(check_offset(memarg))
   use st2 <- result.try(pop_expect(st, value))
   pop_expect(st2, ast.I32)
 }
@@ -790,6 +812,19 @@ fn require_memory(ctx: Ctx) -> Result(Nil, ValidateError) {
 fn check_align(memarg: MemArg, max_align: Int) -> Result(Nil, ValidateError) {
   case memarg.align > max_align {
     True -> Error(BadAlignment)
+    False -> Ok(Nil)
+  }
+}
+
+/// The static memarg offset must fit the memory's address range (spec
+/// `valid/instructions` memarg rule). Decode reads the offset as a `u64` (the
+/// memory64 width, P5-03), and Phase-5 validate only accepts 32-bit (`Idx32`)
+/// memories (memory64's runtime is deferred — R12), so a valid offset is `< 2^32`.
+/// A larger offset (e.g. `align.wast`'s "offset out of range" case) is
+/// `Error(OffsetOutOfRange)`. P5-04 generalizes this to the memory's real idx_type.
+fn check_offset(memarg: MemArg) -> Result(Nil, ValidateError) {
+  case memarg.offset >= 4_294_967_296 {
+    True -> Error(OffsetOutOfRange)
     False -> Ok(Nil)
   }
 }
@@ -887,17 +922,25 @@ fn check_global_inits(globals: List(ast.Global)) -> Result(Nil, ValidateError) {
 fn check_elements(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
   let func_count = module.imported_func_count + list.length(module.funcs)
   list.try_each(module.elements, fn(e) {
-    use _ <- result.try(case ctx.has_table {
-      True -> Ok(Nil)
-      False -> Error(UnknownTable(0))
-    })
-    use _ <- result.try(validate_const_expr(e.offset, ast.I32))
-    list.try_each(e.funcs, fn(idx) {
-      case idx >= 0 && idx < func_count {
-        True -> Ok(Nil)
-        False -> Error(UnknownFunc(idx))
+    // Phase-2 case: an active funcref segment into table 0 with a funcidx list.
+    // Passive/declarative modes, expr-init, explicit tableidx, and externref
+    // segments are P5-04's — rejected fail-closed here.
+    case e.mode, e.init, e.ref_ty {
+      ast.ElemActive(0, offset), ast.ElemFuncs(funcs), ast.FuncRef -> {
+        use _ <- result.try(case ctx.has_table {
+          True -> Ok(Nil)
+          False -> Error(UnknownTable(0))
+        })
+        use _ <- result.try(validate_const_expr(offset, ast.I32))
+        list.try_each(funcs, fn(idx) {
+          case idx >= 0 && idx < func_count {
+            True -> Ok(Nil)
+            False -> Error(UnknownFunc(idx))
+          }
+        })
       }
-    })
+      _, _, _ -> Error(Unsupported("element segment (Phase 5 surface)"))
+    }
   })
 }
 
@@ -906,7 +949,14 @@ fn check_elements(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
 /// presence is enforced when the segment is instantiated; the offset's i32-ness is
 /// the static rule here.)
 fn check_data(data: List(ast.DataSegment)) -> Result(Nil, ValidateError) {
-  list.try_each(data, fn(d) { validate_const_expr(d.offset, ast.I32) })
+  list.try_each(data, fn(d) {
+    // Phase-2 case: an active segment at memory 0. Passive data and
+    // active-with-explicit-memidx are P5-04's — rejected fail-closed here.
+    case d.mode {
+      ast.DataActive(0, offset) -> validate_const_expr(offset, ast.I32)
+      _ -> Error(Unsupported("data segment (Phase 5 surface)"))
+    }
+  })
 }
 
 /// If a `start` function is present, its funcidx is in range and its type is `[] -> []`
