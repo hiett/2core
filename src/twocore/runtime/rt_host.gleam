@@ -52,6 +52,7 @@ import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/list
+import twocore/ir.{type FuncType, FuncType, TF32, TF64, TI32, TI64}
 import twocore/runtime/instance.{
   type HostPolicy, HostDenyAll, HostOpen, HostWhitelist,
 }
@@ -171,7 +172,50 @@ fn resolve_handler(
     // exercises the admit path end-to-end. The broad environment (spectest, the Porffor host
     // shim) plugs into this same registry in Phase 5/6 — one new arm each, no dispatch change.
     "env", "identity" -> Ok(fn(args) { args })
+    // ── Phase 5: the official `spectest` host module's `print*` family (R14, F8). Each
+    //    consumes its argument bit patterns and returns `[]` (the WASM result type `[]`), so it
+    //    is deterministic + node-safe (tier-P/O) and a no-op body is spec-adequate — the suite
+    //    NEVER asserts on print output. These are the DISPATCH face of `spectest`; their declared
+    //    signatures are the build-fixed `spectest_func_type` table below (link-matching, §C.3) —
+    //    the two literal cases MUST agree on this exact set of seven names. A `spectest` print is
+    //    still DENIED unless the instance's `HostPolicy` admits `#("spectest", name)`
+    //    (`profiles.safe_spectest()`), so the fail-closed conjunction is unchanged.
+    "spectest", "print" -> Ok(fn(_args) { [] })
+    "spectest", "print_i32" -> Ok(fn(_args) { [] })
+    "spectest", "print_i64" -> Ok(fn(_args) { [] })
+    "spectest", "print_f32" -> Ok(fn(_args) { [] })
+    "spectest", "print_f64" -> Ok(fn(_args) { [] })
+    "spectest", "print_i32_f32" -> Ok(fn(_args) { [] })
+    "spectest", "print_f64_f64" -> Ok(fn(_args) { [] })
     _, _ -> Error(Nil)
+  }
+}
+
+/// The build-fixed `FuncType` of a `spectest` host FUNCTION, for link-time import matching
+/// (spec §3.2 function matching / §4.5.4 — a missing or mismatched function import is an
+/// `assert_unlinkable`, §C.3). A literal `case` (D3a — no ambient authority; `name` selects
+/// among build-controlled results, never constructs a target), the LINKING face of the same
+/// seven `spectest` functions the `resolve_handler` arms above DISPATCH; the two literal cases
+/// are kept in lock-step (identical name set).
+///
+/// The reference `spectest` module's signatures (the spec's `imports.wast` host module):
+/// `print : [] -> []`, `print_i32 : [i32] -> []`, `print_i64 : [i64] -> []`,
+/// `print_f32 : [f32] -> []`, `print_f64 : [f64] -> []`, `print_i32_f32 : [i32 f32] -> []`,
+/// `print_f64_f64 : [f64 f64] -> []`.
+///
+/// - `name`: the imported function name under module `"spectest"`.
+/// - Returns `Ok(ty)` for a known `spectest` function (its declared signature), or `Error(Nil)`
+///   otherwise (→ the link resolver's `UnknownImport`). Total; never raises.
+pub fn spectest_func_type(name: String) -> Result(FuncType, Nil) {
+  case name {
+    "print" -> Ok(FuncType(params: [], results: []))
+    "print_i32" -> Ok(FuncType(params: [TI32], results: []))
+    "print_i64" -> Ok(FuncType(params: [TI64], results: []))
+    "print_f32" -> Ok(FuncType(params: [TF32], results: []))
+    "print_f64" -> Ok(FuncType(params: [TF64], results: []))
+    "print_i32_f32" -> Ok(FuncType(params: [TI32, TF32], results: []))
+    "print_f64_f64" -> Ok(FuncType(params: [TF64, TF64], results: []))
+    _ -> Error(Nil)
   }
 }
 

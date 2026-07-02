@@ -509,3 +509,168 @@ pub fn record_field_seam_round_trip_test() {
   rt_state.mem(st_t) |> should.equal(rt_state.mem(st))
   rt_state.t_global_get(st_t, "g") |> should.equal(7)
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Unit 09 — the GENERAL seeding surface (`FullDecl` + `seed_full`/`fresh_full`): the
+// multi-memory / multi-table / imported-state / reference-global / passive-drop surface
+// (R5/R7/R8/R2). Assertions target WebAssembly instantiation semantics:
+//
+// - **Dense index-keyed vectors, imported-first (R7/H3)** — `mems`/`tables` are seeded in
+//   INDEX ORDER; imports occupy the low indices (spec §2.5.1 — imports precede definitions),
+//   so `mem_at(i)`/`table_at(i)` read back the i-th element unchanged.
+// - **Reference globals (R8)** — funcref/externref globals live on the parallel `ref_globals`
+//   map, keyed by name, opaque `Dynamic` (never a raw-bit `Int`).
+// - **Passive drop-state (R2)** — a fresh instance drops NOTHING; `drop_data`/`drop_elem` set
+//   the flag, `data_dropped`/`elem_dropped` query it (spec §4.4.9 `data.drop`/`elem.drop`).
+// - **`fresh_full` ≡ `seed_full` (G7 parity)** — the threaded and cell paths materialise
+//   byte-identical state through the shared `build_full`.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── F1. `seed_full` seeds N memories/tables in index order (imported-first) ─────
+
+/// `seed_full` installs a dense memories vector and tables vector in INDEX ORDER: seeding
+/// `mems = [imported, defined0, defined1]` reads back `mem_at(0) == imported`, `mem_at(1)`,
+/// `mem_at(2)` — imports at the low indices (R7/H3). Tables likewise. Rebinding one index leaves
+/// the rest intact.
+pub fn seed_full_indexes_memories_and_tables_test() {
+  let m_imported = dynamic.string("mem-imported")
+  let m_def0 = dynamic.string("mem-def0")
+  let m_def1 = dynamic.string("mem-def1")
+  let t_imported = dynamic.string("tbl-imported")
+  let t_def0 = dynamic.string("tbl-def0")
+
+  rt_state.seed_full(
+    rt_state.FullDecl(
+      mems: [m_imported, m_def0, m_def1],
+      globals: [#("g", 5)],
+      tables: [t_imported, t_def0],
+      ref_globals: [],
+    ),
+  )
+
+  // Memories read back in index order; imported memory is at index 0.
+  rt_state.mem_at(0) |> should.equal(m_imported)
+  rt_state.mem_at(1) |> should.equal(m_def0)
+  rt_state.mem_at(2) |> should.equal(m_def1)
+  // The index-0 alias sees the same default memory.
+  rt_state.mem_get() |> should.equal(m_imported)
+
+  // Tables read back in index order; imported table at index 0.
+  rt_state.table_at(0) |> should.equal(t_imported)
+  rt_state.table_at(1) |> should.equal(t_def0)
+
+  // Rebinding memory index 1 leaves 0 and 2 untouched.
+  let m_def0b = dynamic.string("mem-def0-b")
+  rt_state.with_mem_at(1, m_def0b)
+  rt_state.mem_at(0) |> should.equal(m_imported)
+  rt_state.mem_at(1) |> should.equal(m_def0b)
+  rt_state.mem_at(2) |> should.equal(m_def1)
+
+  // The numeric global was seeded alongside.
+  rt_state.global_get("g") |> should.equal(5)
+}
+
+// ── F2. Reference globals seed + round-trip on the parallel path (R8) ────────────
+
+/// `seed_full` installs reference-typed globals into the parallel `ref_globals` map (R8): a
+/// funcref and an externref global read back through `ref_global_get`, `ref_global_set` rebinds
+/// exactly one, and the raw-bit `globals` path is untouched (the two coexist).
+pub fn seed_full_reference_globals_round_trip_test() {
+  let rf = dynamic.string("a-funcref")
+  let re = dynamic.string("an-externref")
+
+  rt_state.seed_full(
+    rt_state.FullDecl(
+      mems: [dynamic.nil()],
+      globals: [#("n", 42)],
+      tables: [dynamic.nil()],
+      ref_globals: [#("rf", rf), #("re", re)],
+    ),
+  )
+
+  rt_state.ref_global_get("rf") |> should.equal(rf)
+  rt_state.ref_global_get("re") |> should.equal(re)
+  // The numeric global lives on the separate raw-bit path, unaffected.
+  rt_state.global_get("n") |> should.equal(42)
+
+  // A ref write rebinds exactly the named reference global.
+  let re2 = dynamic.int(999)
+  rt_state.ref_global_set("re", re2)
+  rt_state.ref_global_get("re") |> should.equal(re2)
+  rt_state.ref_global_get("rf") |> should.equal(rf)
+}
+
+// ── F3. Passive drop-state: fresh instance drops nothing; drop/query are real (R2) ─
+
+/// A freshly `seed_full`ed instance has dropped NO passive segment; `drop_data`/`drop_elem` set
+/// the flag and `data_dropped`/`elem_dropped` query it (spec §4.4.9). Data and element drop-state
+/// are independent, and drop is idempotent.
+pub fn seed_full_passive_drop_state_test() {
+  rt_state.seed_full(
+    rt_state.FullDecl(
+      mems: [dynamic.nil()],
+      globals: [],
+      tables: [dynamic.nil()],
+      ref_globals: [],
+    ),
+  )
+
+  // Fresh: nothing dropped.
+  rt_state.data_dropped(0) |> should.be_false
+  rt_state.data_dropped(3) |> should.be_false
+  rt_state.elem_dropped(0) |> should.be_false
+
+  // Drop data segment 3: it (and only it) is now dropped; element state untouched.
+  rt_state.drop_data(3)
+  rt_state.data_dropped(3) |> should.be_true
+  rt_state.data_dropped(0) |> should.be_false
+  rt_state.elem_dropped(3) |> should.be_false
+
+  // Drop element segment 1: independent of data drops. Idempotent re-drop is a no-op.
+  rt_state.drop_elem(1)
+  rt_state.drop_elem(1)
+  rt_state.elem_dropped(1) |> should.be_true
+  rt_state.data_dropped(1) |> should.be_false
+}
+
+// ── F4. `fresh_full` ≡ `seed_full` materialisation (G7 parity) + threaded twins ──
+
+/// The threaded `fresh_full` builds a record field-identical to the cell `seed_full` for ONE
+/// `FullDecl`: every memory/table index projects equal through `t_mem_at`/`t_table_at`, reference
+/// globals through `t_ref_global_get`, and drop-state starts empty. Pins that `Threaded` and
+/// `Cell` start from BYTE-IDENTICAL state (G7).
+pub fn fresh_full_matches_seed_full_test() {
+  let m0 = dynamic.string("m0")
+  let m1 = dynamic.string("m1")
+  let t0 = dynamic.string("t0")
+  let rf = dynamic.string("rf")
+  let decl =
+    rt_state.FullDecl(
+      mems: [m0, m1],
+      globals: [#("n", 7)],
+      tables: [t0],
+      ref_globals: [#("r", rf)],
+    )
+
+  let st = rt_state.fresh_full(decl)
+  rt_state.seed_full(decl)
+
+  // Memories: index-by-index parity, imported-first order preserved.
+  rt_state.t_mem_at(st, 0) |> should.equal(rt_state.mem_at(0))
+  rt_state.t_mem_at(st, 1) |> should.equal(rt_state.mem_at(1))
+  rt_state.t_mem_at(st, 0) |> should.equal(m0)
+  rt_state.t_mem_at(st, 1) |> should.equal(m1)
+
+  // Tables, numeric global, and reference global parity.
+  rt_state.t_table_at(st, 0) |> should.equal(rt_state.table_at(0))
+  rt_state.t_global_get(st, "n") |> should.equal(rt_state.global_get("n"))
+  rt_state.t_ref_global_get(st, "r")
+  |> should.equal(rt_state.ref_global_get("r"))
+
+  // Drop-state starts empty in the threaded record too, and its twins are pure.
+  rt_state.t_data_dropped(st, 0) |> should.be_false
+  let st2 = rt_state.t_drop_data(st, 0)
+  rt_state.t_data_dropped(st2, 0) |> should.be_true
+  // Value semantics: the original record is unchanged.
+  rt_state.t_data_dropped(st, 0) |> should.be_false
+}

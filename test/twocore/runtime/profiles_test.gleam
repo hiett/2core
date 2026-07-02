@@ -6,8 +6,8 @@ import gleam/list
 import twocore/middle/ir_opt.{Aggressive, Baseline}
 import twocore/runtime/instance.{
   Atomics, BifAllowlist, BifOpen, Binding, Cell, HostDenyAll, HostOpen,
-  MeterFuel, MeterOff, Nif, Paged, Safe, StdlibOwn, StdlibPassthrough,
-  TableAtomics, TableEts, TablePaged, Threaded, Unsafe,
+  HostWhitelist, MeterFuel, MeterOff, Nif, Paged, Safe, StdlibOwn,
+  StdlibPassthrough, TableAtomics, TableEts, TablePaged, Threaded, Unsafe,
 }
 import twocore/runtime/profiles
 import twocore/runtime/rt_mem_atomics
@@ -478,4 +478,41 @@ pub fn no_accidental_unsafe_or_nif_by_omission_test() {
       assert b.mem_tier != Nif
     },
   )
+}
+
+// ── Phase-5: the `spectest` import-capable Safe binding (§G, R14) ──────────────────
+
+/// `spectest_allow()` is EXACTLY the seven `#("spectest", print*)` pairs — the official host
+/// module's function set (spec's `imports.wast`), a literal build-fixed list (D3a), nothing more.
+pub fn spectest_allow_is_the_seven_prints_test() {
+  assert profiles.spectest_allow()
+    == [
+      #("spectest", "print"),
+      #("spectest", "print_i32"),
+      #("spectest", "print_i64"),
+      #("spectest", "print_f32"),
+      #("spectest", "print_f64"),
+      #("spectest", "print_i32_f32"),
+      #("spectest", "print_f64_f64"),
+    ]
+}
+
+/// `safe_spectest()` is a **Safe** posture that whitelists exactly the `spectest` prints — a
+/// `HostWhitelist(spectest_allow())`, NEVER `HostOpen`. It differs from `safe()` ONLY in
+/// `host_policy`; mode and every other policy field are the Safe defaults (fail-closed — it is not
+/// an Unsafe opt-out).
+pub fn safe_spectest_is_safe_whitelist_test() {
+  let b = profiles.safe_spectest()
+  assert b.mode == Safe
+  assert b.host_policy == HostWhitelist(profiles.spectest_allow())
+  // Identical to safe() apart from the host policy.
+  assert b
+    == Binding(
+      ..profiles.safe(),
+      host_policy: HostWhitelist(profiles.spectest_allow()),
+    )
+  // Not HostOpen — a spectest-importing module stays fail-closed for everything else.
+  assert b.host_policy != HostOpen
+  // It links cleanly (only host_policy changed, no tier/module divergence).
+  assert profiles.link(b) == Ok(profiles.instantiate(b))
 }

@@ -94,11 +94,12 @@ type StateKey {
 /// remain as **index-0 / head aliases** so generated code and `rt_mem`/`rt_table` stay
 /// byte-identical.
 ///
-/// KEYSTONE POSTURE (R5): this unit freezes the record SHAPE and lands conservative,
-/// type-correct accessor bodies (a one-element `mems`/`tables` vector, empty drop sets, empty
-/// `ref_globals`). Unit 09 fills the real seeding (N memories/tables from `StateDecl`, imported
-/// state, reference-global init). No generated code embeds this record literally (it is built
-/// by `seed`/`fresh` and threaded opaquely), so growing it changes NO emitted `.core`.
+/// SEEDING (R5, unit 09): the keystone froze the record SHAPE + accessor bodies; unit 09 lands
+/// the REAL general seeding — `FullDecl` + `seed_full`/`fresh_full` build an N-memory / N-table /
+/// imported-state (imports at the low indices) / reference-global record, while `StateDecl` +
+/// `seed`/`fresh` stay the byte-identical single-region path (`emit_core` unit 06 picks which to
+/// emit). No generated code embeds this record literally (it is built by a seed/fresh call and
+/// threaded opaquely), so growing it changes NO emitted `.core`.
 ///
 /// - `mems`: the memory-index vector, each entry OPAQUE to `rt_state` (built/interpreted by
 ///   `rt_mem`). Index 0 is the default memory every Phase-1..4 memory node targets.
@@ -122,23 +123,60 @@ pub type InstanceState {
   )
 }
 
-/// What the generated `instantiate` entry passes to `seed`: the FRESH per-layer values to
-/// install into a brand-new cell.
+/// What the generated `instantiate/0` entry passes to `seed`/`fresh` for the **single-memory /
+/// single-table / import-free** module (the entire Phase-1..4 corpus): the FRESH per-layer
+/// values to install into a brand-new cell/record.
 ///
 /// FROZEN UNCHANGED from Phase 4 (byte-identity, H7): `emit_core.state_decl_term` emits the
-/// same `{state_decl, Mem, Globals, Table}` term, so the `.core` is unchanged. `build` wraps
-/// the single `mem`/`table` into one-element vectors and seeds empty drop-state / `ref_globals`
-/// (the conservative keystone stub, R5); unit 09 replaces `state_decl_term` + `build` with the
-/// multi-region / imported-state / reference-global seeding.
+/// same `{state_decl, Mem, Globals, Table}` term, so the `.core`/`.beam` is unchanged. `build`
+/// wraps the single `mem`/`table` into one-element index-0 vectors and seeds empty drop-state /
+/// `ref_globals`, sharing the materialisation path (`build_full`) with the general case.
+///
+/// **The general case** — a module with multiple memories/tables, non-function imports, or
+/// reference-typed globals — uses `FullDecl` + `seed_full`/`fresh_full` (below). `emit_core`
+/// (unit 06) emits `StateDecl` for the byte-identical case and `FullDecl` for the rich case, so
+/// a Phase-1..4 module keeps its exact prior `.core` (R5/R7/R8; the `StateDecl` shape is stable
+/// and never grown, so growing the surface never disturbs the frozen emitted term).
 ///
 /// - `mem`: a fresh memory value built by `rt_mem.fresh` (rt_state stores it as-is,
-///   preserving opacity — it never constructs memory).
+///   preserving opacity — it never constructs memory). Becomes the index-0 memory.
 /// - `globals`: the initial NUMERIC globals as `#(name, raw_bits)` pairs (from each global's
 ///   constant init expression), in declaration order. Duplicate names keep the LAST pair
 ///   (`dict.from_list` semantics); validation guarantees unique global names upstream.
-/// - `table`: a fresh table value built by `rt_table.new` (stored as-is).
+/// - `table`: a fresh table value built by `rt_table.new` (stored as-is). Becomes index-0.
 pub type StateDecl {
   StateDecl(mem: Dynamic, globals: List(#(String, Int)), table: Dynamic)
+}
+
+/// What the generated `instantiate/1(Imports)` entry passes to `seed_full`/`fresh_full` for the
+/// **general** module — the multi-memory / multi-table / non-function-import / reference-global
+/// surface (R5/R7/R8). It is the value-shaped decl `emit_core` (unit 06) builds after weaving
+/// each resolved `Provided` externval (`link.Provided`) into the right slot: an IMPORTED
+/// memory/table/global occupies the LOW index of its space (imports precede definitions, spec
+/// §2.5.1), a DEFINED one holds its freshly-built value. `rt_state` needs NO knowledge of imports
+/// — it receives a decl whose imported slots ALREADY hold their provided values and installs it
+/// exactly as it installs a fresh one (the imported-state wiring is a codegen concern, unit 06).
+///
+/// A fresh instance drops NO segment, so the drop-state is always empty at instantiate and is not
+/// carried here (`build_full` seeds `set.new()` for both).
+///
+/// - `mems`: the instance's memories as a **dense index-keyed vector** in index order, imported
+///   memories first (multi-memory, H3). Each entry is OPAQUE `Dynamic` (built by `rt_mem`); index
+///   0 is the default memory every Phase-1..4 memory node targets. A single element ⇒ byte-
+///   identical to Phase-4.
+/// - `globals`: the NUMERIC globals as `#(name, raw_bits)` pairs (D5 raw-bit path) — an imported
+///   global's pair is its provided bits, a defined global's its const-folded init.
+/// - `tables`: the instance's tables as a **dense index-keyed vector** in index order, imported
+///   tables first (R7 — `emit_core` resolves table name→index at compile time). Each entry OPAQUE.
+/// - `ref_globals`: the REFERENCE-typed globals (funcref/externref) as `#(name, ref)` pairs on the
+///   opaque `Dynamic` path (R8), kept parallel to `globals` so the numeric path is byte-identical.
+pub type FullDecl {
+  FullDecl(
+    mems: List(Dynamic),
+    globals: List(#(String, Int)),
+    tables: List(Dynamic),
+    ref_globals: List(#(String, Dynamic)),
+  )
 }
 
 /// Seed a FRESH per-instance cell for THIS process from `decl`, RESETTING any prior state
@@ -153,6 +191,23 @@ pub type StateDecl {
 ///   `seed`) and a `Threaded` build (`fresh`) materialise BYTE-IDENTICAL state (G7).
 pub fn seed(decl: StateDecl) -> Nil {
   put_cell(build(decl))
+}
+
+/// Seed a FRESH per-instance cell from a GENERAL `FullDecl` (the multi-memory / multi-table /
+/// imported / reference-global surface, R5/R7/R8) — the `Cell` install the generated
+/// `instantiate/1(Imports)` entry calls once, before any element/data segment write or `start`.
+///
+/// - `decl`: the fully-woven per-layer values (imported slots already hold their provided
+///   values, at their low indices). Installs the memories/tables vectors verbatim in index order,
+///   materialises `globals`/`ref_globals` into `Dict`s, and seeds EMPTY drop-state (a fresh
+///   instance has dropped nothing).
+/// - Returns `Nil`. Installs the cell with a single atomic `erlang:put/2`, resetting any prior
+///   state (one-instance-one-process). Total; never raises. Routes through the shared `build_full`
+///   constructor so a `Cell` build (`seed_full`) and a `Threaded` build (`fresh_full`) materialise
+///   BYTE-IDENTICAL state (G7). Byte-identical to `seed` when `mems`/`tables` are one-element and
+///   `ref_globals` is empty.
+pub fn seed_full(decl: FullDecl) -> Nil {
+  put_cell(build_full(decl))
 }
 
 /// Drop this process's cell (used between instances when a process is reused). After
@@ -369,6 +424,20 @@ pub fn fresh(decl: StateDecl) -> InstanceState {
   build(decl)
 }
 
+/// Build the initial threaded instance-state record from a GENERAL `FullDecl` — the `Threaded`
+/// twin of `seed_full` (returns the record as a value; no pdict write). Called once by the
+/// threaded `instantiate/1(Imports)` (unit 06) before any element/data segment write or `start`.
+///
+/// - `decl`: the fully-woven per-layer values (imported slots at their low indices). The
+///   memories/tables vectors are stored opaquely in index order; `globals`/`ref_globals` are
+///   materialised into `Dict`s; drop-state starts empty.
+/// - Returns the fresh `InstanceState`. Total; never raises; touches NO process dictionary. Shares
+///   the `build_full` constructor with `seed_full`, so a `Threaded` build and a `Cell` build start
+///   from BYTE-IDENTICAL state (G7).
+pub fn fresh_full(decl: FullDecl) -> InstanceState {
+  build_full(decl)
+}
+
 /// Read mutable global `name`'s raw bit pattern from the threaded record. READ-ONLY: `st` is
 /// unchanged (the caller keeps threading the same record forward).
 ///
@@ -526,23 +595,39 @@ pub fn t_ref_global_set(
 
 // ── internal helpers ──────────────────────────────────────────────────────────
 
-/// The single record builder shared by `seed` (cell path — installs it in the pdict) and
-/// `fresh` (threaded path — returns it). Sharing ONE constructor guarantees the two strategies
-/// materialise BYTE-IDENTICAL state (G7 — a `Threaded` build and a `Cell` build compute
-/// identical results). `decl.globals` becomes the `globals` `Dict`; `mem`/`table` are stored
-/// opaquely. Total; never raises; touches NO process dictionary (the pdict write, if any, is
-/// the caller's — only `seed` does it). (Private: the shared materialisation seam.)
+/// Materialise the single-memory / single-table / import-free `StateDecl` (the byte-identical
+/// Phase-1..4 path) into an `InstanceState`, by widening it to a one-element-vectors `FullDecl`
+/// (index 0 = the default memory/table, empty `ref_globals`) and delegating to `build_full`. So
+/// BOTH decl shapes share ONE materialisation seam (`build_full`) — a single-region `StateDecl`
+/// and the equivalent one-element `FullDecl` produce field-identical records. Total; never
+/// raises; touches NO process dictionary (the caller's `seed` does the pdict write, if any).
 fn build(decl: StateDecl) -> InstanceState {
+  build_full(
+    FullDecl(
+      mems: [decl.mem],
+      globals: decl.globals,
+      tables: [decl.table],
+      ref_globals: [],
+    ),
+  )
+}
+
+/// The single record builder shared by every seed/fresh path (`seed`/`fresh` via `build`, and
+/// `seed_full`/`fresh_full` directly). Sharing ONE constructor guarantees the cell and threaded
+/// strategies materialise BYTE-IDENTICAL state (G7 — a `Threaded` build and a `Cell` build compute
+/// identical results). Installs the memories/tables vectors verbatim in index order (imported
+/// slots already at their low indices, woven by unit 06); `globals`/`ref_globals` become `Dict`s
+/// (duplicate names keep the LAST, `dict.from_list` semantics — validation guarantees uniqueness);
+/// drop-state starts empty (a fresh instance has dropped no passive segment, R2). Total; never
+/// raises; touches NO process dictionary. (Private: the shared materialisation seam.)
+fn build_full(decl: FullDecl) -> InstanceState {
   InstanceState(
-    // Keystone stub (R5): the single `decl.mem`/`decl.table` become one-element index-keyed
-    // vectors (index 0 = the default memory/table), byte-identical to Phase-4 at index 0.
-    // Unit 09 replaces this with N-memory / N-table / imported-state / reference-global seeding.
-    mems: [decl.mem],
+    mems: decl.mems,
     globals: dict.from_list(decl.globals),
-    tables: [decl.table],
+    tables: decl.tables,
     dropped_data: set.new(),
     dropped_elem: set.new(),
-    ref_globals: dict.new(),
+    ref_globals: dict.from_list(decl.ref_globals),
   )
 }
 

@@ -17,6 +17,7 @@
 
 import gleam/erlang/process
 import gleeunit/should
+import twocore/ir
 import twocore/runtime/instance.{HostDenyAll, HostOpen, HostWhitelist}
 import twocore/runtime/rt_host
 
@@ -226,4 +227,80 @@ pub fn current_policy_reflects_seed_test() {
     rt_host.current_policy()
   })
   |> should.equal(wl)
+}
+
+// ── Phase-5: the official `spectest` print family (R14, F8) ───────────────────────
+
+/// The seven `#("spectest", print*)` pairs — the official host-module set (spec's `imports.wast`).
+/// A LITERAL list here so the whitelist test mirrors `profiles.spectest_allow()` without coupling.
+fn spectest_pairs() -> List(#(String, String)) {
+  [
+    #("spectest", "print"),
+    #("spectest", "print_i32"),
+    #("spectest", "print_i64"),
+    #("spectest", "print_f32"),
+    #("spectest", "print_f64"),
+    #("spectest", "print_i32_f32"),
+    #("spectest", "print_f64_f64"),
+  ]
+}
+
+/// Under a whitelist admitting the seven `spectest` prints, EVERY `print*` is dispatched and
+/// returns `[]` (the WASM result type `[]` — a side-effecting host fn that consumes its args and
+/// yields nothing). Proves all seven arms exist and are handler-backed.
+pub fn spectest_prints_dispatched_under_whitelist_test() {
+  let allow = spectest_pairs()
+  call_under(HostWhitelist(allow), "spectest", "print", [])
+  |> should.equal(Ok([]))
+  call_under(HostWhitelist(allow), "spectest", "print_i32", [42])
+  |> should.equal(Ok([]))
+  call_under(HostWhitelist(allow), "spectest", "print_i64", [42])
+  |> should.equal(Ok([]))
+  call_under(HostWhitelist(allow), "spectest", "print_f32", [0x4426A666])
+  |> should.equal(Ok([]))
+  call_under(HostWhitelist(allow), "spectest", "print_f64", [0x4084D4CCCCCCCCCD])
+  |> should.equal(Ok([]))
+  call_under(HostWhitelist(allow), "spectest", "print_i32_f32", [1, 0x4426A666])
+  |> should.equal(Ok([]))
+  call_under(HostWhitelist(allow), "spectest", "print_f64_f64", [0, 0])
+  |> should.equal(Ok([]))
+}
+
+/// Under the fail-closed deny-all default, a `spectest` print DENIES (a `spectest`-importing
+/// module linked without the whitelist gets no host authority) — the same fail-closed conjunction
+/// as any other capability.
+pub fn spectest_print_denied_under_deny_all_test() {
+  denial_under(HostDenyAll, "spectest", "print_i32", [42])
+  |> should.equal(Ok(#("spectest", "print_i32")))
+}
+
+/// The whitelist conjunction is per-pair: a whitelist admitting ONLY `print_i32` dispatches it
+/// (`Ok([])`) but DENIES `print_f32` (listed-set membership is required, not merely being a
+/// `spectest` name).
+pub fn spectest_whitelist_is_per_pair_test() {
+  let allow = [#("spectest", "print_i32")]
+  call_under(HostWhitelist(allow), "spectest", "print_i32", [42])
+  |> should.equal(Ok([]))
+  denial_under(HostWhitelist(allow), "spectest", "print_f32", [0])
+  |> should.equal(Ok(#("spectest", "print_f32")))
+}
+
+/// `spectest_func_type` returns each print's declared signature (the reference `spectest` module's
+/// types) for link-time matching, and `Error(Nil)` for a non-`spectest` name (→ `UnknownImport`).
+pub fn spectest_func_type_signatures_test() {
+  rt_host.spectest_func_type("print")
+  |> should.equal(Ok(ir.FuncType([], [])))
+  rt_host.spectest_func_type("print_i32")
+  |> should.equal(Ok(ir.FuncType([ir.TI32], [])))
+  rt_host.spectest_func_type("print_i64")
+  |> should.equal(Ok(ir.FuncType([ir.TI64], [])))
+  rt_host.spectest_func_type("print_f32")
+  |> should.equal(Ok(ir.FuncType([ir.TF32], [])))
+  rt_host.spectest_func_type("print_f64")
+  |> should.equal(Ok(ir.FuncType([ir.TF64], [])))
+  rt_host.spectest_func_type("print_i32_f32")
+  |> should.equal(Ok(ir.FuncType([ir.TI32, ir.TF32], [])))
+  rt_host.spectest_func_type("print_f64_f64")
+  |> should.equal(Ok(ir.FuncType([ir.TF64, ir.TF64], [])))
+  rt_host.spectest_func_type("not_a_print") |> should.equal(Error(Nil))
 }
