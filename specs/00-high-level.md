@@ -3,7 +3,7 @@
 **Status:** Canonical architecture specification (pre-implementation). Supersedes all prior WASM→Core Erlang scope/addendum/modular documents — they are folded in here and re-scoped. WASM is now the *first frontend* of a larger compiler platform, not the whole system.
 **Audience:** A downstream planning agent and the agent swarm that implements it.
 
-**The shape of the thing.** A compiler that lowers multiple source languages into **one shared, language-neutral IR (ours)**, and emits **Core Erlang** from that IR so the result runs **fast and preemptively on the BEAM** — the way Arc runs JS today, but compiled rather than interpreted. WASM is the first frontend (and transitively gives Rust→Erlang and, via Porffor, JS→Erlang); Arc (JS) and Erlang/Gleam follow as additional frontends. All frontends share one IR, one optimizer, one backend, one standard library, and one security model.
+**The shape of the thing.** A compiler that lowers multiple source languages into **one shared, language-neutral IR (ours)**, and emits **Core Erlang** from that IR so the result runs **fast and preemptively on the BEAM** — compiled, not interpreted. WASM is the first frontend (and transitively gives Rust→Erlang and, via **Porffor**, JS→Erlang — a stated goal: *any Porffor application runs via 2core on the BEAM*, "JS on the BEAM"); an Erlang/Gleam frontend follows as an additional frontend. All frontends share one IR, one optimizer, one backend, one standard library, and one security model.
 
 **Three governing constraints (unchanged):**
 1. **Built in Gleam** (build-time, on the BEAM).
@@ -21,16 +21,16 @@
  ┌───────────────────────────┐
  │ WASM   (now)              │─┐      ┌──────────────────┐     ┌──────────────┐   ┌──────────────┐
  │ Rust   (via WASM, now-ish)│ ├────▶ │   SHARED IR      │────▶│ IR → Core    │──▶│ shared rt +  │
- │ JS via Porffor (this wk)  │ │      │  + optimizer     │     │ Erlang AST → │   │ optional     │
- │ JS/Arc (later, native FE) │ │      │  + stdlib/cap    │     │ .core → BEAM │   │ linear-mem   │
+ │ JS via Porffor (goal)     │ │      │  + optimizer     │     │ Erlang AST → │   │ optional     │
+ │   → "JS on the BEAM"      │ │      │  + stdlib/cap    │     │ .core → BEAM │   │ linear-mem   │
  │ Erlang/Gleam (later)      │─┘      │    lowering      │     └──────────────┘   │ subsystem    │
  └───────────────────────────┘        └──────────────────┘                       └──────────────┘
          each stage is a public, independently-callable interface; the IR has a textual form
 ```
 
 - **Now:** the WASM frontend, the shared IR, the IR→Core-Erlang backend, the Safe/Unsafe security modes, and stdlib scaffolding. Rust→Erlang falls out for free (Rust→WASM→IR→Erlang) — not native-Rust speed, but real.
-- **This week (bridge):** JS via **Porffor** (JS→WASM AOT) feeding the WASM frontend → "JS on the BEAM, fast." A proof-of-concept, bounded by Porffor's maturity (§8.2).
-- **Later:** **Arc as a native JS frontend** (it stops being an interpreter and emits the IR directly — better than the Porffor bridge because it uses the term value model and the shared stdlib instead of boxing JS through linear memory); an **Erlang/Gleam frontend** (write Gleam, deploy to the platform, provably unable to take over the VM via Safe mode).
+- **Goal — JS on the BEAM via Porffor:** JS via **Porffor** (JS→WASM AOT) feeding the WASM frontend → *any Porffor application runs via 2core on the BEAM*. The WASM surface Porffor emits is already largely covered by `fe_wasm`; the work remaining to reach the goal is a **Porffor-ABI host shim** (an `rt_host` supplying Porffor's runtime intrinsics), not a WASI layer (§8.2).
+- **Later:** an **Erlang/Gleam frontend** (write Gleam, deploy to the platform, provably unable to take over the VM via Safe mode).
 
 The decisions in §2 are what must be made **now** — even though most frontends are later — so the platform doesn't have to be rebuilt to accept them.
 
@@ -84,7 +84,7 @@ Every row is an independently-implementable, independently-auditable, independen
 |---|---|---|---|---|---|---|
 | **Frontends** (source → IR) |
 | FW | WASM frontend | `fe_wasm` | build | — | — | decode→validate→ssa→structure→IR |
-| FJ | JS frontend | `fe_js` | build | — | — | *(later)* Arc-as-frontend; *(bridge)* Porffor JS→WASM→`fe_wasm` |
+| FJ | JS frontend | `fe_js` | build | — | — | *(goal)* Porffor JS→WASM→`fe_wasm`; *(future)* a possible native JS frontend |
 | FE | Erlang/Gleam frontend | `fe_beam` | build | — | **yes** (restricts unsafe) | *(later)* ingest→restrict→IR |
 | **Shared middle-end** (IR → IR) |
 | M1 | IR core + textual form | `ir` | build | — | — | the IR module + `.ir` reader/writer |
@@ -160,24 +160,15 @@ Internal stages, each an independently-invokable interface, terminating in the s
 
 Rust→Erlang is this path plus a Rust→WASM toolchain (LLVM): real, though not native-Rust speed.
 
-### 8.2 JS via Porffor (bridge) — this week
-**Porffor** (CanadaHonk) is a from-scratch AOT JS/TS→WASM compiler that *compiles* JS rather than bundling an interpreter, so its WASM is small and fast (it also has `2c`, its own experimental Wasm→C compiler — not used by us; we take its Wasm). Chaining **Porffor (JS→WASM) → `fe_wasm` → IR → Core Erlang** yields *JS on the BEAM, fast*, this week, with no JS frontend of our own.
+### 8.2 JS via Porffor — the goal: any Porffor application runs on the BEAM
+**Porffor** (CanadaHonk) is a from-scratch AOT JS/TS→WASM compiler that *compiles* JS rather than bundling an interpreter, so its WASM is small and fast (it also has `2c`, its own experimental Wasm→C compiler — not used by us; we take its Wasm). Chaining **Porffor (JS→WASM) → `fe_wasm` → IR → Core Erlang** yields *JS on the BEAM* — the stated goal: **any Porffor application runs via 2core on the BEAM**, with no JS frontend of our own. Because 2core now covers the full WASM 2.0 surface minus SIMD (reference types, bulk memory, multi-memory, non-function imports + a host-import mechanism), the WASM Porffor emits is already largely runnable through `fe_wasm`.
 
-**Honest caveats to plan around** (verified against Porffor's current state):
-- It is explicitly an experimental research project; **only a limited subset of JS is supported** (on the order of a third of ECMA-262 historically), and it tracks no particular spec version — so the bridge runs the JS Porffor can compile, not arbitrary JS.
-- **Porffor's Wasm uses its own runtime ABI and custom APIs, not WASI** ("mostly unusable on its own" standalone). So `fe_wasm` must supply Porffor's expected host imports — i.e. an `rt_host` implementation that provides **Porffor's runtime ABI** (its console, memory/string helpers, intrinsics), not generic WASI. Treat "Porffor host shim" as a concrete work item.
-- It deliberately avoids uncommon Wasm proposals (e.g. GC), staying in the core+common subset — which is friendly to `fe_wasm`'s Phase-1 coverage.
+**The remaining work to reach the goal, and the honest technical caveat** (verified against Porffor's current state):
+- **Porffor's Wasm uses its own runtime ABI and custom APIs, not WASI** ("mostly unusable on its own" standalone). So `fe_wasm` must supply Porffor's expected host imports — i.e. an `rt_host` implementation that provides **Porffor's runtime ABI** (its console, memory/string helpers, intrinsics), not generic WASI. This **Porffor-ABI host shim** is the concrete work that remains to reach the goal; it is not yet built or tested.
+- It is explicitly an experimental research project; **only a limited subset of JS is supported** (on the order of a third of ECMA-262 historically), and it tracks no particular spec version — so what reaches the BEAM is the JS Porffor can compile, not arbitrary JS.
+- It deliberately avoids uncommon Wasm proposals (e.g. GC), staying in the core+common subset — which sits comfortably inside `fe_wasm`'s coverage.
 
-Use this as a fast proof-of-concept and benchmark, not a complete JS solution.
-
-### 8.3 Arc as a native JS frontend (`fe_js`) — later
-Arc is currently a JS interpreter on the BEAM. The target state: **Arc stops interpreting and becomes a frontend that emits the IR directly** (JS AST → IR, term value path + shared stdlib + `call_host`). This is strictly better than the Porffor bridge for production JS:
-- It uses the **term value model** (JS objects/values as BEAM terms) instead of boxing JS through WASM linear memory — far better fit and performance on the BEAM.
-- It shares the platform stdlib and Safe/Unsafe model.
-- It keeps Arc's **preemptive** execution property natively (§11), now compiled rather than interpreted.
-  "Transpile JS straight to Erlang rather than interpret" is exactly this, with the IR as the waypoint (so JS benefits from the shared optimizer and backend).
-
-### 8.4 Erlang/Gleam frontend (`fe_beam`, security boundary) — later
+### 8.3 Erlang/Gleam frontend (`fe_beam`, security boundary) — later
 Ingest Core Erlang / Gleam, **restrict unsafe functionality** (disallow VM-escaping BIFs, enforce the Safe-mode allowlist), and emit IR. The payoff: *write Gleam, deploy to the platform, and be provably unable to take over the VM.* The restriction pass is the security boundary; it rejects (fails closed) rather than strips-and-hopes.
 
 ---
@@ -193,7 +184,7 @@ Exact or computations silently corrupt — these hold in every `rt_num` implemen
 (These are the WASM/low-level path's invariants; the term path uses BEAM-native arithmetic with its own, simpler semantics chosen by each frontend's language.)
 
 ### 9.2 Execution model — preemptive, compiled
-- **Compiling to Erlang gives BEAM preemption for free.** Generated code runs as ordinary BEAM code; the scheduler preempts at reduction boundaries, and our tail-recursive loops consume reductions and yield — so even tight WASM loops are **fairly scheduled**, the same property Arc relies on for JS. This is a primary reason to compile (not interpret) and to compile **to Erlang** rather than run a long-running interpreter NIF (which would block a scheduler thread).
+- **Compiling to Erlang gives BEAM preemption for free.** Generated code runs as ordinary BEAM code; the scheduler preempts at reduction boundaries, and our tail-recursive loops consume reductions and yield — so even tight WASM loops are **fairly scheduled** — the same fair-scheduling property that makes JS-on-the-BEAM (via Porffor) viable. This is a primary reason to compile (not interpret) and to compile **to Erlang** rather than run a long-running interpreter NIF (which would block a scheduler thread).
 - **Implication for tier-N memory.** A NIF memory backend is fine because its operations are *per-access and short*; what must never exist is a *whole-program* native loop that runs uninterrupted. Keep native code at the granularity of a single memory/table op.
 - **Interpreted vs compiled stays open but decided.** The compiled route is primary (near-native + preemptive). If an interpreter is ever built for not-yet-supported features, it must be process-per-instance and yield-aware so it inherits the same fairness.
 
@@ -224,7 +215,7 @@ The mechanism behind §4's layer map.
 ## 12. Scope, proposals, non-goals
 - **WASM frontend phasing:** Phase 1 — WASM 1.0 + multi-value + sign-extension + non-trapping float-to-int. Phase 2 — bulk memory, reference types, `memory64`, multiple memories, tail-call proposal (maps beautifully to BEAM tail calls), SIMD (large; defer). Phase 3 / separate — exception-handling, GC, stack switching, component model. **WASI** is just an `rt_host` implementation (a host library), out of the core.
 - **Hard non-goal: WASM threads / shared memory.** Every memory tier is single-threaded / process-local by design; cross-process shared mutable memory conflicts with one-instance-one-process and with the preemptive per-process model. Single-threaded across all tiers and modes.
-- **Frontend roadmap:** WASM (now) → Rust-via-WASM (now-ish) → JS-via-Porffor (bridge, this week) → Arc native JS frontend (later) → Erlang/Gleam frontend (later).
+- **Frontend roadmap:** WASM (now) → Rust-via-WASM (now-ish) → JS-via-Porffor (goal: any Porffor application on the BEAM, gated on the Porffor-ABI host shim) → Erlang/Gleam frontend (later).
 - State proposal and frontend in/out decisions explicitly.
 
 ---
@@ -242,7 +233,7 @@ The mechanism behind §4's layer map.
 **Then each cell is an independent work item** (definition of done = its conformance suite):
 - **IR:** core types; `.ir` parser/printer; round-trip tests.
 - **WASM frontend:** binary decoder; WAT parser; `full`/`subset`/`assume_valid` validators; stack-elim; structure→IR.
-- **Porffor bridge:** the **Porffor-ABI `rt_host` shim**; a JS-subset conformance harness; benchmark vs interpreters.
+- **Porffor path (goal: JS on the BEAM):** the **Porffor-ABI `rt_host` shim**; a JS-subset conformance harness; benchmark vs interpreters.
 - **Optimizer:** `baseline`; `aggressive` (trust-assuming passes flagged Unsafe-only).
 - **Stdlib + capability lowering (`ir_lower`):** stdlib resolution; BIF allowlist enforcement; metering insertion.
 - **Backend:** Core AST + **pretty-printer** (own tests); `state_strategy` threaded/cell; `cerl_ast` alt; `forms`/`file` drivers.
@@ -259,4 +250,4 @@ The mechanism behind §4's layer map.
 
 ## 14. Summary for the next agent
 
-Build, in **Gleam**, a **multi-frontend compiler platform** that lowers several source languages into **one shared, language-neutral IR (ours)** and emits **Core Erlang**, so code runs **fast and preemptively on the BEAM** — compiled, not interpreted. **WASM is the first frontend** (transitively Rust→Erlang; via **Porffor**, a this-week JS→WASM→Erlang bridge, bounded by Porffor's experimental coverage and requiring a Porffor-ABI host shim rather than WASI); **Arc becomes a native JS frontend** later (emitting the IR directly, using the term value model rather than boxing JS through linear memory), and an **Erlang/Gleam frontend** lets people deploy Gleam that provably can't take over the VM. The decisions to lock **now**, even though most frontends are later: the **IR is language-neutral** (no WASM-isms in its core) with **linear memory as an optional feature**, **structured control flow** (no goto), a **dual value model** (BEAM-native terms + opt-in fixed-width/linear-memory) with explicit conversions, **every stage independently invokable with a canonical `.ir` textual form**, **`call_host` as the single capability boundary**, the **standard library defined at the IR level** (Gleam-style minimal-builtin, identical across frontends), and **Safe/Unsafe as global modes** — Unsafe emits the fastest possible near-native code (stdlib passthrough, full BIFs, tier-O/N runtime, no metering), Safe sandboxes (own vetted stdlib + a tiny BEAM-function allowlist, deny-all host, tier-P/O only — never NIFs, metering on). The backend is the proven structured-control→`letrec`+tail-call lowering (loops = constant-space, preemptible BEAM iteration), with numerics routed through `rt_num` (exact two's-complement/IEEE/NaN/trap **fidelity invariants**) and memory through the **canonical tiered `rt_mem`** (`paged` pure default / `atomics` O(1) process-local / `nif` ceiling, never-in-Safe), all behind interfaces validated by **interface-conformance suites** and the official WASM spec test suite. Compiling to Erlang (not a long-running NIF) is what preserves BEAM preemption; tier-N native code stays per-operation. Threads/shared memory is a hard non-goal. Work is interface-first: build the **IR and its textual form first**, then every (stage × implementation) cell is an independent, swarm-parallel work item whose definition of done is its conformance suite — and every link in the chain is independently callable.
+Build, in **Gleam**, a **multi-frontend compiler platform** that lowers several source languages into **one shared, language-neutral IR (ours)** and emits **Core Erlang**, so code runs **fast and preemptively on the BEAM** — compiled, not interpreted. **WASM is the first frontend** (transitively Rust→Erlang; and, via **Porffor**, the goal that *any Porffor application runs on the BEAM* — JS→WASM→Erlang, bounded by Porffor's experimental coverage and gated on a Porffor-ABI `rt_host` shim rather than WASI); an **Erlang/Gleam frontend** lets people deploy Gleam that provably can't take over the VM. The decisions to lock **now**, even though most frontends are later: the **IR is language-neutral** (no WASM-isms in its core) with **linear memory as an optional feature**, **structured control flow** (no goto), a **dual value model** (BEAM-native terms + opt-in fixed-width/linear-memory) with explicit conversions, **every stage independently invokable with a canonical `.ir` textual form**, **`call_host` as the single capability boundary**, the **standard library defined at the IR level** (Gleam-style minimal-builtin, identical across frontends), and **Safe/Unsafe as global modes** — Unsafe emits the fastest possible near-native code (stdlib passthrough, full BIFs, tier-O/N runtime, no metering), Safe sandboxes (own vetted stdlib + a tiny BEAM-function allowlist, deny-all host, tier-P/O only — never NIFs, metering on). The backend is the proven structured-control→`letrec`+tail-call lowering (loops = constant-space, preemptible BEAM iteration), with numerics routed through `rt_num` (exact two's-complement/IEEE/NaN/trap **fidelity invariants**) and memory through the **canonical tiered `rt_mem`** (`paged` pure default / `atomics` O(1) process-local / `nif` ceiling, never-in-Safe), all behind interfaces validated by **interface-conformance suites** and the official WASM spec test suite. Compiling to Erlang (not a long-running NIF) is what preserves BEAM preemption; tier-N native code stays per-operation. Threads/shared memory is a hard non-goal. Work is interface-first: build the **IR and its textual form first**, then every (stage × implementation) cell is an independent, swarm-parallel work item whose definition of done is its conformance suite — and every link in the chain is independently callable.

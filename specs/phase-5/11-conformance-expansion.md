@@ -643,8 +643,9 @@ proved; what — SIMD, memory64-if-cut, full mutable cross-module linking — st
 **Deferred (stated, not dropped):** SIMD (Phase 6); memory64 if cut per H8 (Phase 6, named file-level
 skip, never silent); full cross-module **mutable** linking depth (gated by P5-09's instantiation
 contract — driven and reported here, not guaranteed); GC-proposal reference types (typed function
-references, `struct`/`array`/`i31`, `call_ref`); the Porffor JS→WASM bridge (Phase 7). `assert_
-exhaustion` stays a categorised skip (a BEAM/WASM stack-model mismatch, not a surface gap).
+references, `struct`/`array`/`i31`, `call_ref`). *JS on the BEAM via Porffor* is a **goal** the
+completed surface now largely enables (gated on a Porffor-ABI `rt_host` shim), not a deferred phase.
+`assert_exhaustion` stays a categorised skip (a BEAM/WASM stack-model mismatch, not a surface gap).
 
 ---
 

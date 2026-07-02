@@ -44,7 +44,7 @@ The proof surface is six proofs + one image/docs refresh:
 | 3 | **conformance-neutral** — the whole Phase-1..4 acceptance corpus + previously-passing allowlist stay **byte-identical** under both profiles and every `(state_strategy × mem_tier)` (defaults route the new surface away, H7) | H7 |
 | 4 | **runs-anywhere re-confirmed for the new surface** — a reftype-table / bulk-memory / multi-memory module runs green under the tier-P `portable` build (`threaded`), grep-verified 0 native + executed byte-identical to the `cell`/`paged` oracle | H3/H6 (G1/G3/G6) |
 | 5 | **differential vs `wasmtime` + WAT-from-our-parser confirmed** — unit 11's differential (new surface held to a conformant engine) + the previously-un-`wast2json`-able files running **from our own `parse_script`** are green and committed | H5/overview §1 |
-| 6 | **honest close** — what Phase 5 proved; what is deferred (SIMD→Phase 6, memory64-if-cut, extended-const, GC-reftypes, Porffor→Phase 7, a production C NIF) — stated, not dropped | H8 |
+| 6 | **honest close** — what Phase 5 proved; what is deferred (SIMD→Phase 6, memory64-if-cut, extended-const, GC-reftypes, a production C NIF) — stated, not dropped; and the goal the surface now enables (JS on the BEAM via Porffor, gated on a Porffor-ABI host shim) | H8 |
 | — | **image + docs refresh** — `docs/wasm-conformance.svg` regenerated to the new counts; footnote → Phase-5 scope; a short `docs/phase-5-surface.md` recording the before/after headline | overview §1 |
 
 ---
@@ -425,11 +425,13 @@ text parser; skip-count dropped, `fail == 0` under every shipped tier."** The ge
 - **Did not prove / explicitly deferred (H8):** **SIMD → Phase 6** (the single largest proposal, its
   own focused phase); **memory64** shipped *iff its `.wast` files actually ran* — if quality forced
   the cut, it joins SIMD in **Phase 6**, stated not claimed; **extended-const** and **GC-proposal
-  reference types** (typed function refs + `struct`/`array`/`i31`) are separate proposals, later; the
-  **Porffor JS→WASM bridge → Phase 7** ("JS on the BEAM"); a **production C NIF** for tier-N memory
+  reference types** (typed function refs + `struct`/`array`/`i31`) are separate proposals, later; a
+  **production C NIF** for tier-N memory
   stays documented-deferred (the interface + skeleton ship, the C impl needs a native toolchain);
-  Arc/Gleam frontends, exception-handling / GC / stack-switching / the component model, and the
-  single-`.beam` runtime-dispatch **B1** binding remain deferred. **WASI** stays an `rt_host`
+  the Gleam/Erlang frontend, exception-handling / GC / stack-switching / the component model, and the
+  single-`.beam` runtime-dispatch **B1** binding remain deferred. **"JS on the BEAM" via Porffor is a
+  goal** the completed surface now largely enables — *any Porffor application runs via 2core on the
+  BEAM*, gated on a Porffor-ABI `rt_host` shim (not yet built or tested), not a future phase. **WASI** stays an `rt_host`
   implementation, out of core. No performance claim beyond Phase 4's — Phase 5 is a surface phase; its
   only performance obligation is **negative** (constant-space loops + preemption preserved, no
   regression), which proofs 3–4 carry.
@@ -516,12 +518,13 @@ categorized residuals.
 **Deferred, stated not dropped (H8):** **SIMD** — the `v128` value type + ~236 lane instructions →
 **Phase 6** (the single largest proposal, given its own focused phase); **memory64** joins it *iff*
 cut from Phase 5 (claimed only if its `.wast` files ran); **extended-const** and **GC-proposal
-reference types** (typed function refs + `struct`/`array`/`i31`) are separate proposals, later; the
-**Porffor JS→WASM bridge → Phase 7** ("JS on the BEAM"); a **production C NIF** for tier-N memory
-stays documented-deferred; and later — Arc/Gleam frontends, exception-handling / GC / stack-switching
+reference types** (typed function refs + `struct`/`array`/`i31`) are separate proposals, later; a
+**production C NIF** for tier-N memory
+stays documented-deferred; and later — the Gleam/Erlang frontend, exception-handling / GC / stack-switching
 / the component model, the single-`.beam` runtime-dispatch **B1**. **WASI** stays an `rt_host` impl,
-out of core. Phase 5 completes the *surface*; the second frontend (Phase 7) and SIMD (Phase 6) are the
-next moves.
+out of core. Phase 5 completes the *surface*; SIMD (Phase 6) is the next move — and, as a **goal** the
+completed surface now largely enables, *JS on the BEAM via Porffor* (any Porffor application through
+2core, gated on a Porffor-ABI `rt_host` shim; not yet built or tested).
 
 ---
 

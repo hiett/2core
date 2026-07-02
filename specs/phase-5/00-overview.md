@@ -89,12 +89,14 @@ Phase 2 to grow the IR** — and it does so keeping the IR **language-neutral** 
   Phase 5 adds IR value types + `Expr` nodes + a `.ir` grammar delta. This is expected: Phase 5 is
   the surface phase. Every addition is chosen **language-neutrally** (H7) and is
   **conformance-neutral by default** (H1/H7).
-- **Deferred (state it):** SIMD, memory64-if-cut (**Phase 6**); the Porffor JS→WASM bridge (+ the
-  Porffor-ABI `rt_host` shim) → "JS on the BEAM" (**Phase 7**); Arc as a native JS frontend and the
-  Erlang/Gleam frontend (later); exception-handling / GC (incl. GC-proposal reference types) /
-  stack-switching / the component model (later); the single-`.beam` runtime-dispatch **B1** binding;
-  tier-N numerics; a production C NIF for tier-N memory. **WASI** remains just an `rt_host` impl,
-  out of core.
+- **Deferred (state it):** SIMD, memory64-if-cut (**Phase 6**); exception-handling / GC (incl.
+  GC-proposal reference types) / stack-switching / the component model (later); the Erlang/Gleam
+  frontend (later); the single-`.beam` runtime-dispatch **B1** binding; tier-N numerics; a production
+  C NIF for tier-N memory. **WASI** remains just an `rt_host` impl, out of core.
+- **A goal the completed surface enables — "JS on the BEAM" via Porffor** (a stated direction, *not*
+  a deferred phase): *any Porffor application runs via 2core on the BEAM*. Porffor's JS→WASM output is
+  largely runnable through `fe_wasm` already; the remaining work toward the goal is a **Porffor-ABI
+  `rt_host` shim** (Porffor's own runtime ABI, not WASI) — not yet built or tested.
 
 ---
 
@@ -234,7 +236,8 @@ IR2). The discipline (the anti-WASM-ism rule, high-level decision #1) holds:
 
 See §1. Included: reference types, bulk memory & table ops, multi-memory, memory64 (deferrable
 half), non-function imports + `spectest`, the WAT text parser. **SIMD → Phase 6** (the single
-largest proposal; "large; defer" per §12). **Porffor JS→WASM bridge → Phase 7.** Reference types
+largest proposal; "large; defer" per §12). **JS on the BEAM via Porffor is a goal the completed
+surface enables — gated on a Porffor-ABI `rt_host` shim, not a future phase.** Reference types
 are `funcref`/`externref` only (GC-proposal reftypes are later). This is a surface phase — no new
 optimizer passes, no new perf claim; the obligation is **conformance-neutral by default** + the
 new surface **differentially spec-correct** under the full tier/mode matrix. The performance story
@@ -329,10 +332,12 @@ leave. When in doubt about a foundational decision, **ask the planner**. The man
 - **Phase 6 (SIMD):** the `v128` value type + fixed-width SIMD (~236 lane instructions) — the
   single largest WebAssembly proposal, given its own focused phase; **memory64** joins it if cut
   from Phase 5 per §H8.
-- **Phase 7 (the second frontend):** the Porffor JS→WASM bridge (+ the Porffor-ABI `rt_host` shim)
-  → "JS on the BEAM."
-- **Later:** Arc as a native JS frontend; the Erlang/Gleam frontend; exception-handling, GC
-  (including the GC proposal's typed function references + `struct`/`array`/`i31` reference types),
-  stack-switching, the component model; the single-`.beam` runtime-dispatch **B1** binding; tier-N
-  numerics; a production C NIF for tier-N memory. **WASI** stays an `rt_host` implementation, out of
-  core.
+- **A goal, not a deferred phase — "JS on the BEAM" via Porffor:** *any Porffor application runs via
+  2core on the BEAM* (Porffor JS→WASM → `fe_wasm` → Core Erlang → BEAM). The completed WASM
+  2.0-minus-SIMD surface makes Porffor's output largely runnable through `fe_wasm` today; the work
+  remaining to reach the goal is a **Porffor-ABI `rt_host` shim** (Porffor's own runtime ABI, not
+  WASI) — not yet built or tested.
+- **Later:** the Erlang/Gleam frontend; exception-handling, GC (including the GC proposal's typed
+  function references + `struct`/`array`/`i31` reference types), stack-switching, the component model;
+  the single-`.beam` runtime-dispatch **B1** binding; tier-N numerics; a production C NIF for tier-N
+  memory. **WASI** stays an `rt_host` implementation, out of core.

@@ -12,14 +12,15 @@
 It's a **multi-frontend compiler platform**, written in [Gleam](https://gleam.run), that
 lowers several source languages into **one shared, language-neutral intermediate
 representation (IR)** and emits **Core Erlang** — so the output runs as ordinary,
-fairly-scheduled BEAM code. Loosely: the way Arc runs JavaScript on the BEAM today, but
-**compiled rather than interpreted**. The bet is that compiling *to Erlang* — rather than
+fairly-scheduled BEAM code — **compiled rather than interpreted**. The bet is that compiling *to Erlang* — rather than
 shipping a long-running interpreter — is what preserves BEAM preemption (even a tight loop
 yields fairly and can't monopolise a scheduler) while getting close to native speed.
 
 WebAssembly is the **first** frontend, because so much already compiles *to* WASM —
-which transitively brings Rust and (via a JS→WASM compiler) JavaScript along. Native
-JavaScript and Gleam/Erlang frontends are planned to follow. The intent is for all of
+which transitively brings Rust and (via [Porffor](https://github.com/CanadaHonk/porffor),
+a JS→WASM compiler) JavaScript along. A goal that follows directly from the WASM frontend
+is **JavaScript on the BEAM via Porffor** — *any Porffor application runs via 2core on the
+BEAM* — and a Gleam/Erlang frontend is planned to follow. The intent is for all of
 them to share one IR, one optimizer, one backend, one standard library, and one security
 model.
 
@@ -125,16 +126,16 @@ seam call; the biggest lever left — a native-code (tier-N) numerics/memory bac
 deliberately deferred. In short: correct, sandboxed, preemptive, and runs-anywhere today;
 faster-than-hand-written-Erlang is future work, and honestly measured, not asserted.
 
-## Planned frontend roadmap
+## Frontend roadmap
 
-In intended order (only the first is implemented):
-
-1. **WASM** — *implemented (WASM 1.0).* Also the path to **Rust → BEAM** (via Rust→WASM).
-2. **JavaScript via [Porffor](https://github.com/CanadaHonk/porffor)** — a JS→WASM AOT
-   compiler feeding the WASM frontend, as an early proof-of-concept.
-3. **Arc as a native JavaScript frontend** — emitting the IR directly (term value model)
-   rather than boxing JS through linear memory.
-4. **Erlang / Gleam frontend** — write Gleam, deploy to the platform, and (via Safe mode)
+1. **WASM** — *implemented.* Also the path to **Rust → BEAM** (via Rust→WASM).
+2. **JavaScript via [Porffor](https://github.com/CanadaHonk/porffor)** — *a goal:* a JS→WASM
+   AOT compiler feeding the WASM frontend, so **any Porffor application runs via 2core on the
+   BEAM**. Now that 2core covers the WASM 2.0 surface (minus SIMD), the WASM Porffor emits is
+   already largely runnable; the work remaining to reach the goal is a **Porffor-ABI host
+   shim** (an `rt_host` supplying Porffor's runtime intrinsics, since Porffor uses its own ABI
+   rather than WASI) — not yet built or tested.
+3. **Erlang / Gleam frontend** — write Gleam, deploy to the platform, and (via Safe mode)
    be provably unable to take over the VM.
 
 ## WebAssembly conformance

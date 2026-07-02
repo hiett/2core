@@ -81,7 +81,7 @@ Phase-1 goal & honest scope: see [`phase-1/00-overview.md`](phase-1/00-overview.
 | §11 differential testing (spec `.wast`) | 07 | Tier-A (expected baked in `.wast`) + Tier-B (engine oracle). |
 | §11 interface-conformance suites | each unit's "Verification" | Done = suite passes, not "compiles" (D8). |
 | §8.2 Porffor JS→WASM bridge | — | **Deferred to Phase 2+.** |
-| §8.3/§8.4 Arc/Gleam frontends | — | **Deferred (later phases).** |
+| §8.3 Gleam/Erlang frontend | — | **Deferred (later phase).** |
 | §12 WAT text parser | — | **Deferred to Phase 2** (use `wat2wasm` for fixtures). |
 | §12 bulk memory / reftypes / SIMD / tail-call proposal / threads | — | Deferred / non-goal per §12/§26. |
 
@@ -197,7 +197,7 @@ runtime-dispatch B1 is **Phase 4**.
 **Phase 4** (trust-tier ladder & runs-anywhere): tier-P `threaded` state; tier-O/N `rt_mem`
 (`atomics`/`nif`); `rt_table` tiers; single-`.beam` runtime-dispatch B1. **Phase 5** (complete
 WASM engine): reference types; bulk memory; multi-memory; `memory64`; the WAT text parser;
-non-function imports + `spectest`. **Phase 6+**: the Porffor JS→WASM bridge; Arc/Gleam frontends;
+non-function imports + `spectest`. **Phase 6+**: the Porffor JS→WASM bridge; Gleam/Erlang frontends;
 exception-handling / GC / stack-switching / component model. *(Also deferred within Phase 3: LICM,
 range-based bounds-check elimination, SIMD vectorization, pure-call CSE.)*
 
@@ -254,7 +254,7 @@ runs-anywhere build) and the tier-O/N **memory & table backends** (`atomics` O(1
 
 **Phase 5** (complete WASM engine): reference types; bulk memory; multi-memory; `memory64`; the
 WAT text parser; non-function imports + `spectest`; SIMD. **Phase 6**: the Porffor JS→WASM bridge.
-**Later**: Arc/Gleam frontends; exception-handling / GC / stack-switching / component model; the
+**Later**: Gleam/Erlang frontends; exception-handling / GC / stack-switching / component model; the
 single-`.beam` runtime-dispatch **B1**; tier-N numerics; a production C NIF for tier-N memory.
 
 ---
@@ -267,8 +267,10 @@ Goal & honest scope: see [`specs/phase-5/00-overview.md`](phase-5/00-overview.md
 fast, runs-anywhere platform for a **partial** WASM surface; Phase 5 grows it to the **complete
 standardized surface minus SIMD**. It is the **first phase since Phase 2 to grow the IR** (the
 reference value layer + the effectful table/bulk nodes + the memory-index axis), kept
-language-neutral (H7) and conformance-neutral by default. **SIMD → Phase 6; the Porffor JS bridge →
-Phase 7; memory64's runtime → Phase 6 (R12 — the IR axis stays, decode/validate only).**
+language-neutral (H7) and conformance-neutral by default. **SIMD → Phase 6; memory64's runtime →
+Phase 6 (R12 — the IR axis stays, decode/validate only).** With the surface complete, *JS on the
+BEAM via Porffor* becomes a reachable **goal** (not a future phase): the WASM Porffor emits is
+largely runnable through `fe_wasm` today — the remaining work is a Porffor-ABI host shim (§8.2).
 
 ### Phase-5 freeze milestones (planned)
 
@@ -311,10 +313,13 @@ Phase 7; memory64's runtime → Phase 6 (R12 — the IR axis stays, decode/valid
 
 ### Deferred to Phase 6+ (explicit)
 
-**Phase 6**: SIMD (`v128` + ~236 lane ops); memory64 runtime. **Phase 7**: the Porffor JS→WASM
-bridge. **Later**: Arc/Gleam frontends; exception-handling / GC (incl. GC-proposal reftypes) /
-stack-switching / component model; the single-`.beam` **B1** binding; tier-N numerics; a production C
-NIF; the extended-const proposal.
+**Phase 6**: SIMD (`v128` + ~236 lane ops); memory64 runtime. **Goal — JS on the BEAM via Porffor**
+(a stated direction, *not* a future phase): *any Porffor application runs via 2core on the BEAM*.
+The completed WASM 2.0-minus-SIMD surface makes the WASM Porffor emits largely runnable through
+`fe_wasm`; the work remaining to reach the goal is a **Porffor-ABI `rt_host` shim** (Porffor's own
+runtime ABI, not WASI) — not yet built or tested. **Later**: a Gleam/Erlang frontend;
+exception-handling / GC (incl. GC-proposal reftypes) / stack-switching / component model; the
+single-`.beam` **B1** binding; tier-N numerics; a production C NIF; the extended-const proposal.
 
 ---
 
