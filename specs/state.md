@@ -321,6 +321,14 @@ runtime ABI, not WASI) — not yet built or tested. **Later**: a Gleam/Erlang fr
 exception-handling / GC (incl. GC-proposal reftypes) / stack-switching / component model; the
 single-`.beam` **B1** binding; tier-N numerics; a production C NIF; the extended-const proposal.
 
+**A dedicated performance/optimizer phase (sequel to Phase 3, distinct from Phase 6's surface work)**
+is where the **memory optimizer** lands — MemorySSA + linear-memory alias analysis + range-based
+bounds-check elimination + LICM + store→load forwarding + dead-store elimination, to close the
+per-access residual (`atomics` fixed the O(page) headline; this attacks the seam-fetch + bounds-check
+overhead, trust-neutrally so Safe benefits, across every tier). Design note captured now while fresh:
+[`future-work-memory-optimizer.md`](future-work-memory-optimizer.md) (esp. the trap-preservation
+soundness lever + the "keep the IR analyzable" invariants).
+
 ---
 
 ## Change log
