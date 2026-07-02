@@ -259,7 +259,100 @@ single-`.beam` runtime-dispatch **B1**; tier-N numerics; a production C NIF for 
 
 ---
 
+## Phase 5 — "The complete WASM engine" (reference types + bulk memory + multi-memory + non-function imports/spectest + the WAT parser)
+
+Goal & honest scope: see [`specs/phase-5/00-overview.md`](phase-5/00-overview.md) (decisions
+**H1–H8**) and the AUTHORITATIVE [`specs/phase-5/RECONCILIATION.md`](phase-5/RECONCILIATION.md)
+(decisions **R1–R18** — override the unit docs on conflict). Phases 1–4 built a correct, sandboxed,
+fast, runs-anywhere platform for a **partial** WASM surface; Phase 5 grows it to the **complete
+standardized surface minus SIMD**. It is the **first phase since Phase 2 to grow the IR** (the
+reference value layer + the effectful table/bulk nodes + the memory-index axis), kept
+language-neutral (H7) and conformance-neutral by default. **SIMD → Phase 6; the Porffor JS bridge →
+Phase 7; memory64's runtime → Phase 6 (R12 — the IR axis stays, decode/validate only).**
+
+### Phase-5 freeze milestones (planned)
+
+| Milestone | Produced by | Status | Unblocks |
+|---|---|---|---|
+| `«IR3-FROZEN»` — `ir.gleam` reftype `ValType`s + `ConstNull`/`RefFunc`/`RefIsNull` + table/bulk `Expr` nodes + `Module.memories`/mem-index + `IdxType` + import/export state variants + `TableDecl.ref_ty` + passive/droppable segment model + `.ir` grammar delta; **`runtime/rt_ref.gleam`** (forge-proof ref values, R1) | P5-01 | **unclaimed** | 02, 05, 06, 07, 09, 10 |
+| `«RT3-SIG-FROZEN»` — extended `rt_state` (record + stub accessors, R5) / `rt_mem` / `rt_table` signatures (todo-free) + the `rt_ref` helpers | P5-01 | **unclaimed** | 06, 07, 08, 09 |
+| `«INSTANTIATE3»` — `instantiate/0 | instantiate/1(List(Provided))` + `link_imports` fail-closed contract (R4) + the `spectest` provider (R14) | P5-01 (sig) / P5-09 (impl) | **unclaimed** | 06, 09, 11 |
+| `«WASM-AST3»` — extended `frontend/wasm/ast.gleam` (reftypes, ref/table/bulk instrs, memarg memidx, `IdxType`, segment modes, non-function imports/exports, datacount) | P5-03 (day 1) | **unclaimed** | 04, 05, 10 |
+
+### Phase-5 units (specs authored + critiqued + reconciled; implementation `unclaimed`)
+
+| Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
+|---|---|---|---|---|
+| **P5-01** Interface freeze (keystone) | [`01`](phase-5/01-interface-freeze.md) | **unclaimed** | — | IR3 + `rt_ref` + rt_state record/stubs + RT3 sigs + the instantiate arity rule frozen; lands green, byte-identical defaults. |
+| **P5-02** `.ir` printer/parser ext | [`02`](phase-5/02-ir-textual-form.md) | **unclaimed** | `«IR3»` | Round-trips the new IR3 surface; grammar delta reconciled. |
+| **P5-03** decode ext (+ `«WASM-AST3»`) | [`03`](phase-5/03-decode.md) | **unclaimed** | — | Decodes the full Phase-5 binary surface; owns the datacount wellformedness check (R13); publishes `«WASM-AST3»`. |
+| **P5-04** validate ext | [`04`](phase-5/04-validate.md) | **unclaimed** | `«WASM-AST3»` | Types reftypes/bulk/multi-mem/memory64/select_t/segments/imports; fail-closed. |
+| **P5-05** lower ext | [`05`](phase-5/05-lower.md) | **unclaimed** | `«WASM-AST3»`, `«IR3»` | AST3→IR3 for every new op; rejects 64-bit memory (R12). |
+| **P5-06** emit_core ext | [`06`](phase-5/06-emit-core.md) | **unclaimed** | `«IR3»`, `«RT3-SIG»` | Lowers all new IR3 nodes through the seam (ref/table/bulk/multi-mem) under both strategies; byte-identical defaults; extended D3a test. |
+| **P5-07** rt_table ext | [`07`](phase-5/07-rt-table.md) | **unclaimed** | `«RT3-SIG»` | Typed ref tables + get/set/size/grow/fill/init/copy/elem.drop (payload-as-arg R2, O(N) fuel R9) across tiers + both strategies. |
+| **P5-08** rt_mem ext | [`08`](phase-5/08-rt-mem.md) | **unclaimed** | `«RT3-SIG»` | Bulk memory (exact eager-bounds R10, memmove R11, O(N) fuel R9) + multi-mem routing across tiers + both strategies. |
+| **P5-09** imports + spectest + linker | [`09`](phase-5/09-imports-spectest-linker.md) | **unclaimed** | `«RT3-SIG»`, `«INSTANTIATE3»` | rt_state real bodies (R5/R8); the full `spectest` (R14); `link.gleam` fail-closed `Provided` wiring (R4); export-of-state. |
+| **P5-10** WAT text parser | [`10`](phase-5/10-wat-parser.md) | **unclaimed** | `«WASM-AST3»` | `frontend/wasm/wat.gleam` (10a parse_module + 10b parse_script → src-side `Script`); differential vs `decode∘wat2wasm` (R15). |
+| **P5-11** conformance expansion | [`11`](phase-5/11-conformance-expansion.md) | **unclaimed** | 03–10 | Lights up reftype/bulk/multi-mem/spectest/WAT categories; measured skip-drop (R16); multi-value run-ABI (R17); wasmtime differential. |
+| **P5-12** capstone | [`12`](phase-5/12-capstone.md) | **unclaimed** | all above | PHASE 5 PROVEN: full surface green under the matrix; conformance-neutral; honest close. |
+
+### High-level spec coverage this phase takes
+
+| High-level item | Taken by | Notes |
+|---|---|---|
+| §12 reference types | P5-01/03/04/05/06/07 | `funcref`/`externref` (term-layer values, R1); `table.*`; typed `select`; multi-table; passive/declarative elements. GC-proposal reftypes deferred. |
+| §12 bulk memory | P5-03/04/05/06/07/08 | `memory.*`/`table.*` bulk + passive/droppable segments; exact eager-bounds + memmove + O(N) fuel. |
+| §12 multiple memories | P5-01/03/04/05/06/08 | memory-index axis; `memories: List`; index-0 byte-identical. |
+| §12 `memory64` | P5-03/04 (front only) | decode/validate only; **runtime → Phase 6 (R12)**. |
+| §8/§13 non-function imports + WASI-adjacent host | P5-09 | imported globals/tables/memories as provided state; the `spectest` host module; fail-closed link. |
+| §12 WAT text parser | P5-10 | text → `«WASM-AST3»` + `.wast` script layer; differential vs `wat2wasm`. |
+| §11 differential + interface conformance | P5-11 | the new surface held to `wasmtime` + the `rebuild` oracle under the full matrix. |
+
+### Deferred to Phase 6+ (explicit)
+
+**Phase 6**: SIMD (`v128` + ~236 lane ops); memory64 runtime. **Phase 7**: the Porffor JS→WASM
+bridge. **Later**: Arc/Gleam frontends; exception-handling / GC (incl. GC-proposal reftypes) /
+stack-switching / component model; the single-`.beam` **B1** binding; tier-N numerics; a production C
+NIF; the extended-const proposal.
+
+---
+
 ## Change log
+
+- **Phase-5 plan authored + adversarially critiqued + reconciled.** Scope decision (EM): **Phase 5 =
+  "the complete WASM engine"** — reference types + bulk memory + multi-memory + non-function imports/
+  `spectest` + the WAT text parser (+ memory64 decode/validate only). **SIMD promoted to a dedicated
+  Phase 6** (the single largest proposal; high-level §12 brackets it "large; defer"); the Porffor
+  bridge moves to Phase 7. Authored `phase-5/00-overview.md` (**H1–H8**) + 12 unit docs via a
+  12-agent scoping fan-out (each scoping against an EM-provided provisional IR3/AST3 surface for
+  coherence), then a **4-lens adversarial critique** (frontend spec-fidelity, runtime semantics,
+  security+consistency, scope-realism) refuted the drafts. The critique **cleared** the bulk of the
+  surface (all opcode bytes / `0xFC` sub-opcodes / element+data flags / datacount ordering / memarg
+  bits / `C.refs` membership / eager-bounds+memmove+`grow -1` / index-0 byte-identity — checked
+  against the spec and correct) and caught **4 blockers + 8 majors**, all folded into the
+  AUTHORITATIVE `phase-5/RECONCILIATION.md` (**R1–R18**):
+  - **B: `table.init`/`memory.init` immediate order** was self-contradictory across 03/04/05 (a swap
+    silently validates the wrong bound — security-relevant) → pinned wire order (elemidx-then-tableidx)
+    + an anti-swap fixture (R3).
+  - **B: the `memory.init` seam ABI** was frozen two incompatible ways (unbuildable) and passive-
+    segment payload ownership clashed (07 vs 01/08) → one model: `rt_state` holds only the drop flag,
+    the payload is an emit-supplied argument, symmetric for data/elem (R2).
+  - **B: the null-sentinel/externref representation** was frozen bare-atom (forgeable) vs tagged →
+    pinned the forge-proof `{ref_null}` / `{ref_extern,_}` / unchanged funcref, in a new shared
+    `runtime/rt_ref.gleam` (R1).
+  - **B: the `Provided`/instantiate contract** was frozen incompatibly and 01's dict-keyed-by-name
+    shape couldn't do fail-closed matching (a D3a smell) → adopted 09's typed positional
+    `instantiate/1(List(Provided))` + `link_imports` (R4).
+  - **Majors folded:** `rt_state.gleam` single-owner (01 shape+stubs → 09 bodies; not 08 — R5) + seam
+    naming (R6) + dense index-keyed table store (R7); reference-typed globals via a parallel
+    `ref_globals` map (R8); **O(N) fuel on ALL bulk ops** (else the Safe CPU bound is defeated — R9);
+    the exact `d+n>size ⇒ trap` rule incl. `n==0` (R10); **memory64 runtime deferred to Phase 6**
+    (unverified page cap; decode/validate only — R12); the datacount wellformedness owner (R13); the
+    full `spectest` set incl. `print_i64` (R14); the WAT parser as two implementation passes + float
+    honesty (R15); measured-not-promised conformance greenness (R16); a multi-value run-ABI so
+    residual skips stay closed (R17); host-constructible reference values for the harness (R18). Plan
+    is now internally consistent; implementation next, keystone-first.
+
 
 - **P4-11 landed (capstone) — PHASE 4 PROVEN.** The trust-tier ladder is real and the
   runs-anywhere headline is concrete + true. Two capstone deliverables:

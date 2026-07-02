@@ -9,6 +9,12 @@
 > adds the Phase-5 decisions **H1–H8**. Phases 1–4 are complete and green: **906 tests, 0 warnings,
 > conformance 15747 / 411 / 0 under every shipped `(mode × state_strategy × mem_tier)` binding**,
 > the optimizer proven sound, the trust-tier ladder real, and the runs-anywhere headline concrete.
+>
+> **⚠ After the scoping fan-out + adversarial critique, the canonical decisions were reconciled in
+> [`RECONCILIATION.md`](RECONCILIATION.md) (decisions R1–R18). That file is AUTHORITATIVE — where a
+> unit doc conflicts with it, RECONCILIATION.md wins. Implementer read order:
+> this overview → `RECONCILIATION.md` → the unit doc.** Notable reconciled change: **memory64's
+> runtime is deferred to Phase 6** (the IR axis stays; decode/validate only — R12).
 
 ---
 
@@ -53,7 +59,7 @@ Phase 2 to grow the IR** — and it does so keeping the IR **language-neutral** 
 | **reference types** | `funcref`/`externref` are first-class values; `ref.null`/`ref.func`/`ref.is_null`, `table.get/set/grow/size/fill`, typed `select` all execute spec-correctly; a `call_indirect`/reference through a null slot **traps** (`UninitializedElement`); multiple tables and reference-typed (active + passive + declarative) element segments work; **`reftype.wast`/`ref_null.wast`/`ref_func.wast`/`ref_is_null.wast`/`table_*.wast`/`elem.wast`/`select.wast` run green** |
 | **bulk memory & table** | `memory.fill/copy/init`, `data.drop`, `table.init/copy`, `elem.drop` execute with **spec-exact semantics** — overlap-correct copy (memmove), **eager bounds check → trap with no partial writes**, dropped-segment = zero-length; passive data & element segments carry **droppable instance state**; **`bulk.wast`/`memory_fill.wast`/`memory_copy.wast`/`memory_init.wast`/`table_init.wast`/`table_copy.wast` run green** across `paged` and `atomics` and both state strategies |
 | **multi-memory** | a module with **>1 memory** decodes/validates/lowers/runs; every memory instruction carries a **memory index**; single-memory modules are **byte-identical** to Phase-4 output (the index defaults away) |
-| **memory64** | a **64-bit memory** (`i64`-indexed) decodes/validates/lowers/runs with `i64` address arithmetic and correct large-offset bounds; 32-bit memories are byte-identical to Phase-4 (*this half is the honestly-deferrable one — see §H8*) |
+| **memory64** *(runtime → Phase 6, R12)* | a **64-bit memory** **decodes and validates** correctly (`i64` address typing; a genuinely-invalid memory64 module still fails `assert_invalid`); its **runtime is deferred to Phase 6** — lower/link reject a 64-bit memory with a categorized `memory64 runtime → Phase 6` skip. The `IdxType` axis stays frozen in the IR; 32-bit memories are byte-identical to Phase-4 |
 | **non-function imports + `spectest`** | imported **globals/tables/memories** are wired through the instantiation contract as **provided state** (not deny-all capabilities); the official **`spectest`** module (`global_i32/i64/f32/f64`, `table`, `memory`, `print*`) and the suite's `(register …)` mechanism work, so the many suite files that import them **stop skipping**; an **unsatisfied import fails closed at link time** (never ambient authority — D3a holds) |
 | **WAT text parser** | a new `frontend/wasm/wat.gleam` parses the full text format (folded + flat instructions, S-expressions, the standard abbreviations, inline import/export) **and** the `.wast` script commands (`module`, `assert_return`, `assert_trap`, `assert_invalid`, `register`, `invoke`, `get`, …) into the same WASM AST the binary decoder produces; **differentially proven** `wat_parse(text) ≡ decode(wat2wasm(text))` over a corpus; the previously un-`wast2json`-able suite files now run **from our own parser** |
 | **conformance expansion (the headline)** | the pinned spec suite's **skip count drops materially** as whole categories light up (reftypes, bulk, multi-memory, memory64, spectest-importing files, WAT-only files); **`fail == 0` and `pass` rises**, reported honestly with categorized residual skips; the new surface is **differentially checked** against `wasmtime` |
@@ -65,11 +71,13 @@ Phase 2 to grow the IR** — and it does so keeping the IR **language-neutral** 
   instructions) is the single largest WebAssembly proposal, and high-level §12 explicitly brackets
   it *"(large; defer)."* Folding it into Phase 5 would double the phase and dilute quality. Phase 5
   completes **everything else** in the standardized surface; SIMD gets its own focused **Phase 6**.
-- **memory64 is the deferrable half.** Multi-memory is mechanical and lands. memory64 (`i64`
-  addressing everywhere) is real but the least-impactful-per-correctness-surface feature; it is
-  **in scope** but flagged so that, if quality or coherence is threatened, it may be **honestly
-  deferred to Phase 6 alongside SIMD** rather than shipped half-proven. Do not claim memory64
-  unless its `.wast` files actually run.
+- **memory64's runtime is deferred to Phase 6 (decision exercised — R12).** Multi-memory is
+  mechanical and lands. memory64's runtime (`i64` addressing everywhere, an unverified i64 page cap)
+  was flagged by every scoping agent as the least-impactful-per-correctness-surface feature; per the
+  critique we **exercise H8's deferral**: keep the `IdxType` axis frozen in the IR and **decode +
+  validate** memory64 fully (so we never mis-parse and `assert_invalid` still works), but **defer the
+  runtime to Phase 6** — a 64-bit memory is a categorized skip (`memory64 runtime → Phase 6`), not a
+  guessed-constant implementation. Do not claim memory64 execution in Phase 5.
 - **Reference types = `funcref`/`externref` only** — *not* the GC proposal's typed function
   references or `struct`/`array`/`i31` reference types (those are the GC proposal → later). Phase 5
   ships the two MVP-completion reference types and their table/select/ref instruction surface.
@@ -285,15 +293,15 @@ sized given the surface, and whether memory64 belongs in 08 or is cut per §H8.)
 
 | Unit | File(s) | Notes |
 |---|---|---|
-| **01** keystone | `ir.gleam` (reftypes, H2/H3 `Expr` nodes, `Module.memories`, mem-index, import/export state variants, `TableDecl` reftype, segment/`MemoryDecl` shape, `TrapReason`) · `ir/effect.gleam` *(classify new nodes as barriers — reach)* · `ir/printer.gleam`/`ir/parser.gleam`/`backend/emit_core.gleam` *(minimal compile-satisfying arms so the tree stays green; full impls are 02/06)* · `runtime/instance.gleam` *(import/link contract fields if needed)* · doc-freeze `rt_*` sigs + the instantiation contract | `«IR3-FROZEN»` / `«RT3-SIG-FROZEN»` / `«INSTANTIATE3»`. Land green, byte-identical defaults. |
+| **01** keystone | `ir.gleam` (reftypes, `ConstNull` Value, `RefFunc`/`RefIsNull` + table/bulk `Expr` nodes, `Module.memories`, mem-index, import/export state variants, `TableDecl` reftype, segment/`MemoryDecl` shape, `TrapReason`) · **`runtime/rt_ref.gleam` (NEW — the forge-proof reference value model, R1)** · `runtime/rt_state.gleam` *(record growth + todo-free stub accessors — R5)* · `ir/effect.gleam` *(classify new nodes as barriers)* · `ir/printer.gleam`/`ir/parser.gleam`/`backend/emit_core.gleam` *(minimal compile-satisfying arms; full impls are 02/06)* · doc-freeze `rt_*` sigs + reference the 09 instantiate contract | `«IR3-FROZEN»` / `«RT3-SIG-FROZEN»` / `«INSTANTIATE3»`. Land green, byte-identical defaults. |
 | **02** `.ir` textual | `ir/printer.gleam`, `ir/parser.gleam` (extend) + `specs/phase-5/ir-grammar-delta.md` (or reconcile `ir-grammar.md`) | Full round-trip of the new surface; grammar reconciled to the implementation. |
 | **03** decode ext | `frontend/wasm/decode.gleam`, `frontend/wasm/ast.gleam` (extend) | Publishes **`«WASM-AST3»`** day 1: ref value types, `0xFC`-prefix bulk/table opcodes, ref instructions, memory-index immediates, memory64 limits flags, passive/declarative segment encodings, non-function imports/exports, typed `select`, the expression-form element encoding. |
 | **04** validate ext | `frontend/wasm/validate.gleam` (extend) | Typing for reftypes (`funcref`/`externref` + null), tables (reftype), bulk/table ops, multi-memory memidx bounds, memory64 `i64` address typing, typed `select`, segment + import/export typing. Security boundary; rejects ill-typed fail-closed. |
 | **05** lower ext | `frontend/wasm/lower.gleam` (extend) | WASM AST3 → IR3 for every new op; passive-segment lowering; multi-memory index threading; memory64 address width. |
 | **06** emit_core ext | `backend/emit_core.gleam` (extend) | Lower all new IR nodes through the runtime seam (ref/table/bulk/multi-mem); the state-seam routing by memory index; extend the D3a security-invariant test. Single-owner, deepest codegen change. |
 | **07** rt_table ext | `runtime/rt_table.gleam` + tier modules (extend) / new tier helpers | Typed reference tables; `get/set/grow/size/fill`; `table.init/copy` + `elem.drop`; passive element state; multiple tables; funcref/externref storage; across `map`/`ets`/`atomics` tiers + both state strategies; differential vs oracle. |
-| **08** rt_mem ext (+mem64/multi-mem) | `runtime/rt_mem.gleam` + `rt_mem_atomics`/`rt_mem_nif` (extend), `runtime/rt_state.gleam` *(memories vector — coordinate with 03-owner? no: rt_state is 09/keystone; see reconcile)* | `memory.fill/copy/init` (overlap + eager-bounds-trap) + `data.drop` + passive data state; the memory-index vector; memory64 `i64` addressing; across `paged`/`atomics` (+`nif` iface) + both strategies; differential vs oracle. |
-| **09** imports + spectest + linker | `runtime/rt_host.gleam` (extend: `spectest` registry), `runtime/rt_state.gleam` (extend: imported-state wiring, memories vector), `runtime/profiles.gleam`/`pipeline.gleam` (link contract), the instantiate seam | Non-function imports wired as provided state; the build-fixed `spectest` module; fail-closed unsatisfied-import; export-of-state. |
+| **08** rt_mem ext (+multi-mem) | `runtime/rt_mem.gleam` + `rt_mem_atomics`/`rt_mem_nif` (extend) — **does NOT edit `rt_state.gleam` (R5); consumes its accessors** | `memory.fill/copy/init` (overlap + exact eager-bounds-trap R10; O(N) fuel R9) + `data.drop` payload-as-arg (R2); the memory-index vector routing; **memory64 runtime deferred (R12)**; across `paged`/`atomics` (+`nif` iface) + both strategies; differential vs oracle. |
+| **09** imports + spectest + linker | `runtime/rt_host.gleam` (extend: full `spectest` registry R14), **`runtime/rt_state.gleam` (real bodies — seeding, drop semantics, imported-state, `ref_globals`; R5/R8)**, `runtime/link.gleam` *(NEW — `Provided`/`link_imports`, R4)*, `runtime/profiles.gleam`/`pipeline.gleam`, the `instantiate/0`/`instantiate/1(List(Provided))` seam (R4) | Non-function imports wired as positional provided state (fail-closed matching); the build-fixed `spectest`; export-of-state. |
 | **10** WAT text parser | `frontend/wasm/wat.gleam` *(new)* + the `.wast` script command layer (conformance-facing) | Text → `«WASM-AST3»` (module + script commands); differential `wat_parse ≡ decode∘wat2wasm`. |
 | **11** conformance expansion | `test/twocore/conformance/**` (extend) | Light up reftypes/bulk/multi-mem/mem64/spectest/WAT categories; report new pass/skip/fail honestly; differential vs `wasmtime`; the WAT-only files run from our parser. |
 | **12** capstone | `test/twocore/conformance/**`, `test/**`, `docs/` | Full surface green under the full matrix; skip-count drop headline; conformance-neutral proof; SVG refresh; honest close. |
