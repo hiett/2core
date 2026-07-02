@@ -14,6 +14,15 @@
 > `make_cons`, `tuple_get.<index>`; `data` is `data ( <offset-expr> ) = 0x<hex>`;
 > canonical whitespace is compact (`%name:ty`, no inner-paren padding) though the parser
 > is whitespace-insensitive.
+>
+> **Extensions (per-phase grammar deltas).** This page is the Phase-1 core; later phases
+> grow the grammar **additively** (every spelling here is unchanged). See:
+> - `specs/phase-2/ir2-grammar-delta.md` — Phase-2 (`table`/`elem`/`start`, `mem.size`/
+>   `mem.grow`, the result-typed `mem.load`, the float ops, the trapping/converting `ConvOp`s).
+> - `specs/phase-5/ir-grammar-delta.md` — Phase-5 IR3 (reftype valtypes + `RefType`, the
+>   `null.<reftype>` literal, the reference/table/bulk-memory expressions, the memory-index
+>   decorator, multi-memory + memory64, the import/export state variants, and the
+>   passive/declarative segment forms).
 
 ## Design rules (from D7)
 

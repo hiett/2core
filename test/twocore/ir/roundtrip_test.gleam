@@ -570,6 +570,215 @@ fn mem_table_module() -> ir.Module {
   )
 }
 
+/// The worker function body of `refs_bulk_module` — a `let`-chain exercising every new
+/// reference / table / bulk-memory / multi-memory `Expr` once. Built independently of the
+/// printer (mirrors `golden/refs_bulk.ir`), so agreement is an oracle, not collusion.
+fn refs_bulk_worker_body() -> ir.Expr {
+  ir.Let(
+    ["r0"],
+    ir.RefFunc("worker"),
+    ir.Let(
+      ["isn"],
+      ir.RefIsNull(ir.Var("r0")),
+      ir.Let(
+        [],
+        ir.TableSet("funcs", ir.Var("t"), ir.Var("r0")),
+        ir.Let(
+          ["g"],
+          ir.TableGet("funcs", ir.Var("t")),
+          ir.Let(
+            ["sz"],
+            ir.TableSize("funcs"),
+            ir.Let(
+              ["grew"],
+              ir.TableGrow("hosts", ir.ConstI32(1), ir.ConstNull(ir.ExternRef)),
+              ir.Let(
+                [],
+                ir.TableFill(
+                  "hosts",
+                  ir.ConstI32(0),
+                  ir.ConstNull(ir.ExternRef),
+                  ir.ConstI32(1),
+                ),
+                ir.Let(
+                  [],
+                  ir.TableInit(
+                    "funcs",
+                    2,
+                    ir.ConstI32(0),
+                    ir.ConstI32(0),
+                    ir.ConstI32(2),
+                  ),
+                  ir.Let(
+                    [],
+                    ir.TableCopy(
+                      "funcs",
+                      "funcs",
+                      ir.ConstI32(0),
+                      ir.ConstI32(0),
+                      ir.ConstI32(1),
+                    ),
+                    ir.Let(
+                      [],
+                      ir.ElemDrop(2),
+                      ir.Let(
+                        [],
+                        ir.MemFill(
+                          0,
+                          ir.ConstI32(0),
+                          ir.ConstI32(0),
+                          ir.ConstI32(4),
+                        ),
+                        ir.Let(
+                          [],
+                          ir.MemCopy(
+                            1,
+                            0,
+                            ir.ConstI32(0),
+                            ir.ConstI32(0),
+                            ir.ConstI32(4),
+                          ),
+                          ir.Let(
+                            [],
+                            ir.MemInit(
+                              0,
+                              2,
+                              ir.ConstI32(0),
+                              ir.ConstI32(0),
+                              ir.ConstI32(2),
+                            ),
+                            ir.Let(
+                              [],
+                              ir.DataDrop(2),
+                              ir.Let(
+                                ["big"],
+                                ir.MemLoad(
+                                  1,
+                                  ir.MemAccess(8, False),
+                                  ir.Var("t"),
+                                  0,
+                                  ir.TI64,
+                                ),
+                                ir.Let(
+                                  [],
+                                  ir.MemStore(
+                                    1,
+                                    ir.MemAccess(4, False),
+                                    ir.Var("t"),
+                                    ir.ConstI32(7),
+                                    0,
+                                  ),
+                                  ir.Let(
+                                    ["pages"],
+                                    ir.MemSize(1),
+                                    ir.Return([ir.Var("g")]),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  )
+}
+
+/// Expected `Module` for the Phase-5 golden `golden/refs_bulk.ir` (hand-built, independent of
+/// the printer). Exercises the FULL IR3 surface in one module: two memories (32-bit + memory64),
+/// a funcref + an externref table, a reftype-typed global with a `ref.null` init, the six
+/// import/export state variants, active / mem-tagged-active / passive data, active (legacy) /
+/// canonical-active / passive / declarative element segments with `ref.func` and `ref.null`
+/// items, and every reference / table / bulk / multi-memory expression.
+fn refs_bulk_module() -> ir.Module {
+  ir.Module(
+    name: "refs_bulk",
+    uses_numerics: True,
+    memories: [
+      ir.MemoryDecl(1, Some(4), ir.Idx32),
+      ir.MemoryDecl(2, None, ir.Idx64),
+    ],
+    globals: [
+      ir.GlobalDecl(
+        "gref",
+        ir.TFuncRef,
+        False,
+        ir.Values([ir.ConstNull(ir.FuncRef)]),
+      ),
+    ],
+    imports: [
+      ir.ImportGlobal("spectest", "global_i32", ir.TI32, False),
+      ir.ImportGlobal("env", "counter", ir.TI64, True),
+      ir.ImportTable("spectest", "table", ir.FuncRef, 10, Some(20)),
+      ir.ImportMemory("spectest", "memory", 1, Some(2), ir.Idx32),
+      ir.ImportMemory("env", "mem64", 1, None, ir.Idx64),
+      ir.ImportFn("env", "log", ir.FuncType([ir.TI32], [])),
+    ],
+    functions: [
+      ir.Function(
+        name: "worker",
+        params: [ir.Local("t", ir.TI32)],
+        result: [ir.TFuncRef],
+        locals: [],
+        body: refs_bulk_worker_body(),
+      ),
+      ir.Function(
+        name: "setup",
+        params: [],
+        result: [],
+        locals: [],
+        body: ir.Return([]),
+      ),
+    ],
+    exports: [
+      ir.ExportTable("funcs", "funcs"),
+      ir.ExportMemory("mem2", 1),
+      ir.ExportGlobal("g", "gref"),
+      ir.ExportFn("worker", "worker"),
+    ],
+    data_segments: [
+      ir.DataSegment(ir.DataActive(0, ir.Values([ir.ConstI32(0)])), <<
+        0xde, 0xad, 0xbe, 0xef,
+      >>),
+      ir.DataSegment(ir.DataActive(1, ir.Values([ir.ConstI32(8)])), <<
+        0x01, 0x02,
+      >>),
+      ir.DataSegment(ir.DataPassive, <<0x03, 0x04>>),
+    ],
+    tables: [
+      ir.TableDecl("funcs", ir.FuncRef, 2, Some(8)),
+      ir.TableDecl("hosts", ir.ExternRef, 1, None),
+    ],
+    elements: [
+      ir.ElementSegment(
+        ir.ElemActive("funcs", ir.Values([ir.ConstI32(0)])),
+        ir.FuncRef,
+        [ir.RefFunc("worker"), ir.RefFunc("worker")],
+      ),
+      ir.ElementSegment(
+        ir.ElemActive("funcs", ir.Values([ir.ConstI32(1)])),
+        ir.FuncRef,
+        [ir.RefFunc("worker"), ir.Values([ir.ConstNull(ir.FuncRef)])],
+      ),
+      ir.ElementSegment(ir.ElemPassive, ir.FuncRef, [
+        ir.RefFunc("worker"),
+        ir.Values([ir.ConstNull(ir.FuncRef)]),
+      ]),
+      ir.ElementSegment(ir.ElemDeclarative, ir.ExternRef, [
+        ir.Values([ir.ConstNull(ir.ExternRef)]),
+      ]),
+    ],
+    start: Some("setup"),
+  )
+}
+
 // ───────────────────────────── round-trip tests ─────────────────────────────
 
 pub fn numop_roundtrip_test() {
@@ -712,6 +921,16 @@ pub fn golden_mem_table_parses_to_expected_test() {
     == Ok(mem_table_module())
 }
 
+/// The Phase-5 golden parses to its hand-built expected `Module` — the independent oracle
+/// proving the printer and parser agree on the IR3 grammar delta (reftype valtypes, the
+/// reference/table/bulk expressions, the memory index, multi-memory + memory64, the
+/// import/export state variants, and the passive/declarative segments with ref-init items),
+/// not merely with each other.
+pub fn golden_refs_bulk_parses_to_expected_test() {
+  assert parser.parse_module(read_golden("refs_bulk.ir"))
+    == Ok(refs_bulk_module())
+}
+
 pub fn goldens_reprint_and_reparse_stably_test() {
   // print(parse(golden)) need not match the golden BYTES (the goldens carry hand
   // comments/whitespace), but the parsed Module must round-trip through the canonical
@@ -720,6 +939,7 @@ pub fn goldens_reprint_and_reparse_stably_test() {
   check_roundtrip(sum_to_module())
   check_roundtrip(fib_module())
   check_roundtrip(mem_table_module())
+  check_roundtrip(refs_bulk_module())
 }
 
 // ───────────────────────────── module_equal tests ─────────────────────────────
@@ -730,6 +950,325 @@ pub fn module_equal_reflexive_test() {
 
 pub fn module_equal_distinguishes_programs_test() {
   assert module_equal(add_module(), fib_module()) == False
+}
+
+// ───────────────────────────── Phase-5 IR3 surface (round-trip) ─────────────────
+
+/// A representative instance of every NEW Phase-5 `Expr`, plus the reftype-null `Value`, for
+/// the round-trip. Derived from the WASM reference-types / bulk-memory / multi-memory
+/// constructs (what forms must exist), not from the printer's output. Covers: the memory index
+/// at 0 (omitted) and non-zero; `mem.copy` both-zero and with distinct `dst_mem`/`src_mem`;
+/// `table.copy` with two distinct table names; `table.init`/`mem.init`/`elem.drop`/`data.drop`
+/// segment indices; and `ConstNull` at both reftypes in `Value` position.
+fn phase5_expr_corpus() -> List(ir.Expr) {
+  [
+    // reference expressions
+    ir.RefFunc("f"),
+    ir.RefIsNull(ir.Var("x")),
+    ir.RefIsNull(ir.ConstNull(ir.FuncRef)),
+    // null literals flowing as ordinary values
+    ir.Values([ir.ConstNull(ir.FuncRef)]),
+    ir.Values([ir.ConstNull(ir.ExternRef)]),
+    ir.GlobalSet("g", ir.ConstNull(ir.ExternRef)),
+    // table expressions
+    ir.TableGet("t", ir.Var("i")),
+    ir.TableSet("t", ir.Var("i"), ir.Var("v")),
+    ir.TableSize("t"),
+    ir.TableGrow("t", ir.Var("d"), ir.ConstNull(ir.FuncRef)),
+    ir.TableGrow("t", ir.ConstI32(1), ir.Var("init")),
+    ir.TableFill("t", ir.Var("o"), ir.Var("v"), ir.Var("c")),
+    ir.TableInit("t", 3, ir.Var("d"), ir.Var("s"), ir.Var("c")),
+    ir.TableCopy("dst", "src", ir.Var("d"), ir.Var("s"), ir.Var("c")),
+    ir.TableCopy("t", "t", ir.ConstI32(0), ir.ConstI32(0), ir.ConstI32(1)),
+    ir.ElemDrop(0),
+    ir.ElemDrop(5),
+    // bulk-memory expressions (memory index at 0 = omitted, and non-zero)
+    ir.MemFill(0, ir.Var("d"), ir.Var("v"), ir.Var("c")),
+    ir.MemFill(2, ir.Var("d"), ir.Var("v"), ir.Var("c")),
+    ir.MemCopy(0, 0, ir.Var("d"), ir.Var("s"), ir.Var("c")),
+    ir.MemCopy(2, 1, ir.Var("d"), ir.Var("s"), ir.Var("c")),
+    ir.MemInit(0, 1, ir.Var("d"), ir.Var("s"), ir.Var("c")),
+    ir.MemInit(3, 1, ir.Var("d"), ir.Var("s"), ir.Var("c")),
+    ir.DataDrop(0),
+    ir.DataDrop(7),
+    // the memory index on the existing memory ops, at 0 (omitted) and non-zero
+    ir.MemSize(0),
+    ir.MemSize(1),
+    ir.MemGrow(0, ir.Var("d")),
+    ir.MemGrow(2, ir.Var("d")),
+    ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32),
+    ir.MemLoad(1, ir.MemAccess(1, True), ir.Var("a"), 8, ir.TI64),
+    ir.MemStore(0, ir.MemAccess(4, False), ir.Var("a"), ir.Var("v"), 0),
+    ir.MemStore(3, ir.MemAccess(8, False), ir.Var("a"), ir.Var("v"), 16),
+  ]
+}
+
+pub fn phase5_expr_surface_roundtrip_test() {
+  list.each(phase5_expr_corpus(), fn(e) {
+    check_roundtrip(expr_module("p5", e))
+  })
+}
+
+/// Both reference `ValType`s are legal — and round-trip — in every valtype position:
+/// param, local, function result, a `FuncType` (via `call_indirect`), and a global's type.
+fn reftype_valtype_module() -> ir.Module {
+  ir.Module(
+    name: "rt",
+    uses_numerics: True,
+    memories: [],
+    globals: [
+      ir.GlobalDecl(
+        "gf",
+        ir.TFuncRef,
+        True,
+        ir.Values([ir.ConstNull(ir.FuncRef)]),
+      ),
+      ir.GlobalDecl(
+        "ge",
+        ir.TExternRef,
+        False,
+        ir.Values([ir.ConstNull(ir.ExternRef)]),
+      ),
+    ],
+    imports: [],
+    functions: [
+      ir.Function(
+        name: "f",
+        params: [ir.Local("a", ir.TFuncRef), ir.Local("b", ir.TExternRef)],
+        result: [ir.TFuncRef, ir.TExternRef],
+        locals: [ir.Local("l1", ir.TFuncRef), ir.Local("l2", ir.TExternRef)],
+        body: ir.Let(
+          ["x"],
+          ir.CallIndirect(
+            "t",
+            ir.Var("i"),
+            ir.FuncType([ir.TFuncRef], [ir.TExternRef]),
+            [ir.Var("a")],
+          ),
+          ir.Return([ir.Var("a"), ir.Var("b")]),
+        ),
+      ),
+    ],
+    exports: [],
+    data_segments: [],
+    tables: [ir.TableDecl("t", ir.FuncRef, 1, None)],
+    elements: [],
+    start: None,
+  )
+}
+
+pub fn reftype_valtype_positions_roundtrip_test() {
+  check_roundtrip(reftype_valtype_module())
+}
+
+/// The full IR3 module-level surface round-trips (the hand-built oracle also drives the golden
+/// test); asserting it here keeps the property green independently of golden-file reading.
+pub fn phase5_module_level_roundtrip_test() {
+  check_roundtrip(refs_bulk_module())
+}
+
+/// A zero-memory, a one-memory, and a two-memory module (including a memory64) each round-trip
+/// — the `Module.memories` list is carried losslessly at every cardinality.
+pub fn memories_cardinality_roundtrip_test() {
+  let zero = expr_module("m0", ir.Return([]))
+  let one =
+    ir.Module(..zero, name: "m1", memories: [ir.MemoryDecl(1, None, ir.Idx32)])
+  let two =
+    ir.Module(..zero, name: "m2", memories: [
+      ir.MemoryDecl(1, Some(3), ir.Idx32),
+      ir.MemoryDecl(2, None, ir.Idx64),
+    ])
+  check_roundtrip(zero)
+  check_roundtrip(one)
+  check_roundtrip(two)
+}
+
+// ───────────────────────────── Phase-5 discrimination (no field dropped) ────────
+
+/// A `funcref` table and an `externref` table with the SAME name/min/max are DISTINCT modules
+/// and each round-trips — the `TableDecl.ref_ty` field is not dropped by print→parse.
+pub fn table_reftype_discrimination_test() {
+  let f =
+    ir.Module(..reftype_valtype_module(), tables: [
+      ir.TableDecl("t", ir.FuncRef, 1, Some(2)),
+    ])
+  let e =
+    ir.Module(..reftype_valtype_module(), tables: [
+      ir.TableDecl("t", ir.ExternRef, 1, Some(2)),
+    ])
+  assert module_equal(f, e) == False
+  check_roundtrip(f)
+  check_roundtrip(e)
+}
+
+/// A `mem.load` at memory index 0 vs index 1 (same access/addr/offset/result) are DISTINCT and
+/// each round-trips — the `mem=` decorator is not dropped.
+pub fn mem_index_discrimination_test() {
+  let m0 =
+    expr_module(
+      "mi",
+      ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32),
+    )
+  let m1 =
+    expr_module(
+      "mi",
+      ir.MemLoad(1, ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32),
+    )
+  assert module_equal(m0, m1) == False
+  check_roundtrip(m0)
+  check_roundtrip(m1)
+}
+
+/// An `Idx32` vs an `Idx64` memory (same min/max) are DISTINCT modules and each round-trips —
+/// the `MemoryDecl.idx_type` (memory64 axis) is not dropped.
+pub fn idxtype_discrimination_test() {
+  let base = expr_module("ix", ir.Return([]))
+  let m32 = ir.Module(..base, memories: [ir.MemoryDecl(2, Some(4), ir.Idx32)])
+  let m64 = ir.Module(..base, memories: [ir.MemoryDecl(2, Some(4), ir.Idx64)])
+  assert module_equal(m32, m64) == False
+  check_roundtrip(m32)
+  check_roundtrip(m64)
+}
+
+/// Active vs passive vs declarative element segments (same reftype + init) are pairwise DISTINCT
+/// and each round-trips — the `ElemMode` is not collapsed.
+pub fn elem_mode_discrimination_test() {
+  let init = [ir.RefFunc("w")]
+  let base = expr_module("em", ir.Return([]))
+  let active =
+    ir.Module(..base, elements: [
+      ir.ElementSegment(
+        ir.ElemActive("t", ir.Values([ir.ConstI32(0)])),
+        ir.FuncRef,
+        init,
+      ),
+    ])
+  let passive =
+    ir.Module(..base, elements: [
+      ir.ElementSegment(ir.ElemPassive, ir.FuncRef, init),
+    ])
+  let declarative =
+    ir.Module(..base, elements: [
+      ir.ElementSegment(ir.ElemDeclarative, ir.FuncRef, init),
+    ])
+  assert module_equal(active, passive) == False
+  assert module_equal(passive, declarative) == False
+  assert module_equal(active, declarative) == False
+  check_roundtrip(active)
+  check_roundtrip(passive)
+  check_roundtrip(declarative)
+}
+
+/// A `ConstNull(FuncRef)` vs a `ConstNull(ExternRef)` are DISTINCT and each round-trips — the
+/// null literal's static reftype is not dropped (`ref.null t` is the `ConstNull(t)` value, R1c).
+pub fn constnull_reftype_discrimination_test() {
+  let f = expr_module("cn", ir.Values([ir.ConstNull(ir.FuncRef)]))
+  let e = expr_module("cn", ir.Values([ir.ConstNull(ir.ExternRef)]))
+  assert module_equal(f, e) == False
+  check_roundtrip(f)
+  check_roundtrip(e)
+}
+
+/// A reftype-typed global with a `ref.null` initialiser coexists — and round-trips — alongside
+/// NaN-payload / `-0.0` / ±Inf float globals, proving the new reference surface does not disturb
+/// the D5 bit-exact float encoding.
+pub fn reftype_global_and_nan_coexist_roundtrip_test() {
+  let m =
+    ir.Module(..expr_module("co", ir.Return([])), globals: [
+      ir.GlobalDecl(
+        "gnull",
+        ir.TFuncRef,
+        False,
+        ir.Values([ir.ConstNull(ir.FuncRef)]),
+      ),
+      ir.GlobalDecl(
+        "gqnan",
+        ir.TF64,
+        False,
+        ir.Values([ir.ConstF64(0x7ff8000000000000)]),
+      ),
+      ir.GlobalDecl(
+        "gnzero",
+        ir.TF32,
+        True,
+        ir.Values([ir.ConstF32(0x80000000)]),
+      ),
+      ir.GlobalDecl(
+        "ginf",
+        ir.TF32,
+        False,
+        ir.Values([ir.ConstF32(0x7f800000)]),
+      ),
+    ])
+  check_roundtrip(m)
+}
+
+// ───────────────────────────── Phase-5 byte-identity (H7) ───────────────────────
+
+/// A Phase-4-shaped (legacy) module prints byte-identically: one 32-bit memory (no idx token),
+/// a funcref table (reftype elided), memory ops at index 0 (no `mem=`), an active data segment
+/// at memory 0 (no `mem=`), and function-only import/export. This asserts the EXACT canonical
+/// text (the Phase-4 spelling derived from the grammar), so a regression that leaked a new token
+/// into legacy output fails closed.
+pub fn legacy_module_byte_identical_test() {
+  let m =
+    ir.Module(
+      name: "leg",
+      uses_numerics: True,
+      memories: [ir.MemoryDecl(1, Some(2), ir.Idx32)],
+      globals: [],
+      imports: [ir.ImportFn("env", "log", ir.FuncType([ir.TI32], []))],
+      functions: [
+        ir.Function(
+          name: "f",
+          params: [ir.Local("p", ir.TI32)],
+          result: [ir.TI32],
+          locals: [],
+          body: ir.Let(
+            ["v"],
+            ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("p"), 0, ir.TI32),
+            ir.Let(["sz"], ir.MemSize(0), ir.Return([ir.Var("v")])),
+          ),
+        ),
+      ],
+      exports: [ir.ExportFn("main", "f")],
+      data_segments: [
+        ir.DataSegment(ir.DataActive(0, ir.Values([ir.ConstI32(0)])), <<0x01>>),
+      ],
+      tables: [ir.TableDecl("t", ir.FuncRef, 1, None)],
+      elements: [],
+      start: None,
+    )
+  let expected =
+    "module @leg {\n"
+    <> "  numerics true\n"
+    <> "  memory (min 1 max 2)\n"
+    <> "  table @t min 1\n"
+    <> "  import \"env\" \"log\" : (i32) -> ()\n"
+    <> "  export \"main\" = @f\n"
+    <> "  data (values (i32.const 0)) = 0x01\n"
+    <> "  func @f (%p:i32) -> (i32) {\n"
+    <> "    let (%v) = mem.load i32 4 %p offset=0\n"
+    <> "    let (%sz) = mem.size\n"
+    <> "    return (%v)\n"
+    <> "  }\n"
+    <> "}\n"
+  assert printer.print_module(m) == expected
+  // And the empty (numerics-only) module still prints the legacy `memory none` line.
+  assert printer.print_module(ir.Module(
+      "e",
+      False,
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      None,
+    ))
+    == "module @e {\n  numerics false\n  memory none\n}\n"
 }
 
 // ───────────────────────────── negative corpus (totality, D4) ─────────────────
@@ -875,6 +1414,58 @@ pub fn negative_new_trapreasons_roundtrip_test() {
   assert rejects("module @m { func @f () -> () { trap not_a_reason } }")
 }
 
+pub fn negative_bad_reftype_test() {
+  // `table @t <bad>reftype` — a `min` keyword is required after the (optional) reftype; a bogus
+  // token where the reftype/`min` is expected must error (never panic).
+  let r = parser.parse_module("module @m { table @t bogus min 1 }")
+  assert rejects("module @m { table @t bogus min 1 }") == True
+  assert case r {
+    Error(_) -> True
+    _ -> False
+  }
+}
+
+pub fn negative_unknown_import_kind_test() {
+  // `import "m" "n" widget` — `widget` is not a valid import kind (`:`/global/table/memory).
+  let r = parser.parse_module("module @m { import \"m\" \"n\" widget }")
+  assert case r {
+    Error(parser.UnexpectedToken(_, _, _, "widget")) -> True
+    _ -> False
+  }
+}
+
+pub fn negative_unknown_export_target_test() {
+  // `export "e" = frob @x` — `frob` is not a valid export target (@fn/global/table/memory).
+  let r = parser.parse_module("module @m { export \"e\" = frob @x }")
+  assert case r {
+    Error(parser.UnexpectedToken(_, _, _, "frob")) -> True
+    _ -> False
+  }
+}
+
+pub fn negative_ref_null_is_not_an_expr_test() {
+  // R1c dropped `RefNull` as an `Expr`; a null reference is the `ConstNull` VALUE (`null.<t>`),
+  // so `ref.null …` in expression position is an unknown expression, not a valid statement.
+  let r =
+    parser.parse_module("module @m { func @f () -> () { ref.null funcref } }")
+  assert case r {
+    Error(parser.UnexpectedToken(_, _, "expression", "ref.null")) -> True
+    _ -> False
+  }
+}
+
+pub fn negative_missing_seg_test() {
+  // `mem.init` requires a mandatory `seg=<int>`; omitting it must error (never panic).
+  let r =
+    parser.parse_module(
+      "module @m { func @f () -> () { mem.init i32.const 0 i32.const 0 i32.const 1 } }",
+    )
+  assert case r {
+    Error(_) -> True
+    _ -> False
+  }
+}
+
 pub fn negative_garbage_inputs_never_panic_test() {
   // A battery of malformed inputs: each must return Error (never panic). Reaching the
   // end of this list without crashing the runner IS the totality proof.
@@ -921,6 +1512,37 @@ pub fn negative_garbage_inputs_never_panic_test() {
     "module @m { func @f () -> () { mem.load i32 } }",
     "module @m { func @f () -> () { convert trunc_s.f64 %a } }",
     "module @m { func @f () -> () { convert convert_s.f64.i32 %a } }",
+    // Phase-5 malformed forms (IR3 surface): each must return Error, never panic.
+    "module @m { memory i128 (min 1) }",
+    "module @m { memory i64 }",
+    "module @m { memory (min ) }",
+    "module @m { table @t externref }",
+    "module @m { elem funcref }",
+    "module @m { elem funcref @t }",
+    "module @m { elem funcref @t (values (i32.const 0)) }",
+    "module @m { elem funcref passive }",
+    "module @m { elem bogus passive [ @a ] }",
+    "module @m { import \"m\" \"n\" }",
+    "module @m { import \"m\" \"n\" table }",
+    "module @m { import \"m\" \"n\" memory }",
+    "module @m { import \"m\" \"n\" global }",
+    "module @m { export \"e\" = }",
+    "module @m { export \"e\" = memory }",
+    "module @m { data passive }",
+    "module @m { data mem=1 }",
+    "module @m { func @f () -> () { ref.func } }",
+    "module @m { func @f () -> () { ref.is_null } }",
+    "module @m { func @f () -> () { table.get @t } }",
+    "module @m { func @f () -> () { table.init @t %a %b %c } }",
+    "module @m { func @f () -> () { table.copy @t %a %b %c } }",
+    "module @m { func @f () -> () { elem.drop } }",
+    "module @m { func @f () -> () { elem.drop seg=x } }",
+    "module @m { func @f () -> () { data.drop } }",
+    "module @m { func @f () -> () { mem.fill i32.const 0 } }",
+    "module @m { func @f () -> () { mem.copy i32.const 0 i32.const 0 } }",
+    "module @m { func @f () -> () { mem.init i32.const 0 i32.const 0 i32.const 1 } }",
+    "module @m { func @f () -> () { mem.size mem= } }",
+    "module @m { func @f () -> () { values (null.i32) } }",
   ]
   assert list.all(garbage, rejects)
 }

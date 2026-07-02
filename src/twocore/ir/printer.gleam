@@ -47,11 +47,11 @@ import twocore/ir.{
   IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If,
   IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
   InvalidConversionToInteger, Let, Loop, LoopParam, MakeCons, MakeTuple,
-  MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryDecl, MemoryOutOfBounds,
-  Num, ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64,
-  TI32, TI64, TTerm, TableOutOfBounds, TermOp, Trap, TruncS, TruncSatS,
-  TruncSatU, TruncU, TupleGet, UnboxFloat, UnboxInt, UndefinedElement,
-  UninitializedElement, Unreachable, Values, Var, W32, W64,
+  MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryOutOfBounds, Num,
+  ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64, TI32,
+  TI64, TTerm, TableOutOfBounds, TermOp, Trap, TruncS, TruncSatS, TruncSatU,
+  TruncU, TupleGet, UnboxFloat, UnboxInt, UndefinedElement, UninitializedElement,
+  Unreachable, Values, Var, W32, W64,
 }
 
 // ───────────────────────────── public entry point ─────────────────────────────
@@ -75,8 +75,14 @@ pub fn print_module(module: Module) -> String {
   let header = [
     "module @" <> module.name <> " {\n",
     "  numerics " <> bool_str(module.uses_numerics) <> "\n",
-    "  memory " <> memory_str(module.memories) <> "\n",
   ]
+  // One `memory` line per declaration, in list order (list position = memory index, H3);
+  // the empty list renders the legacy `memory none` sentinel (byte-identical to a Phase-1
+  // numerics-only module). See `print_memory_decl` (§A.2.1).
+  let memories = case module.memories {
+    [] -> ["  memory none\n"]
+    ms -> list.map(ms, print_memory_decl)
+  }
   let globals = list.map(module.globals, print_global)
   let tables = list.map(module.tables, print_table)
   let imports = list.map(module.imports, print_import)
@@ -92,6 +98,7 @@ pub fn print_module(module: Module) -> String {
   string_tree.from_strings(
     list.flatten([
       header,
+      memories,
       globals,
       tables,
       imports,
@@ -116,17 +123,20 @@ fn bool_str(b: Bool) -> String {
   }
 }
 
-/// Renders the linear-memory vector (H3): `none` (no memory), or the first memory's Phase-2
-/// form `(min N)` / `(min N max M)`. KEYSTONE minimal arm: only the single-memory Phase-2 form
-/// is byte-identical here; the full multi-memory / `idx_type` spelling (§F) is P5-02's. A
-/// single 32-bit memory prints exactly as Phase-4 (byte-identity, H7).
-fn memory_str(mems: List(ir.MemoryDecl)) -> String {
-  case mems {
-    [] -> "none"
-    [MemoryDecl(min, None, _), ..] -> "(min " <> int.to_string(min) <> ")"
-    [MemoryDecl(min, Some(max), _), ..] ->
-      "(min " <> int.to_string(min) <> " max " <> int.to_string(max) <> ")"
-  }
+/// Renders one linear-memory declaration as a `  memory …` line (H3, §A.2.1).
+///
+/// The address-width token is **omitted for `Idx32`** (the default — a single 32-bit memory
+/// prints byte-identically to Phase-4) and spelled `i64 ` before the sizing for `Idx64`
+/// (memory64). The sizing reuses the Phase-2 `(min N)` / `(min N max M)` shape. A module with
+/// two memories prints two lines; the empty list is handled by `print_module` (which emits the
+/// legacy `memory none` sentinel). Total.
+fn print_memory_decl(m: ir.MemoryDecl) -> String {
+  "  memory "
+  <> print_idxtype(m.idx_type)
+  <> "(min "
+  <> int.to_string(m.min_pages)
+  <> max_clause(m.max_pages)
+  <> ")\n"
 }
 
 /// Renders one global slot: `  global @name : ty [mut] = <init-expr>`. The init is
@@ -146,9 +156,17 @@ fn print_global(g: ir.GlobalDecl) -> String {
   <> "\n"
 }
 
-/// Renders one import (H4). `ImportFn` is the Phase-1 host-function form
-/// `  import "cap" "name" : <functype>` (byte-identical); the state variants get a minimal
-/// keystone spelling (full round-trip → P5-02).
+/// Renders one import (H4, §A.2.3).
+///
+/// Every import is `  import "<module>" "<name>" <kind-clause>`. `ImportFn` keeps its exact
+/// Phase-1 host-function form (the kind clause is `: <functype>`), so a function-only module
+/// is byte-identical. The three state variants replace the kind clause with a `global`/
+/// `table`/`memory` keyword and the state's shape:
+/// - `global <valtype> [mut]` (an imported global);
+/// - `table <reftype> min N [max M]` (an imported reference table);
+/// - `memory [i64 ]( min N [max M] )` (an imported memory; `i64 ` marks a memory64/`Idx64`
+///   memory, omitted for the default `Idx32`).
+/// Total — every `ImportDecl` variant has a spelling.
 fn print_import(i: ir.ImportDecl) -> String {
   case i {
     ir.ImportFn(capability, name, ty) ->
@@ -160,11 +178,11 @@ fn print_import(i: ir.ImportDecl) -> String {
       <> print_functype(ty)
       <> "\n"
     ir.ImportGlobal(module, name, ty, mutable) ->
-      "  import global \""
+      "  import \""
       <> escape(module)
       <> "\" \""
       <> escape(name)
-      <> "\" : "
+      <> "\" global "
       <> print_valtype(ty)
       <> case mutable {
         True -> " mut"
@@ -172,69 +190,83 @@ fn print_import(i: ir.ImportDecl) -> String {
       }
       <> "\n"
     ir.ImportTable(module, name, ref_ty, min, max) ->
-      "  import table \""
+      "  import \""
       <> escape(module)
       <> "\" \""
       <> escape(name)
-      <> "\" "
+      <> "\" table "
       <> print_reftype(ref_ty)
       <> " min "
       <> int.to_string(min)
       <> max_clause(max)
       <> "\n"
-    ir.ImportMemory(module, name, min, max, _idx) ->
-      "  import memory \""
+    ir.ImportMemory(module, name, min, max, idx) ->
+      "  import \""
       <> escape(module)
       <> "\" \""
       <> escape(name)
-      <> "\" min "
+      <> "\" memory "
+      <> print_idxtype(idx)
+      <> "(min "
       <> int.to_string(min)
       <> max_clause(max)
-      <> "\n"
+      <> ")\n"
   }
 }
 
-/// Renders one export (H4). `ExportFn` is the Phase-1 form `  export "name" = @fn` (byte-
-/// identical); the state variants get a minimal keystone spelling (full round-trip → P5-02).
+/// Renders a memory address-width prefix for the parenthesised sizing form: `""` for the
+/// default `Idx32`, `"i64 "` for a memory64 (`Idx64`) memory (§A.2.1). Shared by the
+/// `import … memory` spelling; the module-level `memory` line inlines the same rule.
+fn print_idxtype(t: ir.IdxType) -> String {
+  case t {
+    ir.Idx32 -> ""
+    ir.Idx64 -> "i64 "
+  }
+}
+
+/// Renders one export (H4, §A.2.4).
+///
+/// Every export is `  export "<name>" = <target>`. `ExportFn` keeps its exact Phase-1 form
+/// (`= @<fn>`), so a function-only module is byte-identical. The state variants prefix the
+/// target with a `global`/`table`/`memory` keyword: `= global @<global>`, `= table @<table>`,
+/// and `= memory <index>` (a memory is named by its **index** in `Module.memories`, not a
+/// name). Total — every `ExportDecl` variant has a spelling.
 fn print_export(e: ir.ExportDecl) -> String {
   case e {
     ir.ExportFn(export_name, fn_name) ->
       "  export \"" <> escape(export_name) <> "\" = @" <> fn_name <> "\n"
     ir.ExportGlobal(export_name, global_name) ->
-      "  export global \""
+      "  export \""
       <> escape(export_name)
-      <> "\" = @"
+      <> "\" = global @"
       <> global_name
       <> "\n"
     ir.ExportTable(export_name, table_name) ->
-      "  export table \""
+      "  export \""
       <> escape(export_name)
-      <> "\" = @"
+      <> "\" = table @"
       <> table_name
       <> "\n"
     ir.ExportMemory(export_name, mem_index) ->
-      "  export memory \""
+      "  export \""
       <> escape(export_name)
-      <> "\" = "
+      <> "\" = memory "
       <> int.to_string(mem_index)
       <> "\n"
   }
 }
 
-/// Renders one data segment (H2). An active segment at memory 0 prints the Phase-2 form
-/// `  data ( <offset> ) = 0x<hex>` (byte-identical); active-at-mem>0 and passive get minimal
-/// keystone spellings (full round-trip → P5-02).
+/// Renders one data segment (H2, §A.2.5).
+///
+/// An **active** segment prints `  data [mem=<i>] ( <offset-expr> ) = 0x<hex>` — the memory
+/// index decorator is **omitted when 0** (so a single-memory active data segment is
+/// byte-identical to Phase-2). A **passive** segment drops the offset entirely:
+/// `  data passive = 0x<hex>`. Total.
 fn print_data(d: ir.DataSegment) -> String {
   case d.mode {
-    ir.DataActive(0, offset) ->
-      "  data ("
-      <> print_expr(2, offset)
-      <> ") = "
-      <> print_hexbytes(d.bytes)
-      <> "\n"
     ir.DataActive(mem, offset) ->
-      "  data mem "
-      <> int.to_string(mem)
+      "  data"
+      <> print_kv("mem", mem)
       <> " ("
       <> print_expr(2, offset)
       <> ") = "
@@ -260,14 +292,39 @@ fn max_clause(max: option.Option(Int)) -> String {
   }
 }
 
-/// Renders one funcref table declaration (Phase-2): `  table @name min N [max M]`.
+/// Renders an omit-when-zero ` <key>=<n>` decorator (§A.6). Returns `""` when `n == 0` (the
+/// default, so the token disappears and the surrounding line is byte-identical to Phase-4),
+/// else ` key=<n>`. Used for the memory-index decorators (`mem`/`dst_mem`/`src_mem`) on the
+/// memory ops and active data segments.
+fn print_kv(key: String, n: Int) -> String {
+  case n {
+    0 -> ""
+    v -> " " <> key <> "=" <> int.to_string(v)
+  }
+}
+
+/// Renders the memory-index decorator ` mem=<n>` (omitted when `n == 0`) — `print_kv` fixed to
+/// the `mem` key. The omit-when-zero rule keeps single-memory `.ir` byte-identical (§A.6).
+fn print_memidx(mem: Int) -> String {
+  print_kv("mem", mem)
+}
+
+/// Renders a **mandatory** ` seg=<n>` decorator (the passive-segment index into
+/// `Module.elements` / `Module.data_segments`). Unlike `print_memidx` this is always spelled
+/// (a segment index is not defaulted). Used by `table.init`/`mem.init`/`elem.drop`/`data.drop`.
+fn print_seg(seg: Int) -> String {
+  " seg=" <> int.to_string(seg)
+}
+
+/// Renders one reference table declaration (H1, §A.2.2): `  table @name [<reftype>] min N
+/// [max M]`.
 ///
-/// Mirrors `memory`'s sizing but is NAMED (`@name`) because `call_indirect`/`elem`
-/// reference it. `min`/`max` are entry counts in canonical decimal; the ` max M` clause is
-/// omitted for an unbounded table (`max: None`). Total — every `TableDecl` has this form.
+/// Mirrors `memory`'s sizing but is NAMED (`@name`) because `call_indirect`/`elem`/the table
+/// ops reference it. The reference type is **elided for `FuncRef`** (so a Phase-2 funcref
+/// table is byte-identical, `  table @name min N …`) and spelled ` externref` for an
+/// `externref` table — the two are then unambiguous. `min`/`max` are entry counts in canonical
+/// decimal; the ` max M` clause is omitted for an unbounded table (`max: None`). Total.
 fn print_table(t: ir.TableDecl) -> String {
-  // A `funcref` table elides the reftype → the Phase-2 form (byte-identical, H7); an
-  // `externref` table names it. Full grammar (§F) reconciled by P5-02.
   let ref_ty = case t.ref_ty {
     ir.FuncRef -> ""
     ir.ExternRef -> " externref"
@@ -281,16 +338,18 @@ fn print_table(t: ir.TableDecl) -> String {
   <> "\n"
 }
 
-/// Renders one active element segment (Phase-2):
-/// `  elem @table ( <offset-expr> ) [ @fn, … ]`.
+/// Renders one element segment (H2, §A.2.6).
 ///
-/// `offset` is a full constant expression (mirroring `data`'s offset form); the payload is
-/// a bracketed, comma-separated list of `@`-prefixed IR function names (`[]` for an empty
-/// segment), written into consecutive table entries from the offset. Total.
+/// Two spellings, both parsed by `parser.parse_elem`:
+/// - **Legacy (byte-identical)** — an ACTIVE `FuncRef` segment whose items are all `RefFunc`
+///   prints the Phase-2 form `  elem @table ( <offset> ) [ @fn, … ]` (the bare `@name`
+///   funcidx-list abbreviation), so `mem_table.ir` re-prints unchanged.
+/// - **Canonical** — everything else prints `  elem <reftype> <mode> [ <init-item>,* ]` where
+///   the reference type comes first, then the mode (`@table ( <offset> )` active / `passive` /
+///   `declare`), then the init items via `print_ref_init` (`ref.func @f` for a funcref item,
+///   the general expression form otherwise — e.g. `values (null.funcref)` for a null slot).
+/// Total — every `ElementSegment` has a spelling.
 fn print_elem(e: ir.ElementSegment) -> String {
-  // An active funcref segment whose items are all `RefFunc` prints the Phase-2 form
-  // `  elem @table ( <offset> ) [ @fn, … ]` (byte-identical, H7). Other modes / reftypes /
-  // non-funcref items get a minimal keystone spelling (full round-trip → P5-02).
   case e.mode, e.ref_ty, all_reffunc(e.init) {
     ir.ElemActive(table, offset), ir.FuncRef, Ok(funcs) ->
       "  elem @"
@@ -302,27 +361,40 @@ fn print_elem(e: ir.ElementSegment) -> String {
       <> "]\n"
     _, _, _ ->
       "  elem "
-      <> print_elem_mode(e.mode)
-      <> " "
       <> print_reftype(e.ref_ty)
+      <> " "
+      <> print_elem_mode(e.mode)
       <> " ["
-      <> string.join(list.map(e.init, fn(x) { print_expr(2, x) }), ", ")
+      <> string.join(list.map(e.init, print_ref_init), ", ")
       <> "]\n"
   }
 }
 
-/// Renders an element-segment mode for the non-Phase-2 keystone spelling.
+/// Renders an element-segment mode (§A.2.6): `@table ( <offset> )` (active) / `passive` /
+/// `declare`. The active form reuses the `data`-style parenthesised constant offset.
 fn print_elem_mode(mode: ir.ElemMode) -> String {
   case mode {
     ir.ElemActive(table, offset) ->
-      "active @" <> table <> " (" <> print_expr(2, offset) <> ")"
+      "@" <> table <> " (" <> print_expr(2, offset) <> ")"
     ir.ElemPassive -> "passive"
-    ir.ElemDeclarative -> "declarative"
+    ir.ElemDeclarative -> "declare"
   }
 }
 
-/// If every element item is a `RefFunc`, return `Ok(func-names)` (the Phase-2 case); otherwise
-/// `Error(Nil)` (a `ConstNull` / non-funcref item is present).
+/// Renders one element-init item (a ref-producing constant expression, §A.2.6). A `RefFunc`
+/// prints the clean `ref.func @name`; every other admissible const-init expression (a null
+/// slot `Values([ConstNull(ty)])`, a `global.get`, a numeric const) falls back to the general
+/// `print_expr` at module indent, so any init item round-trips. Total.
+fn print_ref_init(item: Expr) -> String {
+  case item {
+    ir.RefFunc(name) -> "ref.func @" <> name
+    _ -> print_expr(2, item)
+  }
+}
+
+/// If every element item is a `RefFunc`, return `Ok(func-names)` (the byte-identical Phase-2
+/// case for an active funcref segment); otherwise `Error(Nil)` (a null / non-funcref item is
+/// present, so the canonical `elem` spelling is used).
 fn all_reffunc(init: List(Expr)) -> Result(List(String), Nil) {
   list.try_map(init, fn(item) {
     case item {
@@ -441,12 +513,13 @@ fn print_expr(indent: Int, e: Expr) -> String {
       "convert " <> convop_to_string(op) <> " " <> print_value(arg)
     TermOp(op, args) ->
       "term " <> termop_to_string(op) <> " " <> value_list(args)
-    // The four memory nodes: the `mem 0` index is ELIDED (§F) so a single-memory module's
-    // `.ir` text is byte-identical to Phase-4 (H7). The keystone prints the Phase-2 form
-    // regardless of index; P5-02 adds the explicit memory-index token for `mem != 0`.
-    MemSize(_mem) -> "mem.size"
-    MemGrow(_mem, delta) -> "mem.grow " <> print_value(delta)
-    MemLoad(_mem, op, addr, offset, result) ->
+    // The four existing memory nodes gain a trailing `mem=<n>` decorator, OMITTED when the
+    // index is 0 (§A.6) — so a single-memory (index-0) module's `.ir` is byte-identical to
+    // Phase-4 (H7); a non-zero index appends ` mem=<n>`.
+    MemSize(mem) -> "mem.size" <> print_memidx(mem)
+    MemGrow(mem, delta) ->
+      "mem.grow " <> print_value(delta) <> print_memidx(mem)
+    MemLoad(mem, op, addr, offset, result) ->
       "mem.load "
       <> print_valtype(result)
       <> " "
@@ -455,7 +528,8 @@ fn print_expr(indent: Int, e: Expr) -> String {
       <> print_value(addr)
       <> " offset="
       <> int.to_string(offset)
-    MemStore(_mem, op, addr, value, offset) ->
+      <> print_memidx(mem)
+    MemStore(mem, op, addr, value, offset) ->
       "mem.store "
       <> print_memaccess(op)
       <> " "
@@ -464,9 +538,11 @@ fn print_expr(indent: Int, e: Expr) -> String {
       <> print_value(value)
       <> " offset="
       <> int.to_string(offset)
-    // ── Phase-5 reference / table / bulk nodes (H2). Minimal keystone spellings following the
-    // §F grammar sketch; full round-trip is P5-02's. No Phase-1..4 module contains these, so
-    // conformance is unaffected. ──
+      <> print_memidx(mem)
+    // ── Phase-5 reference / table / bulk nodes (H2, §A.3–§A.5). No Phase-1..4 module
+    // contains these, so any spelling is conformance-neutral by construction. Value operands
+    // are printed positionally; `seg=<n>` is always spelled; `mem=`/`dst_mem=`/`src_mem=`
+    // decorators are omitted when 0 (§A.6). ──
     ir.RefFunc(fn_name) -> "ref.func @" <> fn_name
     ir.RefIsNull(arg) -> "ref.is_null " <> print_value(arg)
     ir.TableGet(table, index) ->
@@ -499,13 +575,12 @@ fn print_expr(indent: Int, e: Expr) -> String {
       "table.init @"
       <> table
       <> " "
-      <> int.to_string(seg)
-      <> " "
       <> print_value(dst)
       <> " "
       <> print_value(src)
       <> " "
       <> print_value(count)
+      <> print_seg(seg)
     ir.TableCopy(dst_table, src_table, dst, src, count) ->
       "table.copy @"
       <> dst_table
@@ -517,39 +592,34 @@ fn print_expr(indent: Int, e: Expr) -> String {
       <> print_value(src)
       <> " "
       <> print_value(count)
-    ir.ElemDrop(seg) -> "elem.drop " <> int.to_string(seg)
+    ir.ElemDrop(seg) -> "elem.drop" <> print_seg(seg)
     ir.MemFill(mem, dest, value, count) ->
       "mem.fill "
-      <> int.to_string(mem)
-      <> " "
       <> print_value(dest)
       <> " "
       <> print_value(value)
       <> " "
       <> print_value(count)
+      <> print_memidx(mem)
     ir.MemCopy(dst_mem, src_mem, dst, src, count) ->
       "mem.copy "
-      <> int.to_string(dst_mem)
-      <> " "
-      <> int.to_string(src_mem)
-      <> " "
       <> print_value(dst)
       <> " "
       <> print_value(src)
       <> " "
       <> print_value(count)
+      <> print_kv("dst_mem", dst_mem)
+      <> print_kv("src_mem", src_mem)
     ir.MemInit(mem, seg, dst, src, count) ->
       "mem.init "
-      <> int.to_string(mem)
-      <> " "
-      <> int.to_string(seg)
-      <> " "
       <> print_value(dst)
       <> " "
       <> print_value(src)
       <> " "
       <> print_value(count)
-    ir.DataDrop(seg) -> "data.drop " <> int.to_string(seg)
+      <> print_seg(seg)
+      <> print_memidx(mem)
+    ir.DataDrop(seg) -> "data.drop" <> print_seg(seg)
     GlobalGet(name) -> "global.get @" <> name
     GlobalSet(name, value) ->
       "global.set @" <> name <> " " <> print_value(value)

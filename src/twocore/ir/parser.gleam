@@ -559,7 +559,7 @@ fn build_module(name: String, acc: ModuleAcc) -> Module {
   Module(
     name: name,
     uses_numerics: acc.numerics,
-    memories: acc.memories,
+    memories: list.reverse(acc.memories),
     globals: list.reverse(acc.globals),
     imports: list.reverse(acc.imports),
     functions: list.reverse(acc.functions),
@@ -591,8 +591,15 @@ fn parse_module_items(
           parse_module_items(r, ModuleAcc(..acc, numerics: b))
         }
         "memory" -> {
-          use #(m, r) <- result.try(parse_memory(rest))
-          parse_module_items(r, ModuleAcc(..acc, memories: m))
+          use #(mopt, r) <- result.try(parse_memory(rest))
+          // Each `memory` line contributes at most one decl, PREPENDED (list order =
+          // memory index, flipped in `build_module`). The legacy `memory none` sentinel
+          // contributes nothing.
+          let memories = case mopt {
+            Some(m) -> [m, ..acc.memories]
+            None -> acc.memories
+          }
+          parse_module_items(r, ModuleAcc(..acc, memories: memories))
         }
         "global" -> {
           use #(g, r) <- result.try(parse_global(rest))
@@ -651,33 +658,58 @@ fn parse_bool(toks: List(PToken)) -> Result(#(Bool, List(PToken)), ParseError) {
   }
 }
 
-/// Parses a `memory` declaration: `none`, `(min N)`, or `(min N max M)`. Returns the memories
-/// vector (`[]` for `none`, a one-element list otherwise). KEYSTONE minimal arm: only the
-/// single 32-bit (`Idx32`) memory Phase-2 form is parsed here (byte-identical); the full
-/// multi-memory / `idx_type` grammar (§F) is P5-02's.
+/// Parses one `memory` declaration (H3, §A.2.1). Returns `#(None, rest)` for the legacy
+/// `memory none` sentinel (contributes no memory) and `#(Some(decl), rest)` for a sized
+/// memory `[ i32 | i64 ] ( min N [max M] )`.
+///
+/// The optional leading address-width token selects the `IdxType`: `i64` marks a memory64
+/// (`Idx64`) memory, `i32` is the explicit form of the default, and an omitted token is the
+/// canonical `Idx32`. Errors (typed `ParseError`, never a panic) on a missing/malformed
+/// `(min …)`. All faults flow from the total helpers.
 fn parse_memory(
   toks: List(PToken),
-) -> Result(#(List(MemoryDecl), List(PToken)), ParseError) {
+) -> Result(#(Option(MemoryDecl), List(PToken)), ParseError) {
   case toks {
-    [PToken(TWord("none"), _, _), ..rest] -> Ok(#([], rest))
-    [PToken(TLParen, _, _), ..rest] -> {
-      use rest <- result.try(expect_word(rest, "min"))
-      use #(minp, rest) <- result.try(expect_number(rest))
-      case rest {
-        [PToken(TWord("max"), _, _), ..rest2] -> {
-          use #(maxp, rest3) <- result.try(expect_number(rest2))
-          use rest4 <- result.try(expect(rest3, TRParen, ")"))
-          Ok(#([MemoryDecl(minp, Some(maxp), ir.Idx32)], rest4))
-        }
-        _ -> {
-          use rest2 <- result.try(expect(rest, TRParen, ")"))
-          Ok(#([MemoryDecl(minp, None, ir.Idx32)], rest2))
-        }
-      }
+    [PToken(TWord("none"), _, _), ..rest] -> Ok(#(None, rest))
+    _ -> {
+      let #(idx, rest) = parse_opt_idxtype(toks)
+      use #(decl, rest) <- result.try(parse_memory_sizing(rest, idx))
+      Ok(#(Some(decl), rest))
     }
-    [PToken(t, l, c), ..] ->
-      Error(UnexpectedToken(l, c, "none or (", describe(t)))
-    [] -> Error(UnexpectedEnd("none or ("))
+  }
+}
+
+/// Peeks an optional address-width token before a memory's parenthesised sizing: `i64` →
+/// `Idx64`, `i32` → `Idx32` (explicit), anything else consumes nothing and defaults to
+/// `Idx32`. Total — returns `#(idx_type, toks)` with `toks` advanced only if a token matched.
+fn parse_opt_idxtype(toks: List(PToken)) -> #(ir.IdxType, List(PToken)) {
+  case toks {
+    [PToken(TWord("i64"), _, _), ..rest] -> #(ir.Idx64, rest)
+    [PToken(TWord("i32"), _, _), ..rest] -> #(ir.Idx32, rest)
+    _ -> #(ir.Idx32, toks)
+  }
+}
+
+/// Parses a memory's parenthesised sizing `( min N [max M] )` at address-width `idx`, shared
+/// by the module-level `memory` line and the `import … memory` clause. Returns the assembled
+/// `MemoryDecl`, or a typed `ParseError` on a missing `(`/`min`/`)` or a malformed count.
+fn parse_memory_sizing(
+  toks: List(PToken),
+  idx: ir.IdxType,
+) -> Result(#(MemoryDecl, List(PToken)), ParseError) {
+  use rest <- result.try(expect(toks, TLParen, "("))
+  use rest <- result.try(expect_word(rest, "min"))
+  use #(minp, rest) <- result.try(expect_number(rest))
+  case rest {
+    [PToken(TWord("max"), _, _), ..rest2] -> {
+      use #(maxp, rest3) <- result.try(expect_number(rest2))
+      use rest4 <- result.try(expect(rest3, TRParen, ")"))
+      Ok(#(MemoryDecl(minp, Some(maxp), idx), rest4))
+    }
+    _ -> {
+      use rest2 <- result.try(expect(rest, TRParen, ")"))
+      Ok(#(MemoryDecl(minp, None, idx), rest2))
+    }
   }
 }
 
@@ -697,123 +729,288 @@ fn parse_global(
   Ok(#(GlobalDecl(name, ty, mutable, init), rest))
 }
 
-/// Parses `import "cap" "name" : <functype>`.
+/// Parses one import (H4, §A.2.3): `import "<a>" "<b>" <kind-clause>`.
+///
+/// The two leading strings are the `(module, name)` link key (for `ImportFn` the first is the
+/// capability). The kind clause after them disambiguates the four variants:
+/// - `: <functype>` → `ImportFn` (byte-identical to Phase-1);
+/// - `global <valtype> [mut]` → `ImportGlobal`;
+/// - `table <reftype> min N [max M]` → `ImportTable`;
+/// - `memory [i64|i32] ( min N [max M] )` → `ImportMemory`.
+/// Returns a typed `ParseError` (never a panic) on a missing string / unknown kind keyword /
+/// malformed clause; the kind dispatch itself is total.
 fn parse_import(
   toks: List(PToken),
 ) -> Result(#(ImportDecl, List(PToken)), ParseError) {
-  use #(cap, rest) <- result.try(parse_string(toks))
-  use #(name, rest) <- result.try(parse_string(rest))
-  use rest <- result.try(expect(rest, TColon, ":"))
-  use #(ty, rest) <- result.try(parse_functype(rest))
-  Ok(#(ImportFn(cap, name, ty), rest))
+  use #(a, rest) <- result.try(parse_string(toks))
+  use #(b, rest) <- result.try(parse_string(rest))
+  case rest {
+    [PToken(TColon, _, _), ..r] -> {
+      use #(ty, r) <- result.try(parse_functype(r))
+      Ok(#(ImportFn(a, b, ty), r))
+    }
+    [PToken(TWord("global"), _, _), ..r] -> {
+      use #(ty, r) <- result.try(parse_valtype(r))
+      let #(mutable, r) = case r {
+        [PToken(TWord("mut"), _, _), ..r2] -> #(True, r2)
+        _ -> #(False, r)
+      }
+      Ok(#(ir.ImportGlobal(a, b, ty, mutable), r))
+    }
+    [PToken(TWord("table"), _, _), ..r] -> {
+      use #(ref_ty, r) <- result.try(parse_reftype(r))
+      use r <- result.try(expect_word(r, "min"))
+      use #(min, r) <- result.try(expect_number(r))
+      let #(max, r) = parse_opt_max(r)
+      Ok(#(ir.ImportTable(a, b, ref_ty, min, max), r))
+    }
+    [PToken(TWord("memory"), _, _), ..r] -> {
+      let #(idx, r) = parse_opt_idxtype(r)
+      use #(decl, r) <- result.try(parse_memory_sizing(r, idx))
+      Ok(#(
+        ir.ImportMemory(a, b, decl.min_pages, decl.max_pages, decl.idx_type),
+        r,
+      ))
+    }
+    [PToken(t, l, c), ..] ->
+      Error(UnexpectedToken(
+        l,
+        c,
+        "import kind (: / global / table / memory)",
+        describe(t),
+      ))
+    [] -> Error(UnexpectedEnd("import kind"))
+  }
 }
 
-/// Parses `export "export-name" = @fn-name`.
+/// Peeks an optional ` max M` clause. Returns `#(Some(M), rest)` when the next tokens are
+/// `max <number>`, else `#(None, toks)` (unconsumed). Total — used by `table`/`import table`
+/// sizings where the `min` was already read.
+fn parse_opt_max(toks: List(PToken)) -> #(Option(Int), List(PToken)) {
+  case toks {
+    [PToken(TWord("max"), _, _), PToken(TNumber(m, _), _, _), ..rest] -> #(
+      Some(m),
+      rest,
+    )
+    _ -> #(None, toks)
+  }
+}
+
+/// Parses one export (H4, §A.2.4): `export "<name>" = <target>`.
+///
+/// After `=`, the target disambiguates the four variants: a bare `@fn` → `ExportFn`
+/// (byte-identical to Phase-1); `global @<g>` → `ExportGlobal`; `table @<t>` → `ExportTable`;
+/// `memory <index>` → `ExportMemory` (a memory is named by its integer index in
+/// `Module.memories`). Returns a typed `ParseError` (never a panic) on a missing name/`=` or
+/// an unknown target form.
 fn parse_export(
   toks: List(PToken),
 ) -> Result(#(ExportDecl, List(PToken)), ParseError) {
   use #(ename, rest) <- result.try(parse_string(toks))
   use rest <- result.try(expect(rest, TEquals, "="))
-  use #(fname, rest) <- result.try(parse_at_name(rest))
-  Ok(#(ExportFn(ename, fname), rest))
+  case rest {
+    [PToken(TAt(fname), _, _), ..r] -> Ok(#(ExportFn(ename, fname), r))
+    [PToken(TWord("global"), _, _), ..r] -> {
+      use #(g, r) <- result.try(parse_at_name(r))
+      Ok(#(ir.ExportGlobal(ename, g), r))
+    }
+    [PToken(TWord("table"), _, _), ..r] -> {
+      use #(t, r) <- result.try(parse_at_name(r))
+      Ok(#(ir.ExportTable(ename, t), r))
+    }
+    [PToken(TWord("memory"), _, _), ..r] -> {
+      use #(i, r) <- result.try(expect_number(r))
+      Ok(#(ir.ExportMemory(ename, i), r))
+    }
+    [PToken(t, l, c), ..] ->
+      Error(UnexpectedToken(
+        l,
+        c,
+        "export target (@fn / global / table / memory)",
+        describe(t),
+      ))
+    [] -> Error(UnexpectedEnd("export target"))
+  }
 }
 
-/// Parses `data ( <offset-expr> ) = 0x<hexbytes>`.
+/// Parses one data segment (H2, §A.2.5).
+///
+/// - `data passive = 0x<hex>` → `DataSegment(DataPassive, bytes)`;
+/// - `data [mem=<i>] ( <offset-expr> ) = 0x<hex>` → `DataSegment(DataActive(i, offset), bytes)`
+///   where the `mem=<i>` decorator defaults to `0` when omitted (byte-identical to Phase-2).
+/// Returns a typed `ParseError` (never a panic) on a missing offset/`=`/hex payload.
 fn parse_data(
   toks: List(PToken),
 ) -> Result(#(DataSegment, List(PToken)), ParseError) {
-  use rest <- result.try(expect(toks, TLParen, "("))
-  use #(offset, rest) <- result.try(parse_expr(rest))
-  use rest <- result.try(expect(rest, TRParen, ")"))
-  use rest <- result.try(expect(rest, TEquals, "="))
-  use #(bytes, rest) <- result.try(parse_hexbytes(rest))
-  // KEYSTONE minimal arm: parses only the Phase-2 active-at-memory-0 form (byte-identical);
-  // passive / active-at-mem>0 data grammar (§F) is P5-02's.
-  Ok(#(DataSegment(ir.DataActive(0, offset), bytes), rest))
+  case toks {
+    [PToken(TWord("passive"), _, _), ..rest] -> {
+      use rest <- result.try(expect(rest, TEquals, "="))
+      use #(bytes, rest) <- result.try(parse_hexbytes(rest))
+      Ok(#(DataSegment(ir.DataPassive, bytes), rest))
+    }
+    _ -> {
+      let #(mem, rest) = parse_opt_kv(toks, "mem")
+      use rest <- result.try(expect(rest, TLParen, "("))
+      use #(offset, rest) <- result.try(parse_expr(rest))
+      use rest <- result.try(expect(rest, TRParen, ")"))
+      use rest <- result.try(expect(rest, TEquals, "="))
+      use #(bytes, rest) <- result.try(parse_hexbytes(rest))
+      Ok(#(DataSegment(ir.DataActive(mem, offset), bytes), rest))
+    }
+  }
 }
 
-/// Parses a funcref table declaration `table @name min <int> [max <int>]` (`«IR2-FROZEN»`;
-/// see `specs/phase-2/ir2-grammar-delta.md`).
+/// Parses one reference table declaration (H1, §A.2.2):
+/// `table @name [<reftype>] min <int> [max <int>]`.
 ///
-/// The leading `table` keyword has already been consumed. Returns `Ok(#(TableDecl, rest))`
-/// where `max` is `Some(M)` when the optional `max <int>` clause is present and `None`
-/// otherwise. Errors (typed `ParseError`, never a panic) when the `@name`, the `min`
-/// keyword, or either entry count is missing/malformed — all faults flow from the total
-/// helpers (`parse_at_name`, `expect_word`, `expect_number`).
+/// The leading `table` keyword has already been consumed. The reference type after `@name` is
+/// **optional** — an omitted reftype defaults to `FuncRef` (so the Phase-2 legacy form
+/// `table @t0 min 2 max 8` still parses), while `funcref`/`externref` set it explicitly.
+/// Returns `Ok(#(TableDecl, rest))` (`max` is `Some(M)` iff the `max <int>` clause is present),
+/// or a typed `ParseError` (never a panic) on a missing `@name`/`min`/count.
 fn parse_table(
   toks: List(PToken),
 ) -> Result(#(TableDecl, List(PToken)), ParseError) {
   use #(name, rest) <- result.try(parse_at_name(toks))
+  let #(ref_ty, rest) = parse_opt_reftype(rest, ir.FuncRef)
   use rest <- result.try(expect_word(rest, "min"))
   use #(min, rest) <- result.try(expect_number(rest))
-  // KEYSTONE minimal arm: parses the Phase-2 funcref table (byte-identical); the reftype-tag
-  // grammar (`externref` tables, §F) is P5-02's.
-  case rest {
-    [PToken(TWord("max"), _, _), ..rest2] -> {
-      use #(max, rest3) <- result.try(expect_number(rest2))
-      Ok(#(TableDecl(name, ir.FuncRef, min, Some(max)), rest3))
-    }
-    _ -> Ok(#(TableDecl(name, ir.FuncRef, min, None), rest))
+  let #(max, rest) = parse_opt_max(rest)
+  Ok(#(TableDecl(name, ref_ty, min, max), rest))
+}
+
+/// Parses a reference type token (H1, §A.1): `funcref` → `FuncRef`, `externref` → `ExternRef`.
+///
+/// A dedicated, total helper accepting **only** the two reference types; any other token
+/// (`i32`/`term`/…) is rejected with `UnexpectedToken(expected: "reftype")`. Used by
+/// `table`/`elem`/`import table` and the reftype clauses; never panics.
+fn parse_reftype(
+  toks: List(PToken),
+) -> Result(#(ir.RefType, List(PToken)), ParseError) {
+  case toks {
+    [PToken(TWord("funcref"), _, _), ..rest] -> Ok(#(ir.FuncRef, rest))
+    [PToken(TWord("externref"), _, _), ..rest] -> Ok(#(ir.ExternRef, rest))
+    [PToken(t, l, c), ..] ->
+      Error(UnexpectedToken(l, c, "reftype", describe(t)))
+    [] -> Error(UnexpectedEnd("reftype"))
   }
 }
 
-/// Parses an active element segment `elem @table ( <offset-expr> ) [ @fn, … ]`
-/// (`«IR2-FROZEN»`; see `specs/phase-2/ir2-grammar-delta.md`).
+/// Peeks an OPTIONAL reference type token, defaulting to `default` when the next token is not a
+/// reftype. Total — advances `toks` only if a `funcref`/`externref` token matched. Used where
+/// the reftype is elided in the legacy spelling (`table`).
+fn parse_opt_reftype(
+  toks: List(PToken),
+  default: ir.RefType,
+) -> #(ir.RefType, List(PToken)) {
+  case toks {
+    [PToken(TWord("funcref"), _, _), ..rest] -> #(ir.FuncRef, rest)
+    [PToken(TWord("externref"), _, _), ..rest] -> #(ir.ExternRef, rest)
+    _ -> #(default, toks)
+  }
+}
+
+/// Parses one element segment (H2, §A.2.6). Two spellings, both producing an
+/// `ElementSegment(mode, ref_ty, init)`:
 ///
-/// The leading `elem` keyword has already been consumed. The offset is a full expression
-/// (the parser checks SYNTAX only — it does not require a constant; semantic validation is a
-/// later stage). The payload is a bracketed, comma-separated list of `@`-prefixed function
-/// names (`[]` for an empty segment). Returns `Ok(#(ElementSegment, rest))`, or a typed
-/// `ParseError` (never a panic) on a missing `@table`, the `(`/`)` around the offset, or the
-/// `[`/`]`/`,` of the function list.
+/// - **Legacy** — `elem @table ( <offset> ) [ <init>,* ]` starts with `@table`; the reftype
+///   defaults to `FuncRef` and the mode is `ElemActive`. Keeps `mem_table.ir` parsing.
+/// - **Canonical** — `elem <reftype> <mode> [ <init>,* ]` starts with a reftype keyword, then
+///   the mode (`@table ( <offset> )` active / `passive` / `declare`).
+///
+/// The leading `elem` keyword has already been consumed; dispatch is on the token after it (a
+/// reftype keyword ⇒ canonical, `@table` ⇒ legacy). The bracketed `init` list is read by
+/// `parse_ref_init_list` (each item an `@name` funcidx abbreviation or a full ref-producing
+/// expression). Returns a typed `ParseError` (never a panic) on any malformed piece.
 fn parse_elem(
   toks: List(PToken),
 ) -> Result(#(ElementSegment, List(PToken)), ParseError) {
-  use #(table, rest) <- result.try(parse_at_name(toks))
-  use rest <- result.try(expect(rest, TLParen, "("))
-  use #(offset, rest) <- result.try(parse_expr(rest))
-  use rest <- result.try(expect(rest, TRParen, ")"))
-  use #(funcs, rest) <- result.try(parse_at_name_bracket_list(rest))
-  // KEYSTONE minimal arm: parses the Phase-2 active funcref segment (byte-identical) — each
-  // `@fn` becomes a `RefFunc` init item. Passive/declarative + externref/null items (§F) are
-  // P5-02's.
-  Ok(#(
-    ElementSegment(
-      ir.ElemActive(table, offset),
-      ir.FuncRef,
-      list.map(funcs, ir.RefFunc),
-    ),
-    rest,
-  ))
-}
-
-/// Parses a bracketed, comma-separated list of `@name` references: `[ @a, @b ]` or `[]`.
-///
-/// The bracket analogue of `parse_paren_list` specialised to `@`-names (the element-segment
-/// function list). Returns `Ok(#(names, rest))` with the bare names (sigil stripped), or a
-/// typed `ParseError` on a missing `[`, a wrong-sigil entry, or a missing `,`/`]`. Total.
-fn parse_at_name_bracket_list(
-  toks: List(PToken),
-) -> Result(#(List(String), List(PToken)), ParseError) {
-  use rest <- result.try(expect(toks, TLBracket, "["))
-  case rest {
-    [PToken(TRBracket, _, _), ..r] -> Ok(#([], r))
-    _ -> parse_at_name_bracket_rest(rest, [])
+  case toks {
+    [PToken(TWord("funcref"), _, _), ..]
+    | [PToken(TWord("externref"), _, _), ..] -> {
+      use #(ref_ty, rest) <- result.try(parse_reftype(toks))
+      use #(mode, rest) <- result.try(parse_elem_mode(rest))
+      use #(init, rest) <- result.try(parse_ref_init_list(rest))
+      Ok(#(ElementSegment(mode, ref_ty, init), rest))
+    }
+    _ -> {
+      // Legacy active-funcref form: `@table ( <offset> ) [ <init>,* ]`.
+      use #(table, rest) <- result.try(parse_at_name(toks))
+      use rest <- result.try(expect(rest, TLParen, "("))
+      use #(offset, rest) <- result.try(parse_expr(rest))
+      use rest <- result.try(expect(rest, TRParen, ")"))
+      use #(init, rest) <- result.try(parse_ref_init_list(rest))
+      Ok(#(ElementSegment(ir.ElemActive(table, offset), ir.FuncRef, init), rest))
+    }
   }
 }
 
-/// Tail of `parse_at_name_bracket_list`: reads one `@name`, then either a `,` (continue) or
-/// the closing `]`. Accumulates reversed and flips at the close.
-fn parse_at_name_bracket_rest(
+/// Parses an element-segment mode (§A.2.6): `@table ( <offset-expr> )` → `ElemActive`,
+/// `passive` → `ElemPassive`, `declare` → `ElemDeclarative`. Returns a typed `ParseError`
+/// (never a panic) on a missing `@table`/offset-parens or an unrecognised mode token.
+fn parse_elem_mode(
   toks: List(PToken),
-  acc: List(String),
-) -> Result(#(List(String), List(PToken)), ParseError) {
-  use #(name, rest) <- result.try(parse_at_name(toks))
+) -> Result(#(ir.ElemMode, List(PToken)), ParseError) {
+  case toks {
+    [PToken(TWord("passive"), _, _), ..rest] -> Ok(#(ir.ElemPassive, rest))
+    [PToken(TWord("declare"), _, _), ..rest] -> Ok(#(ir.ElemDeclarative, rest))
+    [PToken(TAt(table), _, _), ..rest] -> {
+      use rest <- result.try(expect(rest, TLParen, "("))
+      use #(offset, rest) <- result.try(parse_expr(rest))
+      use rest <- result.try(expect(rest, TRParen, ")"))
+      Ok(#(ir.ElemActive(table, offset), rest))
+    }
+    [PToken(t, l, c), ..] ->
+      Error(UnexpectedToken(
+        l,
+        c,
+        "elem mode (@table / passive / declare)",
+        describe(t),
+      ))
+    [] -> Error(UnexpectedEnd("elem mode"))
+  }
+}
+
+/// Parses a bracketed, comma-separated element-init list `[ <item>,* ]` / `[]` (§A.2.6).
+///
+/// Each item is either an `@name` funcidx abbreviation (WAT-style — desugars to
+/// `RefFunc(name)`) or a full ref-producing expression (`ref.func @f`, a null slot
+/// `values (null.<reftype>)`, `global.get @g`, …). Returns `Ok(#(items, rest))` or a typed
+/// `ParseError` (never a panic) on a missing `[`/`,`/`]`.
+fn parse_ref_init_list(
+  toks: List(PToken),
+) -> Result(#(List(Expr), List(PToken)), ParseError) {
+  use rest <- result.try(expect(toks, TLBracket, "["))
   case rest {
-    [PToken(TComma, _, _), ..r] -> parse_at_name_bracket_rest(r, [name, ..acc])
-    [PToken(TRBracket, _, _), ..r] -> Ok(#(list.reverse([name, ..acc]), r))
+    [PToken(TRBracket, _, _), ..r] -> Ok(#([], r))
+    _ -> parse_ref_init_rest(rest, [])
+  }
+}
+
+/// Tail of `parse_ref_init_list`: reads one init item, then either a `,` (continue) or the
+/// closing `]`. Accumulates reversed and flips at the close. Total.
+fn parse_ref_init_rest(
+  toks: List(PToken),
+  acc: List(Expr),
+) -> Result(#(List(Expr), List(PToken)), ParseError) {
+  use #(item, rest) <- result.try(parse_ref_init(toks))
+  case rest {
+    [PToken(TComma, _, _), ..r] -> parse_ref_init_rest(r, [item, ..acc])
+    [PToken(TRBracket, _, _), ..r] -> Ok(#(list.reverse([item, ..acc]), r))
     [PToken(t, l, c), ..] -> Error(UnexpectedToken(l, c, ", or ]", describe(t)))
     [] -> Error(UnexpectedEnd(", or ]"))
+  }
+}
+
+/// Parses one element-init item: a bare `@name` (the funcidx abbreviation → `RefFunc(name)`)
+/// or any full ref-producing expression via `parse_expr`. Total — a bad item surfaces as a
+/// typed `ParseError` from the delegate.
+fn parse_ref_init(
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  case toks {
+    [PToken(TAt(name), _, _), ..rest] -> Ok(#(ir.RefFunc(name), rest))
+    _ -> parse_expr(toks)
   }
 }
 
@@ -901,7 +1098,9 @@ fn parse_param(
 
 // ───────────────────────────── types & values ─────────────────────────────
 
-/// Parses a value type token (`i32`/`i64`/`f32`/`f64`/`term`).
+/// Parses a value type token (`i32`/`i64`/`f32`/`f64`/`term`/`funcref`/`externref`). The two
+/// reference types (H1) are legal in every valtype position (params/locals/globals/functype/
+/// `mem.load` result); a `funcref`/`externref` maps to `TFuncRef`/`TExternRef`.
 fn parse_valtype(
   toks: List(PToken),
 ) -> Result(#(ValType, List(PToken)), ParseError) {
@@ -913,6 +1112,8 @@ fn parse_valtype(
         "f32" -> Ok(#(TF32, rest))
         "f64" -> Ok(#(TF64, rest))
         "term" -> Ok(#(TTerm, rest))
+        "funcref" -> Ok(#(ir.TFuncRef, rest))
+        "externref" -> Ok(#(ir.TExternRef, rest))
         _ -> Error(UnexpectedToken(l, c, "valtype", w))
       }
     [PToken(t, l, c), ..] ->
@@ -999,15 +1200,103 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
         "num" -> parse_num(rest)
         "convert" -> parse_convert(rest)
         "term" -> parse_term(rest)
-        // The four memory nodes parse the Phase-2 (memory-index-0) form (byte-identical); the
-        // explicit memory-index token for `mem != 0` (§F) is P5-02's, hence the fixed `0`.
-        "mem.size" -> Ok(#(MemSize(0), rest))
+        // The four existing memory nodes accept a trailing `mem=<n>` decorator (§A.6),
+        // defaulting to index 0 when omitted (byte-identical to Phase-4).
+        "mem.size" -> {
+          let #(mem, rest) = parse_opt_kv(rest, "mem")
+          Ok(#(MemSize(mem), rest))
+        }
         "mem.grow" -> {
           use #(delta, rest) <- result.try(parse_value(rest))
-          Ok(#(MemGrow(0, delta), rest))
+          let #(mem, rest) = parse_opt_kv(rest, "mem")
+          Ok(#(MemGrow(mem, delta), rest))
         }
         "mem.load" -> parse_mem_load(rest)
         "mem.store" -> parse_mem_store(rest)
+        // ── Phase-5 reference / table / bulk expressions (H2, §A.3–§A.5). ──
+        "ref.func" -> {
+          use #(n, rest) <- result.try(parse_at_name(rest))
+          Ok(#(ir.RefFunc(n), rest))
+        }
+        "ref.is_null" -> {
+          use #(v, rest) <- result.try(parse_value(rest))
+          Ok(#(ir.RefIsNull(v), rest))
+        }
+        "table.get" -> {
+          use #(t, rest) <- result.try(parse_at_name(rest))
+          use #(i, rest) <- result.try(parse_value(rest))
+          Ok(#(ir.TableGet(t, i), rest))
+        }
+        "table.set" -> {
+          use #(t, rest) <- result.try(parse_at_name(rest))
+          use #(i, rest) <- result.try(parse_value(rest))
+          use #(v, rest) <- result.try(parse_value(rest))
+          Ok(#(ir.TableSet(t, i, v), rest))
+        }
+        "table.size" -> {
+          use #(t, rest) <- result.try(parse_at_name(rest))
+          Ok(#(ir.TableSize(t), rest))
+        }
+        "table.grow" -> {
+          use #(t, rest) <- result.try(parse_at_name(rest))
+          use #(d, rest) <- result.try(parse_value(rest))
+          use #(init, rest) <- result.try(parse_value(rest))
+          Ok(#(ir.TableGrow(t, d, init), rest))
+        }
+        "table.fill" -> {
+          use #(t, rest) <- result.try(parse_at_name(rest))
+          use #(off, rest) <- result.try(parse_value(rest))
+          use #(v, rest) <- result.try(parse_value(rest))
+          use #(cnt, rest) <- result.try(parse_value(rest))
+          Ok(#(ir.TableFill(t, off, v, cnt), rest))
+        }
+        "table.init" -> {
+          use #(t, rest) <- result.try(parse_at_name(rest))
+          use #(dst, rest) <- result.try(parse_value(rest))
+          use #(src, rest) <- result.try(parse_value(rest))
+          use #(cnt, rest) <- result.try(parse_value(rest))
+          use #(seg, rest) <- result.try(parse_seg(rest))
+          Ok(#(ir.TableInit(t, seg, dst, src, cnt), rest))
+        }
+        "table.copy" -> {
+          use #(dt, rest) <- result.try(parse_at_name(rest))
+          use #(st, rest) <- result.try(parse_at_name(rest))
+          use #(dst, rest) <- result.try(parse_value(rest))
+          use #(src, rest) <- result.try(parse_value(rest))
+          use #(cnt, rest) <- result.try(parse_value(rest))
+          Ok(#(ir.TableCopy(dt, st, dst, src, cnt), rest))
+        }
+        "elem.drop" -> {
+          use #(seg, rest) <- result.try(parse_seg(rest))
+          Ok(#(ir.ElemDrop(seg), rest))
+        }
+        "mem.fill" -> {
+          use #(dst, rest) <- result.try(parse_value(rest))
+          use #(v, rest) <- result.try(parse_value(rest))
+          use #(cnt, rest) <- result.try(parse_value(rest))
+          let #(mem, rest) = parse_opt_kv(rest, "mem")
+          Ok(#(ir.MemFill(mem, dst, v, cnt), rest))
+        }
+        "mem.copy" -> {
+          use #(dst, rest) <- result.try(parse_value(rest))
+          use #(src, rest) <- result.try(parse_value(rest))
+          use #(cnt, rest) <- result.try(parse_value(rest))
+          let #(dst_mem, rest) = parse_opt_kv(rest, "dst_mem")
+          let #(src_mem, rest) = parse_opt_kv(rest, "src_mem")
+          Ok(#(ir.MemCopy(dst_mem, src_mem, dst, src, cnt), rest))
+        }
+        "mem.init" -> {
+          use #(dst, rest) <- result.try(parse_value(rest))
+          use #(src, rest) <- result.try(parse_value(rest))
+          use #(cnt, rest) <- result.try(parse_value(rest))
+          use #(seg, rest) <- result.try(parse_seg(rest))
+          let #(mem, rest) = parse_opt_kv(rest, "mem")
+          Ok(#(ir.MemInit(mem, seg, dst, src, cnt), rest))
+        }
+        "data.drop" -> {
+          use #(seg, rest) <- result.try(parse_seg(rest))
+          Ok(#(ir.DataDrop(seg), rest))
+        }
         "global.get" -> {
           use #(name, rest) <- result.try(parse_at_name(rest))
           Ok(#(GlobalGet(name), rest))
@@ -1110,9 +1399,9 @@ fn parse_term(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
   }
 }
 
-/// Parses `mem.load <result-valtype> <memaccess> <addr> offset=<int>`. The leading result
-/// valtype disambiguates the loaded value's width/sign (e.g. `i32.load8_s` vs
-/// `i64.load8_s`) — see `«IR2-FROZEN»` and `specs/phase-2/ir2-grammar-delta.md`.
+/// Parses `mem.load <result-valtype> <memaccess> <addr> offset=<int> [mem=<int>]`. The leading
+/// result valtype disambiguates the loaded value's width/sign (e.g. `i32.load8_s` vs
+/// `i64.load8_s`); the trailing `mem=<int>` memory-index decorator (§A.6) defaults to 0.
 fn parse_mem_load(
   toks: List(PToken),
 ) -> Result(#(Expr, List(PToken)), ParseError) {
@@ -1122,10 +1411,12 @@ fn parse_mem_load(
   use rest <- result.try(expect_word(rest, "offset"))
   use rest <- result.try(expect(rest, TEquals, "="))
   use #(off, rest) <- result.try(expect_number(rest))
-  Ok(#(MemLoad(0, macc, addr, off, result), rest))
+  let #(mem, rest) = parse_opt_kv(rest, "mem")
+  Ok(#(MemLoad(mem, macc, addr, off, result), rest))
 }
 
-/// Parses `mem.store <memaccess> <addr> <value> offset=<int>`.
+/// Parses `mem.store <memaccess> <addr> <value> offset=<int> [mem=<int>]`. The trailing
+/// `mem=<int>` memory-index decorator (§A.6) defaults to 0 when omitted.
 fn parse_mem_store(
   toks: List(PToken),
 ) -> Result(#(Expr, List(PToken)), ParseError) {
@@ -1135,7 +1426,8 @@ fn parse_mem_store(
   use rest <- result.try(expect_word(rest, "offset"))
   use rest <- result.try(expect(rest, TEquals, "="))
   use #(off, rest) <- result.try(expect_number(rest))
-  Ok(#(MemStore(0, macc, addr, val, off), rest))
+  let #(mem, rest) = parse_opt_kv(rest, "mem")
+  Ok(#(MemStore(mem, macc, addr, val, off), rest))
 }
 
 /// Parses a memory-access descriptor: `<bytes>` optionally followed by `signed`.
@@ -1147,6 +1439,39 @@ fn parse_memaccess(
     [PToken(TWord("signed"), _, _), ..r] -> Ok(#(MemAccess(bytes, True), r))
     _ -> Ok(#(MemAccess(bytes, False), rest))
   }
+}
+
+/// Peek-parses an OPTIONAL `<key>=<int>` decorator (§A.6) — the memory-index family
+/// (`mem`/`dst_mem`/`src_mem`). Returns `#(value, rest)` when the next three tokens are exactly
+/// `<key> = <number>`, else the default `#(0, toks)` (nothing consumed).
+///
+/// TOTAL and UNAMBIGUOUS: it matches only when a `TWord(key)` is IMMEDIATELY followed by `=`
+/// (and a number). No IR expression keyword is a bare `mem`/`dst_mem`/`src_mem` word (they are
+/// all dotted — `mem.size`, `mem.fill`, … — or distinct), so a following statement in a
+/// `let`/`charge` continuation can never begin with `<key> =` and this peek cannot swallow it.
+fn parse_opt_kv(toks: List(PToken), key: String) -> #(Int, List(PToken)) {
+  case toks {
+    [
+      PToken(TWord(k), _, _),
+      PToken(TEquals, _, _),
+      PToken(TNumber(v, _), _, _),
+      ..rest
+    ]
+      if k == key
+    -> #(v, rest)
+    _ -> #(0, toks)
+  }
+}
+
+/// Parses a MANDATORY `seg=<int>` decorator (the passive-segment index into
+/// `Module.elements` / `Module.data_segments`). Unlike `parse_opt_kv` a missing/malformed
+/// `seg=` is an error (a segment index is never defaulted). Returns the index, or a typed
+/// `ParseError` (never a panic) on a missing `seg`/`=`/number. Used by
+/// `table.init`/`mem.init`/`elem.drop`/`data.drop`.
+fn parse_seg(toks: List(PToken)) -> Result(#(Int, List(PToken)), ParseError) {
+  use rest <- result.try(expect_word(toks, "seg"))
+  use rest <- result.try(expect(rest, TEquals, "="))
+  expect_number(rest)
 }
 
 /// Parses `call_indirect @table [<index>] : <functype> (args)`.

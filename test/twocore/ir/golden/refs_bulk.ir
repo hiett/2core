@@ -1,0 +1,58 @@
+; refs_bulk — a hand-authored Phase-5 golden. Exercises, in ONE module and by reading the
+; grammar delta (specs/phase-5/ir-grammar-delta.md), never printer-generated (D7): two memories
+; (a 32-bit one and a memory64), a funcref table and an externref table, a reference-typed
+; global with a ref.null initialiser, non-function imports (global mut/immut, table, memory
+; i32/i64, plus a host function) and non-function exports (global/table/memory-by-index), an
+; active + a memory-index-tagged active + a passive data segment, an active (legacy) + a
+; canonical-active + a passive + a declarative element segment with ref.func / ref.null init
+; items, and the reference / table / bulk-memory / multi-memory expression forms. Independent
+; oracle against printer/parser collusion.
+module @refs_bulk {
+  numerics true
+  memory (min 1 max 4)
+  memory i64 (min 2)
+  global @gref : funcref = values (null.funcref)
+  table @funcs funcref min 2 max 8
+  table @hosts externref min 1
+  import "spectest" "global_i32" global i32
+  import "env" "counter" global i64 mut
+  import "spectest" "table" table funcref min 10 max 20
+  import "spectest" "memory" memory (min 1 max 2)
+  import "env" "mem64" memory i64 (min 1)
+  import "env" "log" : (i32) -> ()
+  export "funcs" = table @funcs
+  export "mem2" = memory 1
+  export "g" = global @gref
+  export "worker" = @worker
+  data (values (i32.const 0)) = 0xdeadbeef
+  data mem=1 (values (i32.const 8)) = 0x0102
+  data passive = 0x0304
+  elem @funcs (values (i32.const 0)) [ @worker, @worker ]
+  elem funcref @funcs (values (i32.const 1)) [ ref.func @worker, values (null.funcref) ]
+  elem funcref passive [ ref.func @worker, values (null.funcref) ]
+  elem externref declare [ values (null.externref) ]
+  start @setup
+  func @worker ( %t:i32 ) -> (funcref) {
+    let (%r0) = ref.func @worker ;
+    let (%isn) = ref.is_null %r0 ;
+    let () = table.set @funcs %t %r0 ;
+    let (%g) = table.get @funcs %t ;
+    let (%sz) = table.size @funcs ;
+    let (%grew) = table.grow @hosts i32.const 1 null.externref ;
+    let () = table.fill @hosts i32.const 0 null.externref i32.const 1 ;
+    let () = table.init @funcs i32.const 0 i32.const 0 i32.const 2 seg=2 ;
+    let () = table.copy @funcs @funcs i32.const 0 i32.const 0 i32.const 1 ;
+    let () = elem.drop seg=2 ;
+    let () = mem.fill i32.const 0 i32.const 0 i32.const 4 ;
+    let () = mem.copy i32.const 0 i32.const 0 i32.const 4 dst_mem=1 ;
+    let () = mem.init i32.const 0 i32.const 0 i32.const 2 seg=2 ;
+    let () = data.drop seg=2 ;
+    let (%big) = mem.load i64 8 %t offset=0 mem=1 ;
+    let () = mem.store 4 %t i32.const 7 offset=0 mem=1 ;
+    let (%pages) = mem.size mem=1 ;
+    return (%g)
+  }
+  func @setup ( ) -> () {
+    return ()
+  }
+}
