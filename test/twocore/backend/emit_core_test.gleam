@@ -41,7 +41,7 @@ fn module_with(f: ir.Function) -> ir.Module {
   ir.Module(
     name: "twocore@test@" <> f.name,
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [f],
@@ -574,7 +574,7 @@ fn op_module(
 pub fn mem_size_is_bare_call_test() {
   let b = binding()
   let assert CCall(CAtom(mem), CAtom("size"), []) =
-    body_of(op_module("f", [], [ir.TI32], ir.MemSize), "f")
+    body_of(op_module("f", [], [ir.TI32], ir.MemSize(0)), "f")
   assert mem == b.mem_module
 }
 
@@ -587,7 +587,7 @@ pub fn mem_grow_is_bare_call_test() {
         "f",
         [ir.Local("d", ir.TI32)],
         [ir.TI32],
-        ir.MemGrow(ir.Var("d")),
+        ir.MemGrow(0, ir.Var("d")),
       ),
       "f",
     )
@@ -623,7 +623,7 @@ pub fn mem_load_is_trapping_case_test() {
         "f",
         [ir.Local("a", ir.TI32)],
         [ir.TI32],
-        ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 8, ir.TI32),
+        ir.MemLoad(0, ir.MemAccess(1, True), ir.Var("a"), 8, ir.TI32),
       ),
       "f",
     )
@@ -643,7 +643,7 @@ pub fn mem_load_result_width_disambiguates_test() {
         "f",
         [ir.Local("a", ir.TI32)],
         [ir.TI32],
-        ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI32),
+        ir.MemLoad(0, ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI32),
       ),
       "f",
     )
@@ -653,7 +653,7 @@ pub fn mem_load_result_width_disambiguates_test() {
         "f",
         [ir.Local("a", ir.TI32)],
         [ir.TI64],
-        ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI64),
+        ir.MemLoad(0, ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI64),
       ),
       "f",
     )
@@ -691,7 +691,7 @@ pub fn mem_store_is_ordered_effect_test() {
         "f",
         [ir.Local("a", ir.TI32), ir.Local("v", ir.TI32)],
         [],
-        ir.MemStore(ir.MemAccess(4, False), ir.Var("a"), ir.Var("v"), 0),
+        ir.MemStore(0, ir.MemAccess(4, False), ir.Var("a"), ir.Var("v"), 0),
       ),
       "f",
     )
@@ -888,14 +888,22 @@ fn full_module() -> ir.Module {
   ir.Module(
     name: "twocore@test@full",
     uses_numerics: True,
-    memory: option.Some(ir.MemoryDecl(1, option.Some(2))),
+    memories: [ir.MemoryDecl(1, option.Some(2), ir.Idx32)],
     globals: [ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(42)]))],
     imports: [],
     functions: [elemfn, initfn],
     exports: [],
-    data_segments: [ir.DataSegment(ir.Values([ir.ConstI32(0)]), <<1, 2, 3>>)],
-    tables: [ir.TableDecl("t0", 4, option.None)],
-    elements: [ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["elemfn"])],
+    data_segments: [
+      ir.DataSegment(ir.DataActive(0, ir.Values([ir.ConstI32(0)])), <<1, 2, 3>>),
+    ],
+    tables: [ir.TableDecl("t0", ir.FuncRef, 4, option.None)],
+    elements: [
+      ir.ElementSegment(
+        ir.ElemActive("t0", ir.Values([ir.ConstI32(0)])),
+        ir.FuncRef,
+        [ir.RefFunc("elemfn")],
+      ),
+    ],
     start: option.Some("init"),
   )
 }
@@ -1033,7 +1041,7 @@ pub fn export_alias_wrapper_test() {
     ir.Module(
       name: "twocore@test@alias",
       uses_numerics: True,
-      memory: option.None,
+      memories: [],
       globals: [],
       imports: [],
       functions: [f],
@@ -1091,13 +1099,13 @@ fn st_module(f: ir.Function) -> ir.Module {
   ir.Module(
     name: "twocore@test@" <> f.name,
     uses_numerics: True,
-    memory: option.Some(ir.MemoryDecl(1, option.None)),
+    memories: [ir.MemoryDecl(1, option.None, ir.Idx32)],
     globals: [ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(0)]))],
     imports: [],
     functions: [f],
     exports: [ir.ExportFn(f.name, f.name)],
     data_segments: [],
-    tables: [ir.TableDecl("t0", 4, option.None)],
+    tables: [ir.TableDecl("t0", ir.FuncRef, 4, option.None)],
     elements: [],
     start: option.None,
   )
@@ -1128,7 +1136,7 @@ pub fn threaded_store_rebinds_record_test() {
       locals: [],
       body: ir.Let(
         [],
-        ir.MemStore(ir.MemAccess(4, False), ir.Var("addr"), ir.Var("val"), 0),
+        ir.MemStore(0, ir.MemAccess(4, False), ir.Var("addr"), ir.Var("val"), 0),
         ir.Values([]),
       ),
     )
@@ -1171,7 +1179,7 @@ pub fn threaded_load_reads_without_rebind_test() {
       params: [ir.Local("addr", ir.TI32)],
       result: [ir.TI32],
       locals: [],
-      body: ir.MemLoad(ir.MemAccess(4, False), ir.Var("addr"), 0, ir.TI32),
+      body: ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("addr"), 0, ir.TI32),
     )
   let assert FunDef(FName("load", 2), CFun([st, "addr"], body)) =
     threaded_def(st_module(load), "load")
@@ -1202,7 +1210,7 @@ pub fn threaded_size_reads_without_rebind_test() {
       params: [],
       result: [ir.TI32],
       locals: [],
-      body: ir.MemSize,
+      body: ir.MemSize(0),
     )
   let assert FunDef(FName("size", 1), CFun([st], body)) =
     threaded_def(st_module(size), "size")
@@ -1223,7 +1231,7 @@ pub fn threaded_grow_binds_value_and_rebinds_test() {
       params: [ir.Local("d", ir.TI32)],
       result: [ir.TI32],
       locals: [],
-      body: ir.MemGrow(ir.Var("d")),
+      body: ir.MemGrow(0, ir.Var("d")),
     )
   let assert FunDef(FName("grow", 2), CFun([st, "d"], body)) =
     threaded_def(st_module(grow), "grow")
@@ -1374,7 +1382,7 @@ pub fn threaded_tail_call_to_state_reaching_stays_tail_test() {
       params: [ir.Local("x", ir.TI32)],
       result: [ir.TI32],
       locals: [],
-      body: ir.MemLoad(ir.MemAccess(4, False), ir.Var("x"), 0, ir.TI32),
+      body: ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("x"), 0, ir.TI32),
     )
   let f =
     ir.Function(
@@ -1388,7 +1396,7 @@ pub fn threaded_tail_call_to_state_reaching_stays_tail_test() {
     ir.Module(
       name: "twocore@test@tailcall",
       uses_numerics: True,
-      memory: option.Some(ir.MemoryDecl(1, option.None)),
+      memories: [ir.MemoryDecl(1, option.None, ir.Idx32)],
       globals: [],
       imports: [],
       functions: [g, f],
@@ -1419,7 +1427,7 @@ pub fn threaded_loop_is_constant_space_template_test() {
         result: [],
         body: ir.Let(
           [],
-          ir.MemStore(ir.MemAccess(4, False), ir.Var("i"), ir.Var("i"), 0),
+          ir.MemStore(0, ir.MemAccess(4, False), ir.Var("i"), ir.Var("i"), 0),
           ir.Continue("go", [ir.Var("i")]),
         ),
       ),
@@ -1462,7 +1470,13 @@ pub fn threaded_export_name_equals_fn_no_duplicate_test() {
       locals: [],
       body: ir.Let(
         [],
-        ir.MemStore(ir.MemAccess(4, False), ir.Var("addr"), ir.Var("addr"), 0),
+        ir.MemStore(
+          0,
+          ir.MemAccess(4, False),
+          ir.Var("addr"),
+          ir.Var("addr"),
+          0,
+        ),
         ir.Values([]),
       ),
     )
@@ -1491,7 +1505,13 @@ pub fn threaded_export_alias_forwards_at_plus_one_test() {
       locals: [],
       body: ir.Let(
         [],
-        ir.MemStore(ir.MemAccess(4, False), ir.Var("addr"), ir.Var("addr"), 0),
+        ir.MemStore(
+          0,
+          ir.MemAccess(4, False),
+          ir.Var("addr"),
+          ir.Var("addr"),
+          0,
+        ),
         ir.Values([]),
       ),
     )
@@ -1499,7 +1519,7 @@ pub fn threaded_export_alias_forwards_at_plus_one_test() {
     ir.Module(
       name: "twocore@test@threadedalias",
       uses_numerics: True,
-      memory: option.Some(ir.MemoryDecl(1, option.None)),
+      memories: [ir.MemoryDecl(1, option.None, ir.Idx32)],
       globals: [],
       imports: [],
       functions: [store],

@@ -37,7 +37,7 @@ fn add_module() -> ir.Module {
   ir.Module(
     name: "twocore@tier@add",
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [
@@ -68,7 +68,7 @@ fn global_module() -> ir.Module {
   ir.Module(
     name: "twocore@tier@global",
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(7)]))],
     imports: [],
     functions: [
@@ -96,7 +96,7 @@ fn memory_module() -> ir.Module {
   ir.Module(
     name: "twocore@tier@mem",
     uses_numerics: True,
-    memory: option.Some(ir.MemoryDecl(1, option.None)),
+    memories: [ir.MemoryDecl(1, option.None, ir.Idx32)],
     globals: [],
     imports: [],
     functions: [
@@ -107,7 +107,13 @@ fn memory_module() -> ir.Module {
         [],
         ir.Let(
           [],
-          ir.MemStore(ir.MemAccess(4, False), ir.Var("addr"), ir.Var("val"), 0),
+          ir.MemStore(
+            0,
+            ir.MemAccess(4, False),
+            ir.Var("addr"),
+            ir.Var("val"),
+            0,
+          ),
           ir.Values([]),
         ),
       ),
@@ -116,7 +122,7 @@ fn memory_module() -> ir.Module {
         [ir.Local("addr", ir.TI32)],
         [ir.TI32],
         [],
-        ir.MemLoad(ir.MemAccess(4, False), ir.Var("addr"), 0, ir.TI32),
+        ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("addr"), 0, ir.TI32),
       ),
     ],
     exports: [

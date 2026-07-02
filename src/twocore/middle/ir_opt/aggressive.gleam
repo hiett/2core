@@ -421,17 +421,85 @@ fn apply_rename_subst(
     ir.Num(op, args) -> ir.Num(op, rs_values(args, rename, subst))
     ir.Convert(op, arg) -> ir.Convert(op, rs_value(arg, rename, subst))
     ir.TermOp(op, args) -> ir.TermOp(op, rs_values(args, rename, subst))
-    ir.MemSize -> e
-    ir.MemGrow(delta) -> ir.MemGrow(rs_value(delta, rename, subst))
-    ir.MemLoad(op, addr, offset, result) ->
-      ir.MemLoad(op, rs_value(addr, rename, subst), offset, result)
-    ir.MemStore(op, addr, value, offset) ->
+    ir.MemSize(_) -> e
+    ir.MemGrow(mem, delta) -> ir.MemGrow(mem, rs_value(delta, rename, subst))
+    ir.MemLoad(mem, op, addr, offset, result) ->
+      ir.MemLoad(mem, op, rs_value(addr, rename, subst), offset, result)
+    ir.MemStore(mem, op, addr, value, offset) ->
       ir.MemStore(
+        mem,
         op,
         rs_value(addr, rename, subst),
         rs_value(value, rename, subst),
         offset,
       )
+    // ── Phase-5 reference/table/bulk nodes: rewrite their `Value` operands so an inlined
+    // callee's params are substituted into them (their names/segment indices are static). ──
+    ir.RefFunc(_) -> e
+    ir.RefIsNull(arg) -> ir.RefIsNull(rs_value(arg, rename, subst))
+    ir.TableGet(table, index) ->
+      ir.TableGet(table, rs_value(index, rename, subst))
+    ir.TableSet(table, index, value) ->
+      ir.TableSet(
+        table,
+        rs_value(index, rename, subst),
+        rs_value(value, rename, subst),
+      )
+    ir.TableSize(_) -> e
+    ir.TableGrow(table, delta, init) ->
+      ir.TableGrow(
+        table,
+        rs_value(delta, rename, subst),
+        rs_value(init, rename, subst),
+      )
+    ir.TableFill(table, offset, value, count) ->
+      ir.TableFill(
+        table,
+        rs_value(offset, rename, subst),
+        rs_value(value, rename, subst),
+        rs_value(count, rename, subst),
+      )
+    ir.TableInit(table, seg, dst, src, count) ->
+      ir.TableInit(
+        table,
+        seg,
+        rs_value(dst, rename, subst),
+        rs_value(src, rename, subst),
+        rs_value(count, rename, subst),
+      )
+    ir.TableCopy(dst_table, src_table, dst, src, count) ->
+      ir.TableCopy(
+        dst_table,
+        src_table,
+        rs_value(dst, rename, subst),
+        rs_value(src, rename, subst),
+        rs_value(count, rename, subst),
+      )
+    ir.ElemDrop(_) -> e
+    ir.MemFill(mem, dest, value, count) ->
+      ir.MemFill(
+        mem,
+        rs_value(dest, rename, subst),
+        rs_value(value, rename, subst),
+        rs_value(count, rename, subst),
+      )
+    ir.MemCopy(dst_mem, src_mem, dst, src, count) ->
+      ir.MemCopy(
+        dst_mem,
+        src_mem,
+        rs_value(dst, rename, subst),
+        rs_value(src, rename, subst),
+        rs_value(count, rename, subst),
+      )
+    ir.MemInit(mem, seg, dst, src, count) ->
+      ir.MemInit(
+        mem,
+        seg,
+        rs_value(dst, rename, subst),
+        rs_value(src, rename, subst),
+        rs_value(count, rename, subst),
+      )
+    ir.DataDrop(_) -> e
     ir.GlobalGet(_) -> e
     ir.GlobalSet(name, value) ->
       ir.GlobalSet(name, rs_value(value, rename, subst))
@@ -710,12 +778,32 @@ fn closure(
 /// The names a function must NOT be deleted for even when orphaned: exported functions, the
 /// start function, and any function named in an element segment (reachable via `CallIndirect`).
 fn protected_names(module: ir.Module) -> Set(String) {
-  let exported = list.map(module.exports, fn(x) { x.fn_name })
+  // Only FUNCTION exports protect a function; exported state (global/table/memory) names no
+  // function (H4).
+  let exported =
+    list.filter_map(module.exports, fn(x) {
+      case x {
+        ir.ExportFn(_, fn_name) -> Ok(fn_name)
+        ir.ExportGlobal(..) | ir.ExportTable(..) | ir.ExportMemory(..) ->
+          Error(Nil)
+      }
+    })
   let started = case module.start {
     option.Some(s) -> [s]
     option.None -> []
   }
-  let element_refs = list.flat_map(module.elements, fn(el) { el.funcs })
+  // A function named by a `ref.func` element item is reachable via `CallIndirect`/`ref.func`,
+  // so it must not be deleted. Element items are ref-expressions now (H2); collect the
+  // `RefFunc` targets (a `ConstNull` item names no function).
+  let element_refs =
+    list.flat_map(module.elements, fn(el) {
+      list.filter_map(el.init, fn(item) {
+        case item {
+          ir.RefFunc(fn_name) -> Ok(fn_name)
+          _ -> Error(Nil)
+        }
+      })
+    })
   set.from_list(list.append(exported, list.append(started, element_refs)))
 }
 

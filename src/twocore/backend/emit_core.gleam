@@ -354,7 +354,15 @@ fn emit_exports(
 ) -> Result(#(List(FName), List(FunDef)), EmitError) {
   list.try_fold(exports, #([], []), fn(acc, exp) {
     let #(names, wrappers) = acc
-    let ir.ExportFn(export_name, fn_name) = exp
+    // Only FUNCTION exports lower here (the Phase-1..4 surface, byte-identical). Exported state
+    // (global/table/memory — H4) is P5-06/09's; it never appears in the existing corpus, so a
+    // typed error keeps the tree green without moving conformance.
+    use #(export_name, fn_name) <- result.try(case exp {
+      ir.ExportFn(export_name, fn_name) -> Ok(#(export_name, fn_name))
+      ir.ExportGlobal(..) -> Error(UnsupportedNode("export_global"))
+      ir.ExportTable(..) -> Error(UnsupportedNode("export_table"))
+      ir.ExportMemory(..) -> Error(UnsupportedNode("export_memory"))
+    })
     case dict.get(ctx.fn_arity, fn_name) {
       Error(_) -> Error(UnknownFunction(fn_name))
       Ok(arity) ->
@@ -557,11 +565,28 @@ fn expr_touches_state(expr: Expr) -> Bool {
   case expr {
     MemLoad(..)
     | MemStore(..)
-    | MemSize
+    | MemSize(..)
     | MemGrow(..)
     | GlobalGet(..)
     | GlobalSet(..)
-    | CallIndirect(..) -> True
+    | CallIndirect(..)
+    | // Phase-5 reference/table/bulk nodes all read/write mutable instance state (a table slot,
+      // a memory range, passive drop-state, or an instance-linked closure), so a function
+      // containing one is state-reaching under `Threaded` (§A.3). No Phase-1..4 module has them.
+      ir.RefFunc(..)
+    | ir.RefIsNull(..)
+    | ir.TableGet(..)
+    | ir.TableSet(..)
+    | ir.TableSize(..)
+    | ir.TableGrow(..)
+    | ir.TableFill(..)
+    | ir.TableInit(..)
+    | ir.TableCopy(..)
+    | ir.ElemDrop(..)
+    | ir.MemFill(..)
+    | ir.MemCopy(..)
+    | ir.MemInit(..)
+    | ir.DataDrop(..) -> True
     Let(_, rhs, body) -> expr_touches_state(rhs) || expr_touches_state(body)
     If(_, _, t, e) -> expr_touches_state(t) || expr_touches_state(e)
     Switch(_, _, arms, default) ->
@@ -642,19 +667,37 @@ fn emit(
     // ── Stateful ops — routed through the ONE state-access seam (`seam_call`). Under
     // `NoState` each is today's cell `call '<binding.X_module>':'op'(...)`; under
     // `Threading(cur)` each threads the `InstanceState` record through the `t_*` family. ──
-    MemSize -> emit_mem_size(cont, sc, state, ctx)
-    MemGrow(delta) -> emit_mem_grow(delta, cont, sc, state, ctx)
-    MemLoad(op, addr, offset, result) ->
+    // The `mem` index is IGNORED here (always `0` for the Phase-1..4 corpus, so byte-
+    // identical); P5-06 adds the leading memory-index argument for `mem != 0`.
+    MemSize(_mem) -> emit_mem_size(cont, sc, state, ctx)
+    MemGrow(_mem, delta) -> emit_mem_grow(delta, cont, sc, state, ctx)
+    MemLoad(_mem, op, addr, offset, result) ->
       emit_mem_load(op, addr, offset, result, cont, sc, state, ctx)
-    MemStore(op, addr, value, offset) ->
+    MemStore(_mem, op, addr, value, offset) ->
       emit_mem_store(op, addr, value, offset, cont, sc, state, ctx)
     GlobalGet(name) -> emit_global_get(name, cont, sc, state, ctx)
     GlobalSet(name, value) -> emit_global_set(name, value, cont, sc, state, ctx)
     CallIndirect(_table, index, ty, args) ->
       emit_call_indirect(index, ty, args, cont, sc, state, ctx)
-    // Out of scope — typed error, never a panic. Only the term layer (`TermOp`) and the
-    // term↔numeric boxing `Convert`s remain unlowered (handled in `emit_convert`).
+    // Out of scope — typed error, never a panic. The term layer (`TermOp`) + the term↔numeric
+    // boxing `Convert`s remain unlowered, plus the Phase-5 reference/table/bulk nodes whose
+    // real codegen is P5-06. No Phase-1..4 module contains any of these, so the corpus + suite
+    // stay byte-identical (they are never reached by the existing surface).
     TermOp(..) -> Error(UnsupportedNode("term_op"))
+    ir.RefFunc(..) -> Error(UnsupportedNode("ref_func"))
+    ir.RefIsNull(..) -> Error(UnsupportedNode("ref_is_null"))
+    ir.TableGet(..) -> Error(UnsupportedNode("table_get"))
+    ir.TableSet(..) -> Error(UnsupportedNode("table_set"))
+    ir.TableSize(..) -> Error(UnsupportedNode("table_size"))
+    ir.TableGrow(..) -> Error(UnsupportedNode("table_grow"))
+    ir.TableFill(..) -> Error(UnsupportedNode("table_fill"))
+    ir.TableInit(..) -> Error(UnsupportedNode("table_init"))
+    ir.TableCopy(..) -> Error(UnsupportedNode("table_copy"))
+    ir.ElemDrop(..) -> Error(UnsupportedNode("elem_drop"))
+    ir.MemFill(..) -> Error(UnsupportedNode("mem_fill"))
+    ir.MemCopy(..) -> Error(UnsupportedNode("mem_copy"))
+    ir.MemInit(..) -> Error(UnsupportedNode("mem_init"))
+    ir.DataDrop(..) -> Error(UnsupportedNode("data_drop"))
   }
 }
 
@@ -1302,6 +1345,8 @@ fn result_width(t: ValType) -> Int {
   case t {
     TI32 | TF32 | TTerm -> 32
     TI64 | TF64 -> 64
+    // Reference types are never a numeric load result (validate rejects it); defaulted to 32.
+    ir.TFuncRef | ir.TExternRef -> 32
   }
 }
 
@@ -1868,6 +1913,10 @@ fn emit_value(v: Value) -> CExpr {
     ConstI64(bits) -> CInt(bits)
     ConstF32(bits) -> CInt(bits)
     ConstF64(bits) -> CInt(bits)
+    // The null-reference literal (both reftypes share ONE sentinel, R1) — the forge-proof
+    // `{ref_null}` term `rt_ref.null_ref` produces. Reftype-agnostic at runtime. No Phase-1..4
+    // operand is `ConstNull`, so this arm is never reached by the existing corpus.
+    ir.ConstNull(_ty) -> CTuple([CAtom("ref_null")])
   }
 }
 
@@ -1942,6 +1991,8 @@ fn valtype_atom(t: ValType) -> CExpr {
     TF32 -> "f32"
     TF64 -> "f64"
     TTerm -> "term"
+    ir.TFuncRef -> "funcref"
+    ir.TExternRef -> "externref"
   })
 }
 
@@ -2150,8 +2201,9 @@ fn threaded_elem_wrappers(
 ) -> Result(#(List(fn(CExpr) -> CExpr), String, EmitState), EmitError) {
   list.try_fold(segs, #([], cur, state), fn(acc, seg) {
     let #(wraps, cur, st) = acc
-    use offset <- result.try(const_fold(seg.offset))
-    use #(entries, st2) <- result.try(build_threaded_entries(seg.funcs, ctx, st))
+    use #(offset_expr, funcs) <- result.try(elem_active_funcs(seg))
+    use offset <- result.try(const_fold(offset_expr))
+    use #(entries, st2) <- result.try(build_threaded_entries(funcs, ctx, st))
     let call =
       seam_call(ctx.binding.table_module, "t_init_elem", [
         CVar(cur),
@@ -2176,7 +2228,8 @@ fn threaded_data_wrappers(
 ) -> Result(#(List(fn(CExpr) -> CExpr), String, EmitState), EmitError) {
   list.try_fold(segs, #([], cur, state), fn(acc, seg) {
     let #(wraps, cur, st) = acc
-    use offset <- result.try(const_fold(seg.offset))
+    use offset_expr <- result.try(data_active_offset(seg))
+    use offset <- result.try(const_fold(offset_expr))
     let call =
       seam_call(ctx.binding.mem_module, "t_init_data", [
         CVar(cur),
@@ -2410,9 +2463,12 @@ fn state_decl_term(
   ctx: Ctx,
   state: EmitState,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(min_pages, mem_max) = case module.memory {
-    Some(m) -> #(m.min_pages, option_int_term(m.max_pages))
-    None -> #(0, CAtom("none"))
+  // The FIRST (index-0) memory's sizing. KEYSTONE: a single 32-bit memory emits the same
+  // `rt_mem:fresh(Min, Max, Cap)` call as Phase-4 (byte-identical); the multi-memory vector
+  // seed (index 1+) is P5-06/09's. `[]` (numerics-only) → a 0-page memory, unchanged.
+  let #(min_pages, mem_max) = case module.memories {
+    [m, ..] -> #(m.min_pages, option_int_term(m.max_pages))
+    [] -> #(0, CAtom("none"))
   }
   let mem =
     seam_call(ctx.binding.mem_module, "fresh", [
@@ -2464,8 +2520,9 @@ fn element_segment_effects(
 ) -> Result(#(List(CExpr), EmitState), EmitError) {
   list.try_fold(segs, #([], state), fn(acc, seg) {
     let #(effects, st) = acc
-    use offset <- result.try(const_fold(seg.offset))
-    use #(entries, st2) <- result.try(build_entries(seg.funcs, ctx, st))
+    use #(offset_expr, funcs) <- result.try(elem_active_funcs(seg))
+    use offset <- result.try(const_fold(offset_expr))
+    use #(entries, st2) <- result.try(build_entries(funcs, ctx, st))
     let call =
       seam_call(ctx.binding.table_module, "init_elem", [
         CInt(offset),
@@ -2572,7 +2629,8 @@ fn data_segment_effects(
 ) -> Result(#(List(CExpr), EmitState), EmitError) {
   list.try_fold(segs, #([], state), fn(acc, seg) {
     let #(effects, st) = acc
-    use offset <- result.try(const_fold(seg.offset))
+    use offset_expr <- result.try(data_active_offset(seg))
+    use offset <- result.try(const_fold(offset_expr))
     let call =
       seam_call(ctx.binding.mem_module, "init_data", [
         CInt(offset),
@@ -2613,6 +2671,46 @@ fn const_value_bits(v: Value) -> Result(Int, EmitError) {
   case v {
     ConstI32(b) | ConstI64(b) | ConstF32(b) | ConstF64(b) -> Ok(b)
     Var(_) -> Error(NonConstInit("variable in constant init/offset"))
+    // A reference-typed constant init (`ref.null`) has no numeric bit pattern; its seeding is
+    // P5-06/09's (a `ConstNull` never appears in a Phase-1..4 numeric offset/init).
+    ir.ConstNull(_) ->
+      Error(NonConstInit("null reference in constant init/offset"))
+  }
+}
+
+/// Extract the Phase-2 active-funcref parts of an element segment for the keystone codegen
+/// path: the target-table offset expression + the funcref function names. Returns
+/// `Error(UnsupportedNode(_))` for a passive/declarative segment, an `externref` segment, or a
+/// non-`RefFunc` init item (their real lowering is P5-06/07). No Phase-1..4 module has one, so
+/// the active-funcref path is byte-identical and the error paths are never reached.
+fn elem_active_funcs(
+  seg: ir.ElementSegment,
+) -> Result(#(Expr, List(String)), EmitError) {
+  case seg.mode, seg.ref_ty {
+    ir.ElemActive(_table, offset), ir.FuncRef -> {
+      use funcs <- result.try(
+        list.try_map(seg.init, fn(item) {
+          case item {
+            ir.RefFunc(name) -> Ok(name)
+            _ -> Error(UnsupportedNode("elem_item"))
+          }
+        }),
+      )
+      Ok(#(offset, funcs))
+    }
+    _, _ -> Error(UnsupportedNode("elem_segment"))
+  }
+}
+
+/// Extract the Phase-2 active-at-memory-0 offset of a data segment. Returns
+/// `Error(UnsupportedNode(_))` for a passive segment or an active-at-mem>0 segment (their
+/// lowering is P5-06/08). No Phase-1..4 module has one, so the active-at-0 path is byte-
+/// identical and the error paths are never reached.
+fn data_active_offset(seg: ir.DataSegment) -> Result(Expr, EmitError) {
+  case seg.mode {
+    ir.DataActive(0, offset) -> Ok(offset)
+    ir.DataActive(_, _) -> Error(UnsupportedNode("data_segment_mem"))
+    ir.DataPassive -> Error(UnsupportedNode("data_passive"))
   }
 }
 
@@ -2824,11 +2922,35 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     Num(_, args) -> collect_values(args, acc)
     Convert(_, arg) -> collect_value(arg, acc)
     TermOp(_, args) -> collect_values(args, acc)
-    MemSize -> acc
-    MemGrow(delta) -> collect_value(delta, acc)
-    MemLoad(_, addr, _, _) -> collect_value(addr, acc)
-    MemStore(_, addr, value, _) ->
+    MemSize(_) -> acc
+    MemGrow(_, delta) -> collect_value(delta, acc)
+    MemLoad(_, _, addr, _, _) -> collect_value(addr, acc)
+    MemStore(_, _, addr, value, _) ->
       collect_value(value, collect_value(addr, acc))
+    // ── Phase-5 reference/table/bulk nodes: collect the `Var` names in their operands so
+    // gensym avoids them (over-approximating is safe). ──
+    ir.RefFunc(_) -> acc
+    ir.RefIsNull(arg) -> collect_value(arg, acc)
+    ir.TableGet(_, index) -> collect_value(index, acc)
+    ir.TableSet(_, index, value) ->
+      collect_value(value, collect_value(index, acc))
+    ir.TableSize(_) -> acc
+    ir.TableGrow(_, delta, init) ->
+      collect_value(init, collect_value(delta, acc))
+    ir.TableFill(_, offset, value, count) ->
+      collect_value(count, collect_value(value, collect_value(offset, acc)))
+    ir.TableInit(_, _, dst, src, count) ->
+      collect_value(count, collect_value(src, collect_value(dst, acc)))
+    ir.TableCopy(_, _, dst, src, count) ->
+      collect_value(count, collect_value(src, collect_value(dst, acc)))
+    ir.ElemDrop(_) -> acc
+    ir.MemFill(_, dest, value, count) ->
+      collect_value(count, collect_value(value, collect_value(dest, acc)))
+    ir.MemCopy(_, _, dst, src, count) ->
+      collect_value(count, collect_value(src, collect_value(dst, acc)))
+    ir.MemInit(_, _, dst, src, count) ->
+      collect_value(count, collect_value(src, collect_value(dst, acc)))
+    ir.DataDrop(_) -> acc
     GlobalGet(_) -> acc
     GlobalSet(_, value) -> collect_value(value, acc)
     CallDirect(_, args) -> collect_values(args, acc)

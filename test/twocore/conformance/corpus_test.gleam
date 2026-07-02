@@ -369,7 +369,7 @@ fn numeric_module(name: String, fns: List(ir.Function)) -> ir.Module {
   ir.Module(
     name: "twocore@corpus@" <> name <> "_" <> int.to_string(ffi.unique_int()),
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: fns,

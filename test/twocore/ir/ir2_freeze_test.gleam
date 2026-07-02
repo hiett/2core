@@ -25,19 +25,21 @@ fn ir2_module() -> ir.Module {
   ir.Module(
     name: "twocore@wasm@ir2_freeze",
     uses_numerics: True,
-    memory: Some(ir.MemoryDecl(min_pages: 1, max_pages: Some(4))),
+    memories: [
+      ir.MemoryDecl(min_pages: 1, max_pages: Some(4), idx_type: ir.Idx32),
+    ],
     globals: [],
     imports: [],
     functions: [worker_function(), init_function()],
     exports: [ir.ExportFn("run", "worker")],
     data_segments: [],
     // NEW Phase-2 module fields:
-    tables: [ir.TableDecl(name: "t0", min: 2, max: Some(8))],
+    tables: [ir.TableDecl(name: "t0", ref_ty: ir.FuncRef, min: 2, max: Some(8))],
     elements: [
       ir.ElementSegment(
-        table: "t0",
-        offset: ir.Values([ir.ConstI32(0)]),
-        funcs: ["worker", "init"],
+        mode: ir.ElemActive(table: "t0", offset: ir.Values([ir.ConstI32(0)])),
+        ref_ty: ir.FuncRef,
+        init: [ir.RefFunc("worker"), ir.RefFunc("init")],
       ),
     ],
     start: Some("init"),
@@ -53,14 +55,15 @@ fn worker_function() -> ir.Function {
     locals: [],
     body: ir.Let(
       ["sz"],
-      ir.MemSize,
+      ir.MemSize(0),
       ir.Let(
         ["prev"],
-        ir.MemGrow(ir.ConstI32(1)),
+        ir.MemGrow(0, ir.ConstI32(1)),
         ir.Let(
           // i64.load8_s: 1 byte, sign-extended, RESULT TI64 (distinct from i32.load8_s).
           ["x"],
           ir.MemLoad(
+            0,
             ir.MemAccess(bytes: 1, signed: True),
             ir.Var("p0"),
             0,
@@ -102,13 +105,14 @@ fn init_function() -> ir.Function {
 /// The module typechecks and its new module-level fields hold the expected declarations.
 pub fn ir2_module_typechecks_test() {
   let m = ir2_module()
-  assert m.tables == [ir.TableDecl(name: "t0", min: 2, max: Some(8))]
+  assert m.tables
+    == [ir.TableDecl(name: "t0", ref_ty: ir.FuncRef, min: 2, max: Some(8))]
   assert m.elements
     == [
       ir.ElementSegment(
-        table: "t0",
-        offset: ir.Values([ir.ConstI32(0)]),
-        funcs: ["worker", "init"],
+        mode: ir.ElemActive(table: "t0", offset: ir.Values([ir.ConstI32(0)])),
+        ref_ty: ir.FuncRef,
+        init: [ir.RefFunc("worker"), ir.RefFunc("init")],
       ),
     ]
   assert m.start == Some("init")
@@ -119,7 +123,7 @@ pub fn ir2_module_typechecks_test() {
 /// An `i64.load8_s` / `i32.load8_s` builder: same `MemAccess(1, signed)`, parametric on the
 /// result valtype (so the distinction lives entirely in the `result` field).
 fn load8s(result: ir.ValType) -> ir.Expr {
-  ir.MemLoad(ir.MemAccess(bytes: 1, signed: True), ir.Var("a"), 0, result)
+  ir.MemLoad(0, ir.MemAccess(bytes: 1, signed: True), ir.Var("a"), 0, result)
 }
 
 /// The `MemLoad` result `ValType` discriminates `i32.load8_s` from `i64.load8_s` — same
@@ -127,8 +131,8 @@ fn load8s(result: ir.ValType) -> ir.Expr {
 /// the `result` field (the two were indistinguishable before). Destructure each load and
 /// confirm it carries the expected result valtype.
 pub fn memload_result_discriminates_test() {
-  let assert ir.MemLoad(ir.MemAccess(1, True), _, _, r32) = load8s(ir.TI32)
-  let assert ir.MemLoad(ir.MemAccess(1, True), _, _, r64) = load8s(ir.TI64)
+  let assert ir.MemLoad(_, ir.MemAccess(1, True), _, _, r32) = load8s(ir.TI32)
+  let assert ir.MemLoad(_, ir.MemAccess(1, True), _, _, r64) = load8s(ir.TI64)
   assert r32 == ir.TI32
   assert r64 == ir.TI64
 }

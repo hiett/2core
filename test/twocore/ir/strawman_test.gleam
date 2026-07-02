@@ -36,7 +36,7 @@ fn add_module() -> ir.Module {
   ir.Module(
     name: "add",
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [add_function()],
@@ -58,7 +58,7 @@ pub fn add_module_capabilities_test() {
   let m = add_module()
   // Numerics opt-in is on; linear memory is a SEPARATE Option and is off (D5).
   assert m.uses_numerics == True
-  assert m.memory == option.None
+  assert m.memories == []
   assert m.exports == [ir.ExportFn(export_name: "add", fn_name: "add")]
 }
 
@@ -107,7 +107,7 @@ fn sum_to_module() -> ir.Module {
   ir.Module(
     name: "loop",
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [sum_to_function()],
@@ -127,7 +127,7 @@ pub fn sum_to_signature_test() {
 pub fn sum_to_module_capabilities_test() {
   let m = sum_to_module()
   assert m.uses_numerics == True
-  assert m.memory == option.None
+  assert m.memories == []
   assert m.exports == [ir.ExportFn(export_name: "sum_to", fn_name: "sum_to")]
 }
 
@@ -179,7 +179,7 @@ fn fib_module() -> ir.Module {
   ir.Module(
     name: "fib",
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [fib_function()],
@@ -199,6 +199,6 @@ pub fn fib_signature_test() {
 pub fn fib_module_capabilities_test() {
   let m = fib_module()
   assert m.uses_numerics == True
-  assert m.memory == option.None
+  assert m.memories == []
   assert m.exports == [ir.ExportFn(export_name: "fib", fn_name: "fib")]
 }

@@ -108,7 +108,7 @@ pub fn parse_module(source: String) -> Result(Module, ParseError) {
   use rest <- result.try(expect(rest, TLBrace, "{"))
   use #(acc, rest) <- result.try(parse_module_items(
     rest,
-    ModuleAcc(False, None, [], [], [], [], [], [], [], None),
+    ModuleAcc(False, [], [], [], [], [], [], [], [], None),
   ))
   use rest <- result.try(expect(rest, TRBrace, "}"))
   case rest {
@@ -542,7 +542,7 @@ fn parse_list_rest(
 type ModuleAcc {
   ModuleAcc(
     numerics: Bool,
-    memory: Option(MemoryDecl),
+    memories: List(MemoryDecl),
     globals: List(GlobalDecl),
     imports: List(ImportDecl),
     exports: List(ExportDecl),
@@ -559,7 +559,7 @@ fn build_module(name: String, acc: ModuleAcc) -> Module {
   Module(
     name: name,
     uses_numerics: acc.numerics,
-    memory: acc.memory,
+    memories: acc.memories,
     globals: list.reverse(acc.globals),
     imports: list.reverse(acc.imports),
     functions: list.reverse(acc.functions),
@@ -592,7 +592,7 @@ fn parse_module_items(
         }
         "memory" -> {
           use #(m, r) <- result.try(parse_memory(rest))
-          parse_module_items(r, ModuleAcc(..acc, memory: m))
+          parse_module_items(r, ModuleAcc(..acc, memories: m))
         }
         "global" -> {
           use #(g, r) <- result.try(parse_global(rest))
@@ -651,12 +651,15 @@ fn parse_bool(toks: List(PToken)) -> Result(#(Bool, List(PToken)), ParseError) {
   }
 }
 
-/// Parses a `memory` declaration: `none`, `(min N)`, or `(min N max M)`.
+/// Parses a `memory` declaration: `none`, `(min N)`, or `(min N max M)`. Returns the memories
+/// vector (`[]` for `none`, a one-element list otherwise). KEYSTONE minimal arm: only the
+/// single 32-bit (`Idx32`) memory Phase-2 form is parsed here (byte-identical); the full
+/// multi-memory / `idx_type` grammar (§F) is P5-02's.
 fn parse_memory(
   toks: List(PToken),
-) -> Result(#(Option(MemoryDecl), List(PToken)), ParseError) {
+) -> Result(#(List(MemoryDecl), List(PToken)), ParseError) {
   case toks {
-    [PToken(TWord("none"), _, _), ..rest] -> Ok(#(None, rest))
+    [PToken(TWord("none"), _, _), ..rest] -> Ok(#([], rest))
     [PToken(TLParen, _, _), ..rest] -> {
       use rest <- result.try(expect_word(rest, "min"))
       use #(minp, rest) <- result.try(expect_number(rest))
@@ -664,11 +667,11 @@ fn parse_memory(
         [PToken(TWord("max"), _, _), ..rest2] -> {
           use #(maxp, rest3) <- result.try(expect_number(rest2))
           use rest4 <- result.try(expect(rest3, TRParen, ")"))
-          Ok(#(Some(MemoryDecl(minp, Some(maxp))), rest4))
+          Ok(#([MemoryDecl(minp, Some(maxp), ir.Idx32)], rest4))
         }
         _ -> {
           use rest2 <- result.try(expect(rest, TRParen, ")"))
-          Ok(#(Some(MemoryDecl(minp, None)), rest2))
+          Ok(#([MemoryDecl(minp, None, ir.Idx32)], rest2))
         }
       }
     }
@@ -724,7 +727,9 @@ fn parse_data(
   use rest <- result.try(expect(rest, TRParen, ")"))
   use rest <- result.try(expect(rest, TEquals, "="))
   use #(bytes, rest) <- result.try(parse_hexbytes(rest))
-  Ok(#(DataSegment(offset, bytes), rest))
+  // KEYSTONE minimal arm: parses only the Phase-2 active-at-memory-0 form (byte-identical);
+  // passive / active-at-mem>0 data grammar (§F) is P5-02's.
+  Ok(#(DataSegment(ir.DataActive(0, offset), bytes), rest))
 }
 
 /// Parses a funcref table declaration `table @name min <int> [max <int>]` (`«IR2-FROZEN»`;
@@ -741,12 +746,14 @@ fn parse_table(
   use #(name, rest) <- result.try(parse_at_name(toks))
   use rest <- result.try(expect_word(rest, "min"))
   use #(min, rest) <- result.try(expect_number(rest))
+  // KEYSTONE minimal arm: parses the Phase-2 funcref table (byte-identical); the reftype-tag
+  // grammar (`externref` tables, §F) is P5-02's.
   case rest {
     [PToken(TWord("max"), _, _), ..rest2] -> {
       use #(max, rest3) <- result.try(expect_number(rest2))
-      Ok(#(TableDecl(name, min, Some(max)), rest3))
+      Ok(#(TableDecl(name, ir.FuncRef, min, Some(max)), rest3))
     }
-    _ -> Ok(#(TableDecl(name, min, None), rest))
+    _ -> Ok(#(TableDecl(name, ir.FuncRef, min, None), rest))
   }
 }
 
@@ -767,7 +774,17 @@ fn parse_elem(
   use #(offset, rest) <- result.try(parse_expr(rest))
   use rest <- result.try(expect(rest, TRParen, ")"))
   use #(funcs, rest) <- result.try(parse_at_name_bracket_list(rest))
-  Ok(#(ElementSegment(table, offset, funcs), rest))
+  // KEYSTONE minimal arm: parses the Phase-2 active funcref segment (byte-identical) — each
+  // `@fn` becomes a `RefFunc` init item. Passive/declarative + externref/null items (§F) are
+  // P5-02's.
+  Ok(#(
+    ElementSegment(
+      ir.ElemActive(table, offset),
+      ir.FuncRef,
+      list.map(funcs, ir.RefFunc),
+    ),
+    rest,
+  ))
 }
 
 /// Parses a bracketed, comma-separated list of `@name` references: `[ @a, @b ]` or `[]`.
@@ -938,6 +955,9 @@ fn parse_value(
           use #(n, rest) <- result.try(expect_number(rest))
           Ok(#(ConstF64(n), rest))
         }
+        // The null-reference literal, tagged by reftype (R1c): `null.funcref` / `null.externref`.
+        "null.funcref" -> Ok(#(ir.ConstNull(ir.FuncRef), rest))
+        "null.externref" -> Ok(#(ir.ConstNull(ir.ExternRef), rest))
         _ -> Error(UnexpectedToken(l, c, "value", w))
       }
     [PToken(t, l, c), ..] -> Error(UnexpectedToken(l, c, "value", describe(t)))
@@ -979,10 +999,12 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
         "num" -> parse_num(rest)
         "convert" -> parse_convert(rest)
         "term" -> parse_term(rest)
-        "mem.size" -> Ok(#(MemSize, rest))
+        // The four memory nodes parse the Phase-2 (memory-index-0) form (byte-identical); the
+        // explicit memory-index token for `mem != 0` (§F) is P5-02's, hence the fixed `0`.
+        "mem.size" -> Ok(#(MemSize(0), rest))
         "mem.grow" -> {
           use #(delta, rest) <- result.try(parse_value(rest))
-          Ok(#(MemGrow(delta), rest))
+          Ok(#(MemGrow(0, delta), rest))
         }
         "mem.load" -> parse_mem_load(rest)
         "mem.store" -> parse_mem_store(rest)
@@ -1100,7 +1122,7 @@ fn parse_mem_load(
   use rest <- result.try(expect_word(rest, "offset"))
   use rest <- result.try(expect(rest, TEquals, "="))
   use #(off, rest) <- result.try(expect_number(rest))
-  Ok(#(MemLoad(macc, addr, off, result), rest))
+  Ok(#(MemLoad(0, macc, addr, off, result), rest))
 }
 
 /// Parses `mem.store <memaccess> <addr> <value> offset=<int>`.
@@ -1113,7 +1135,7 @@ fn parse_mem_store(
   use rest <- result.try(expect_word(rest, "offset"))
   use rest <- result.try(expect(rest, TEquals, "="))
   use #(off, rest) <- result.try(expect_number(rest))
-  Ok(#(MemStore(macc, addr, val, off), rest))
+  Ok(#(MemStore(0, macc, addr, val, off), rest))
 }
 
 /// Parses a memory-access descriptor: `<bytes>` optionally followed by `signed`.

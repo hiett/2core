@@ -30,7 +30,7 @@ fn mod_of(funcs: List(ir.Function), exports: List(ir.ExportDecl)) -> ir.Module {
   ir.Module(
     name: "twocore@opt@aggressive_test",
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: funcs,
@@ -595,7 +595,7 @@ pub fn charge_elide_nested_test() {
 /// policy overlay, not a WASM semantic).
 pub fn charge_elide_keeps_inner_effect_test() {
   let store =
-    ir.MemStore(ir.MemAccess(4, False), ir.ConstI32(0), ir.ConstI32(1), 0)
+    ir.MemStore(0, ir.MemAccess(4, False), ir.ConstI32(0), ir.ConstI32(1), 0)
   let m = mod_of([func("main", [], [], ir.Charge(2, store))], [])
   assert body_of(opt_agg(m), "main") == store
 }

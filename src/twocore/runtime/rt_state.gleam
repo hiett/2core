@@ -51,6 +51,8 @@
 
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
+import gleam/list
+import gleam/set.{type Set}
 
 /// `erlang:put/2` — store `value` under `key` in the current process dictionary; returns
 /// the previous value (or the atom `undefined` if unset), which callers here discard.
@@ -79,24 +81,59 @@ type StateKey {
   TwocoreRtState
 }
 
-/// The opaque per-instance state record held in the process cell.
+/// The opaque per-instance state record held in the process cell (Phase-5 grown, R5/R7/R8).
 ///
-/// - `mem`: the linear-memory value, OPAQUE to `rt_state` (built and interpreted by
-///   `rt_mem`). Held as `Dynamic` to avoid importing `rt_mem`.
-/// - `globals`: the mutable globals as raw IEEE/two's-complement bit patterns, keyed by
-///   global name.
-/// - `table`: the funcref-table value, OPAQUE to `rt_state` (built and interpreted by
-///   `rt_table`). Held as `Dynamic` to avoid importing `rt_table`.
+/// Phase 5 generalizes the single-memory/single-table Phase-4 record to the complete-WASM
+/// surface: a **dense index-keyed memories vector**, a **dense index-keyed tables vector**
+/// (R7 — `emit_core` resolves table name→index at compile time; index 0 is the Phase-2 single
+/// table, byte-identical), passive-segment **drop-state sets** (R2 — `rt_state` owns ONLY the
+/// drop flag; the segment payload is an emit-supplied argument), and a **parallel
+/// `ref_globals` map** (R8 — reference-typed globals live on the term `Dynamic` path so the
+/// raw-bit `Int` `globals` path, D5, is untouched and byte-identical). The Phase-4 accessors
+/// (`mem_get`/`mem_put`/`mem`/`with_mem`, the single-table accessors, `global_*`/`t_global_*`)
+/// remain as **index-0 / head aliases** so generated code and `rt_mem`/`rt_table` stay
+/// byte-identical.
+///
+/// KEYSTONE POSTURE (R5): this unit freezes the record SHAPE and lands conservative,
+/// type-correct accessor bodies (a one-element `mems`/`tables` vector, empty drop sets, empty
+/// `ref_globals`). Unit 09 fills the real seeding (N memories/tables from `StateDecl`, imported
+/// state, reference-global init). No generated code embeds this record literally (it is built
+/// by `seed`/`fresh` and threaded opaquely), so growing it changes NO emitted `.core`.
+///
+/// - `mems`: the memory-index vector, each entry OPAQUE to `rt_state` (built/interpreted by
+///   `rt_mem`). Index 0 is the default memory every Phase-1..4 memory node targets.
+/// - `globals`: the mutable NUMERIC globals as raw IEEE/two's-complement bit patterns, keyed
+///   by global name (unchanged — D5 raw-bits path).
+/// - `tables`: the table-index vector, each entry OPAQUE to `rt_state` (built/interpreted by
+///   `rt_table`). Index 0 is the Phase-2 single table.
+/// - `dropped_data`: the set of passive DATA segment indices marked dropped (R2). Drop is O(1).
+/// - `dropped_elem`: the set of passive ELEMENT segment indices marked dropped (R2).
+/// - `ref_globals`: the mutable/immutable REFERENCE globals (funcref/externref) as opaque
+///   `Dynamic` terms keyed by name (R8) — kept parallel to `globals` so the numeric path is
+///   byte-identical.
 pub type InstanceState {
-  InstanceState(mem: Dynamic, globals: Dict(String, Int), table: Dynamic)
+  InstanceState(
+    mems: List(Dynamic),
+    globals: Dict(String, Int),
+    tables: List(Dynamic),
+    dropped_data: Set(Int),
+    dropped_elem: Set(Int),
+    ref_globals: Dict(String, Dynamic),
+  )
 }
 
 /// What the generated `instantiate` entry passes to `seed`: the FRESH per-layer values to
 /// install into a brand-new cell.
 ///
+/// FROZEN UNCHANGED from Phase 4 (byte-identity, H7): `emit_core.state_decl_term` emits the
+/// same `{state_decl, Mem, Globals, Table}` term, so the `.core` is unchanged. `build` wraps
+/// the single `mem`/`table` into one-element vectors and seeds empty drop-state / `ref_globals`
+/// (the conservative keystone stub, R5); unit 09 replaces `state_decl_term` + `build` with the
+/// multi-region / imported-state / reference-global seeding.
+///
 /// - `mem`: a fresh memory value built by `rt_mem.fresh` (rt_state stores it as-is,
 ///   preserving opacity — it never constructs memory).
-/// - `globals`: the initial globals as `#(name, raw_bits)` pairs (from each global's
+/// - `globals`: the initial NUMERIC globals as `#(name, raw_bits)` pairs (from each global's
 ///   constant init expression), in declaration order. Duplicate names keep the LAST pair
 ///   (`dict.from_list` semantics); validation guarantees unique global names upstream.
 /// - `table`: a fresh table value built by `rt_table.new` (stored as-is).
@@ -129,38 +166,150 @@ pub fn clear() -> Nil {
   Nil
 }
 
-/// Read the opaque memory value out of this process's cell (for `rt_mem`).
+/// Read the DEFAULT (index-0) opaque memory value out of this process's cell (for `rt_mem`).
 ///
+/// The Phase-4 name, preserved as the index-0 alias of `mem_at` for byte-identity (R6).
 /// - Returns the `Dynamic` memory value, unchanged (rt_state never inspects it). Fail-closed:
 ///   `panic`s (a node-safe internal error) on an un-seeded cell — never returns garbage.
 pub fn mem_get() -> Dynamic {
-  require_cell().mem
+  mem_at(0)
 }
 
-/// Write a new opaque memory value back into this process's cell (for `rt_mem`).
+/// Write a new DEFAULT (index-0) opaque memory value into this process's cell (for `rt_mem`).
 ///
+/// The Phase-4 name, preserved as the index-0 alias of `with_mem_at` for byte-identity (R6).
 /// - `mem`: the updated memory value (rt_mem produces it; rt_state stores it opaquely).
-/// - Returns `Nil`. Fail-closed: `panic`s on an un-seeded cell (the read-modify-write needs
-///   a present cell). The other fields (globals/table) are preserved by reference.
+/// - Returns `Nil`. Fail-closed: `panic`s on an un-seeded cell. Other fields preserved by ref.
 pub fn mem_put(mem: Dynamic) -> Nil {
-  put_cell(InstanceState(..require_cell(), mem: mem))
+  with_mem_at(0, mem)
 }
 
-/// Read the opaque table value out of this process's cell (for `rt_table`).
+/// Read the opaque memory value at index `index` out of this process's cell (R6/R7).
 ///
-/// - Returns the `Dynamic` table value, unchanged. Fail-closed: `panic`s on an un-seeded
-///   cell — never returns garbage.
+/// - `index`: the memory index (0 = the default memory). Out of range is an internal
+///   invariant violation (unreachable post-validation; the multi-memory vector is seeded to
+///   the module's memory count by unit 09) and `panic`s fail-closed — never garbage.
+/// - Returns the `Dynamic` memory value at `index`, unchanged. Fail-closed on an un-seeded
+///   cell. (Keystone stub: the vector currently holds exactly the default memory; 09 seeds N.)
+pub fn mem_at(index: Int) -> Dynamic {
+  nth_or_panic(
+    require_cell().mems,
+    index,
+    "rt_state.mem_at: memory index out of range (internal invariant violation)",
+  )
+}
+
+/// Rebind the memory at index `index` in this process's cell (R6/R7).
+///
+/// - `index`: the memory index (0 = the default memory).
+/// - `handle`: the updated opaque memory value.
+/// - Returns `Nil`. Fail-closed: `panic`s on an un-seeded cell. Only `index` changes; other
+///   memories/fields are preserved by reference. An out-of-range `index` leaves the vector
+///   unchanged (a conservative no-op — 09 grows the vector so every live index exists).
+pub fn with_mem_at(index: Int, handle: Dynamic) -> Nil {
+  let st = require_cell()
+  put_cell(InstanceState(..st, mems: set_nth(st.mems, index, handle)))
+}
+
+/// Read the DEFAULT (index-0 / first) opaque table value out of this process's cell.
+///
+/// The Phase-4 name, preserved as the index-0 alias of `table_at` for byte-identity (R6/R7).
+/// - Returns the `Dynamic` table value, unchanged. Fail-closed on an un-seeded cell.
 pub fn table_get() -> Dynamic {
-  require_cell().table
+  table_at(0)
 }
 
-/// Write a new opaque table value back into this process's cell (for `rt_table`).
+/// Write a new DEFAULT (index-0 / first) opaque table value into this process's cell.
 ///
+/// The Phase-4 name, preserved as the index-0 alias of `with_table_at` for byte-identity.
 /// - `table`: the updated table value (rt_table produces it; rt_state stores it opaquely).
-/// - Returns `Nil`. Fail-closed: `panic`s on an un-seeded cell. The other fields are
-///   preserved by reference.
+/// - Returns `Nil`. Fail-closed on an un-seeded cell. Other fields preserved by reference.
 pub fn table_put(table: Dynamic) -> Nil {
-  put_cell(InstanceState(..require_cell(), table: table))
+  with_table_at(0, table)
+}
+
+/// Read the opaque table value at index `index` out of this process's cell (R7).
+///
+/// - `index`: the table index (0 = the default/first table). `emit_core` resolves each table
+///   name to its compile-time index. Out of range `panic`s fail-closed (internal invariant).
+/// - Returns the `Dynamic` table value at `index`, unchanged. Fail-closed on an un-seeded cell.
+pub fn table_at(index: Int) -> Dynamic {
+  nth_or_panic(
+    require_cell().tables,
+    index,
+    "rt_state.table_at: table index out of range (internal invariant violation)",
+  )
+}
+
+/// Rebind the table at index `index` in this process's cell (R7).
+///
+/// - `index`: the table index (0 = the default/first table).
+/// - `handle`: the updated opaque table value.
+/// - Returns `Nil`. Fail-closed on an un-seeded cell. Only `index` changes; others by ref.
+///   An out-of-range `index` is a conservative no-op (09 seeds every live table index).
+pub fn with_table_at(index: Int, handle: Dynamic) -> Nil {
+  let st = require_cell()
+  put_cell(InstanceState(..st, tables: set_nth(st.tables, index, handle)))
+}
+
+// ── passive-segment drop state (cell family; R2) ──────────────────────────────
+//
+// `rt_state` owns ONLY the drop FLAG (a `Set(Int)`); the segment payload is a compile-time
+// constant `emit_core` passes as an argument to `rt_mem`/`rt_table` (never stored here). Drop
+// is O(1). A dropped segment behaves as length-0, so a later `*.init` with count>0 traps on
+// the source-bounds check — exactly the spec (§4.4.9). These bodies are REAL (simple set ops);
+// what unit 09 adds is seeding the sets to empty at instantiate (already the `build` default).
+
+/// Has passive data segment `seg` been dropped? (`data.drop` / `memory.init` guard, R2.)
+/// - Returns `True` iff `seg ∈ dropped_data`. Fail-closed on an un-seeded cell.
+pub fn data_dropped(seg: Int) -> Bool {
+  set.contains(require_cell().dropped_data, seg)
+}
+
+/// Mark passive data segment `seg` dropped (`data.drop`, R2). Idempotent.
+/// - Returns `Nil`. Fail-closed on an un-seeded cell. Other fields preserved by reference.
+pub fn drop_data(seg: Int) -> Nil {
+  let st = require_cell()
+  put_cell(InstanceState(..st, dropped_data: set.insert(st.dropped_data, seg)))
+}
+
+/// Has passive element segment `seg` been dropped? (`elem.drop` / `table.init` guard, R2.)
+/// - Returns `True` iff `seg ∈ dropped_elem`. Fail-closed on an un-seeded cell.
+pub fn elem_dropped(seg: Int) -> Bool {
+  set.contains(require_cell().dropped_elem, seg)
+}
+
+/// Mark passive element segment `seg` dropped (`elem.drop`, R2). Idempotent.
+/// - Returns `Nil`. Fail-closed on an un-seeded cell. Other fields preserved by reference.
+pub fn drop_elem(seg: Int) -> Nil {
+  let st = require_cell()
+  put_cell(InstanceState(..st, dropped_elem: set.insert(st.dropped_elem, seg)))
+}
+
+// ── reference globals (cell family; R8) ───────────────────────────────────────
+//
+// A reference-typed global holds a `Dynamic` (funcref/externref), not an `Int`, so it lives in
+// a PARALLEL map, leaving the raw-bit numeric `globals` (D5) untouched and byte-identical.
+
+/// Read reference global `name`'s current value from this process's cell (R8).
+/// - Returns the reference `Dynamic`. Fail-closed: `panic`s on an un-seeded cell OR an
+///   undeclared `name` (both unreachable post-validation) — never fabricates a value.
+pub fn ref_global_get(name: String) -> Dynamic {
+  case dict.get(require_cell().ref_globals, name) {
+    Ok(value) -> value
+    Error(Nil) ->
+      panic as "rt_state.ref_global_get: undeclared reference global (internal invariant violation)"
+  }
+}
+
+/// Write reference global `name` in this process's cell (R8).
+/// - `value`: the new reference `Dynamic`. Returns `Nil`. Fail-closed on an un-seeded cell.
+///   Only `name` changes; other globals and fields are preserved by reference.
+pub fn ref_global_set(name: String, value: Dynamic) -> Nil {
+  let st = require_cell()
+  put_cell(
+    InstanceState(..st, ref_globals: dict.insert(st.ref_globals, name, value)),
+  )
 }
 
 /// Read mutable global `name`'s current raw bit pattern from this process's cell.
@@ -259,46 +408,120 @@ pub fn t_global_set(
   InstanceState(..st, globals: dict.insert(st.globals, name, value))
 }
 
-/// Project the opaque memory value out of the threaded record (the field seam `rt_mem`'s
-/// tier-P wrappers, unit 04, project → drive the pure core → re-inject). READ-ONLY.
+/// Project the DEFAULT (index-0) opaque memory value out of the threaded record. READ-ONLY.
 ///
-/// - `st`: the threaded instance-state record.
-/// - Returns the `mem` field unchanged — a `Dynamic` `rt_state` never inspects (`rt_mem` owns
-///   its shape). Total; never raises.
+/// The Phase-4 name, preserved as the index-0 alias of `t_mem_at` for byte-identity (R6).
+/// - Returns the default `mem` unchanged — a `Dynamic` `rt_state` never inspects. Total.
 pub fn mem(st: InstanceState) -> Dynamic {
-  st.mem
+  t_mem_at(st, 0)
 }
 
-/// Rebind the memory field, RETURNING the updated record (for `rt_mem`'s `t_store`/`t_grow`/
-/// `t_init_data`, which inject a new opaque `mem` after driving the pure core).
+/// Rebind the DEFAULT (index-0) memory field, RETURNING the updated record.
 ///
-/// - `st`: the threaded instance-state record.
-/// - `mem`: the new opaque memory value (`rt_mem` produces it; `rt_state` stores it as-is).
-/// - Returns a NEW `InstanceState` sharing `globals`/`table` by reference — NOT a copy. Total;
-///   never raises; touches NO process dictionary.
+/// The Phase-4 name, preserved as the index-0 alias of `t_with_mem_at` for byte-identity.
+/// - `mem`: the new opaque memory value. Returns a NEW `InstanceState`. Total; never raises.
 pub fn with_mem(st: InstanceState, mem: Dynamic) -> InstanceState {
-  InstanceState(..st, mem: mem)
+  t_with_mem_at(st, 0, mem)
 }
 
-/// Project the opaque table value out of the threaded record (the field seam `rt_table`'s
-/// tier-P wrappers, unit 06, project). READ-ONLY.
-///
-/// - `st`: the threaded instance-state record.
-/// - Returns the `table` field unchanged — a `Dynamic` `rt_state` never inspects (`rt_table`
-///   owns its shape). Total; never raises.
+/// Project the opaque memory value at index `index` out of the threaded record (R6/R7).
+/// READ-ONLY. Fail-closed `panic` on an out-of-range index (internal invariant violation).
+pub fn t_mem_at(st: InstanceState, index: Int) -> Dynamic {
+  nth_or_panic(
+    st.mems,
+    index,
+    "rt_state.t_mem_at: memory index out of range (internal invariant violation)",
+  )
+}
+
+/// Rebind the memory at index `index` in the threaded record, RETURNING the updated record
+/// (R6/R7). Only `index` changes; other memories/fields are shared by reference. An
+/// out-of-range `index` is a conservative no-op (09 seeds every live memory index).
+pub fn t_with_mem_at(
+  st: InstanceState,
+  index: Int,
+  handle: Dynamic,
+) -> InstanceState {
+  InstanceState(..st, mems: set_nth(st.mems, index, handle))
+}
+
+/// Project the DEFAULT (index-0 / first) opaque table value out of the threaded record.
+/// READ-ONLY. The Phase-4 name, preserved as the index-0 alias of `t_table_at` (R6/R7).
 pub fn table(st: InstanceState) -> Dynamic {
-  st.table
+  t_table_at(st, 0)
 }
 
-/// Rebind the table field, RETURNING the updated record (for `rt_table`'s `t_init_elem`/
-/// `t_call_indirect`, which inject a new opaque `table`).
-///
-/// - `st`: the threaded instance-state record.
-/// - `table`: the new opaque table value (`rt_table` produces it; `rt_state` stores it as-is).
-/// - Returns a NEW `InstanceState` sharing `mem`/`globals` by reference — NOT a copy. Total;
-///   never raises; touches NO process dictionary.
+/// Rebind the DEFAULT (index-0 / first) table field, RETURNING the updated record.
+/// The Phase-4 name, preserved as the index-0 alias of `t_with_table_at` for byte-identity.
 pub fn with_table(st: InstanceState, table: Dynamic) -> InstanceState {
-  InstanceState(..st, table: table)
+  t_with_table_at(st, 0, table)
+}
+
+/// Project the opaque table value at index `index` out of the threaded record (R7). READ-ONLY.
+/// Fail-closed `panic` on an out-of-range index (internal invariant violation).
+pub fn t_table_at(st: InstanceState, index: Int) -> Dynamic {
+  nth_or_panic(
+    st.tables,
+    index,
+    "rt_state.t_table_at: table index out of range (internal invariant violation)",
+  )
+}
+
+/// Rebind the table at index `index` in the threaded record, RETURNING the updated record
+/// (R7). Only `index` changes; other tables/fields are shared by reference. An out-of-range
+/// `index` is a conservative no-op (09 seeds every live table index).
+pub fn t_with_table_at(
+  st: InstanceState,
+  index: Int,
+  handle: Dynamic,
+) -> InstanceState {
+  InstanceState(..st, tables: set_nth(st.tables, index, handle))
+}
+
+// ── passive-segment drop state (threaded twins; R2) ───────────────────────────
+
+/// Has passive data segment `seg` been dropped in the threaded record? READ-ONLY (R2).
+pub fn t_data_dropped(st: InstanceState, seg: Int) -> Bool {
+  set.contains(st.dropped_data, seg)
+}
+
+/// Mark passive data segment `seg` dropped in the threaded record, RETURNING it (R2).
+/// Idempotent; other fields shared by reference.
+pub fn t_drop_data(st: InstanceState, seg: Int) -> InstanceState {
+  InstanceState(..st, dropped_data: set.insert(st.dropped_data, seg))
+}
+
+/// Has passive element segment `seg` been dropped in the threaded record? READ-ONLY (R2).
+pub fn t_elem_dropped(st: InstanceState, seg: Int) -> Bool {
+  set.contains(st.dropped_elem, seg)
+}
+
+/// Mark passive element segment `seg` dropped in the threaded record, RETURNING it (R2).
+/// Idempotent; other fields shared by reference.
+pub fn t_drop_elem(st: InstanceState, seg: Int) -> InstanceState {
+  InstanceState(..st, dropped_elem: set.insert(st.dropped_elem, seg))
+}
+
+// ── reference globals (threaded twins; R8) ────────────────────────────────────
+
+/// Read reference global `name`'s value from the threaded record (R8). READ-ONLY.
+/// Fail-closed `panic` on an undeclared `name` (unreachable post-validation).
+pub fn t_ref_global_get(st: InstanceState, name: String) -> Dynamic {
+  case dict.get(st.ref_globals, name) {
+    Ok(value) -> value
+    Error(Nil) ->
+      panic as "rt_state.t_ref_global_get: undeclared reference global (internal invariant violation)"
+  }
+}
+
+/// Rebind reference global `name` in the threaded record, RETURNING it (R8).
+/// Only `name` changes; other globals/fields shared by reference.
+pub fn t_ref_global_set(
+  st: InstanceState,
+  name: String,
+  value: Dynamic,
+) -> InstanceState {
+  InstanceState(..st, ref_globals: dict.insert(st.ref_globals, name, value))
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────
@@ -311,10 +534,38 @@ pub fn with_table(st: InstanceState, table: Dynamic) -> InstanceState {
 /// the caller's — only `seed` does it). (Private: the shared materialisation seam.)
 fn build(decl: StateDecl) -> InstanceState {
   InstanceState(
-    mem: decl.mem,
+    // Keystone stub (R5): the single `decl.mem`/`decl.table` become one-element index-keyed
+    // vectors (index 0 = the default memory/table), byte-identical to Phase-4 at index 0.
+    // Unit 09 replaces this with N-memory / N-table / imported-state / reference-global seeding.
+    mems: [decl.mem],
     globals: dict.from_list(decl.globals),
-    table: decl.table,
+    tables: [decl.table],
+    dropped_data: set.new(),
+    dropped_elem: set.new(),
+    ref_globals: dict.new(),
   )
+}
+
+/// Read the `index`-th element of `xs`, or `panic` with `msg` if out of range. The fail-closed
+/// projection every index accessor goes through — an out-of-range index is an internal
+/// invariant violation (the vector is seeded to the live region count), never a normal path.
+fn nth_or_panic(xs: List(a), index: Int, msg: String) -> a {
+  case list.drop(xs, index) {
+    [x, ..] -> x
+    [] -> panic as msg
+  }
+}
+
+/// Return `xs` with its `index`-th element replaced by `value`. An out-of-range `index` leaves
+/// `xs` unchanged (a conservative no-op — the keystone vector holds only index 0; unit 09 grows
+/// it so every live index exists). Total; never raises.
+fn set_nth(xs: List(a), index: Int, value: a) -> List(a) {
+  list.index_map(xs, fn(x, i) {
+    case i == index {
+      True -> value
+      False -> x
+    }
+  })
 }
 
 /// Install `state` as this process's cell under the fixed key. The superseded record (if

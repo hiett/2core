@@ -140,7 +140,7 @@ fn mixed_module() -> ir.Module {
   ir.Module(
     name: "twocore@test@sink",
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [kitchen_sink],
@@ -192,7 +192,7 @@ fn stateful_module() -> ir.Module {
       locals: [],
       body: ir.Let(
         [],
-        ir.MemStore(ir.MemAccess(4, False), ir.Var("p0"), ir.Var("p0"), 0),
+        ir.MemStore(0, ir.MemAccess(4, False), ir.Var("p0"), ir.Var("p0"), 0),
         ir.Let(
           ["g"],
           ir.GlobalGet("g0"),
@@ -201,13 +201,13 @@ fn stateful_module() -> ir.Module {
             ir.GlobalSet("g0", ir.Var("g")),
             ir.Let(
               ["ld"],
-              ir.MemLoad(ir.MemAccess(4, False), ir.Var("p0"), 0, ir.TI32),
+              ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("p0"), 0, ir.TI32),
               ir.Let(
                 ["sz"],
-                ir.MemSize,
+                ir.MemSize(0),
                 ir.Let(
                   ["gr"],
-                  ir.MemGrow(ir.Var("sz")),
+                  ir.MemGrow(0, ir.Var("sz")),
                   ir.CallIndirect(
                     "t0",
                     ir.Var("ld"),
@@ -224,15 +224,21 @@ fn stateful_module() -> ir.Module {
   ir.Module(
     name: "twocore@test@stateful",
     uses_numerics: True,
-    memory: option.Some(ir.MemoryDecl(1, option.None)),
+    memories: [ir.MemoryDecl(1, option.None, ir.Idx32)],
     globals: [ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(0)]))],
     imports: [],
     functions: [target, f],
     exports: [ir.ExportFn("f", "f")],
-    data_segments: [ir.DataSegment(ir.Values([ir.ConstI32(0)]), <<9, 9>>)],
-    tables: [ir.TableDecl("t0", 4, option.None)],
+    data_segments: [
+      ir.DataSegment(ir.DataActive(0, ir.Values([ir.ConstI32(0)])), <<9, 9>>),
+    ],
+    tables: [ir.TableDecl("t0", ir.FuncRef, 4, option.None)],
     elements: [
-      ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["target"]),
+      ir.ElementSegment(
+        ir.ElemActive("t0", ir.Values([ir.ConstI32(0)])),
+        ir.FuncRef,
+        [ir.RefFunc("target")],
+      ),
     ],
     start: option.None,
   )

@@ -46,7 +46,7 @@ fn module(name: String, functions: List(ir.Function)) -> ir.Module {
   ir.Module(
     name: "twocore@e2e@" <> name,
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: functions,
@@ -396,7 +396,10 @@ fn full(
   ir.Module(
     name: "twocore@e2e@" <> name,
     uses_numerics: True,
-    memory: memory,
+    memories: case memory {
+      option.Some(m) -> [m]
+      option.None -> []
+    },
     globals: globals,
     imports: [],
     functions: functions,
@@ -422,7 +425,13 @@ fn store_fn(name: String, bytes: Int) -> ir.Function {
     locals: [],
     body: ir.Let(
       [],
-      ir.MemStore(ir.MemAccess(bytes, False), ir.Var("addr"), ir.Var("val"), 0),
+      ir.MemStore(
+        0,
+        ir.MemAccess(bytes, False),
+        ir.Var("addr"),
+        ir.Var("val"),
+        0,
+      ),
       ir.Values([]),
     ),
   )
@@ -439,7 +448,7 @@ fn load_fn(
     params: [ir.Local("addr", ir.TI32)],
     result: [result],
     locals: [],
-    body: ir.MemLoad(ir.MemAccess(bytes, signed), ir.Var("addr"), 0, result),
+    body: ir.MemLoad(0, ir.MemAccess(bytes, signed), ir.Var("addr"), 0, result),
   )
 }
 
@@ -451,7 +460,7 @@ pub fn memory_store_load_roundtrip_e2e_test() {
   let mod =
     load(full(
       "mem",
-      option.Some(ir.MemoryDecl(1, option.None)),
+      option.Some(ir.MemoryDecl(1, option.None, ir.Idx32)),
       [],
       [
         store_fn("store32", 4),
@@ -481,7 +490,7 @@ pub fn memory_oob_load_traps_e2e_test() {
   let mod =
     load(full(
       "memoob",
-      option.Some(ir.MemoryDecl(1, option.None)),
+      option.Some(ir.MemoryDecl(1, option.None, ir.Idx32)),
       [],
       [load_fn("load32", 4, False, ir.TI32)],
       [],
@@ -501,7 +510,7 @@ pub fn memory_grow_e2e_test() {
   let mod =
     load(full(
       "memgrow",
-      option.Some(ir.MemoryDecl(1, option.Some(3))),
+      option.Some(ir.MemoryDecl(1, option.Some(3), ir.Idx32)),
       [],
       [
         ir.Function(
@@ -509,9 +518,9 @@ pub fn memory_grow_e2e_test() {
           [ir.Local("d", ir.TI32)],
           [ir.TI32],
           [],
-          ir.MemGrow(ir.Var("d")),
+          ir.MemGrow(0, ir.Var("d")),
         ),
-        ir.Function("size", [], [ir.TI32], [], ir.MemSize),
+        ir.Function("size", [], [ir.TI32], [], ir.MemSize(0)),
         load_fn("load32", 4, False, ir.TI32),
       ],
       [],
@@ -600,8 +609,14 @@ pub fn call_indirect_e2e_test() {
       option.None,
       [],
       [inc, callfn, callwrong],
-      [ir.TableDecl("t0", 4, option.None)],
-      [ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["inc"])],
+      [ir.TableDecl("t0", ir.FuncRef, 4, option.None)],
+      [
+        ir.ElementSegment(
+          ir.ElemActive("t0", ir.Values([ir.ConstI32(0)])),
+          ir.FuncRef,
+          [ir.RefFunc("inc")],
+        ),
+      ],
       [],
       option.None,
     ))
@@ -703,12 +718,18 @@ pub fn oob_data_segment_traps_at_instantiation_e2e_test() {
   let mod =
     load(full(
       "dataoob",
-      option.Some(ir.MemoryDecl(1, option.None)),
+      option.Some(ir.MemoryDecl(1, option.None, ir.Idx32)),
       [],
       [],
       [],
       [],
-      [ir.DataSegment(ir.Values([ir.ConstI32(65_535)]), <<1, 2, 3>>)],
+      [
+        ir.DataSegment(ir.DataActive(0, ir.Values([ir.ConstI32(65_535)])), <<
+          1,
+          2,
+          3,
+        >>),
+      ],
       option.None,
     ))
   let assert Error(reason) = catch_apply(mod, atom.create("instantiate"), [])
@@ -734,12 +755,16 @@ pub fn oob_element_segment_traps_at_instantiation_e2e_test() {
       option.None,
       [],
       [target],
-      [ir.TableDecl("t0", 2, option.None)],
+      [ir.TableDecl("t0", ir.FuncRef, 2, option.None)],
       [
-        ir.ElementSegment("t0", ir.Values([ir.ConstI32(1)]), [
-          "target",
-          "target",
-        ]),
+        ir.ElementSegment(
+          ir.ElemActive("t0", ir.Values([ir.ConstI32(1)])),
+          ir.FuncRef,
+          [
+            ir.RefFunc("target"),
+            ir.RefFunc("target"),
+          ],
+        ),
       ],
       [],
       option.None,
@@ -811,7 +836,7 @@ pub fn threaded_memory_store_load_roundtrip_e2e_test() {
   let m =
     full(
       "threadedmem",
-      option.Some(ir.MemoryDecl(1, option.None)),
+      option.Some(ir.MemoryDecl(1, option.None, ir.Idx32)),
       [],
       [
         store_fn("store32", 4),
@@ -851,7 +876,7 @@ pub fn threaded_memory_grow_e2e_test() {
   let m =
     full(
       "threadedgrow",
-      option.Some(ir.MemoryDecl(1, option.Some(3))),
+      option.Some(ir.MemoryDecl(1, option.Some(3), ir.Idx32)),
       [],
       [
         ir.Function(
@@ -859,9 +884,9 @@ pub fn threaded_memory_grow_e2e_test() {
           [ir.Local("d", ir.TI32)],
           [ir.TI32],
           [],
-          ir.MemGrow(ir.Var("d")),
+          ir.MemGrow(0, ir.Var("d")),
         ),
-        ir.Function("size", [], [ir.TI32], [], ir.MemSize),
+        ir.Function("size", [], [ir.TI32], [], ir.MemSize(0)),
         load_fn("load32", 4, False, ir.TI32),
       ],
       [],
@@ -977,8 +1002,14 @@ pub fn threaded_call_indirect_e2e_test() {
       option.None,
       [],
       [inc, callfn, callwrong],
-      [ir.TableDecl("t0", 4, option.None)],
-      [ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["inc"])],
+      [ir.TableDecl("t0", ir.FuncRef, 4, option.None)],
+      [
+        ir.ElementSegment(
+          ir.ElemActive("t0", ir.Values([ir.ConstI32(0)])),
+          ir.FuncRef,
+          [ir.RefFunc("inc")],
+        ),
+      ],
       [],
       option.None,
     )
@@ -1005,12 +1036,18 @@ pub fn threaded_oob_data_segment_traps_at_instantiation_e2e_test() {
   let m =
     full(
       "threadeddataoob",
-      option.Some(ir.MemoryDecl(1, option.None)),
+      option.Some(ir.MemoryDecl(1, option.None, ir.Idx32)),
       [],
       [],
       [],
       [],
-      [ir.DataSegment(ir.Values([ir.ConstI32(65_535)]), <<1, 2, 3>>)],
+      [
+        ir.DataSegment(ir.DataActive(0, ir.Values([ir.ConstI32(65_535)])), <<
+          1,
+          2,
+          3,
+        >>),
+      ],
       option.None,
     )
   let mod = load_threaded(m)
@@ -1035,12 +1072,16 @@ pub fn threaded_oob_element_segment_traps_at_instantiation_e2e_test() {
       option.None,
       [],
       [target],
-      [ir.TableDecl("t0", 2, option.None)],
+      [ir.TableDecl("t0", ir.FuncRef, 2, option.None)],
       [
-        ir.ElementSegment("t0", ir.Values([ir.ConstI32(1)]), [
-          "target",
-          "target",
-        ]),
+        ir.ElementSegment(
+          ir.ElemActive("t0", ir.Values([ir.ConstI32(1)])),
+          ir.FuncRef,
+          [
+            ir.RefFunc("target"),
+            ir.RefFunc("target"),
+          ],
+        ),
       ],
       [],
       option.None,

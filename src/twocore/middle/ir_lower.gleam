@@ -172,15 +172,17 @@ fn lower_expr(
   imports: Set(#(String, String)),
 ) -> Result(Expr, LowerError) {
   case expr {
-    // leaves / pure ops — nothing to gate or meter
+    // leaves — nothing to gate or meter (no CallHost, no Loop, no sub-Expr). The Phase-5
+    // reference/table/bulk nodes join here: they carry only `Value` operands, so `ir_lower`
+    // (a CallHost-gate + Loop-meter pass) leaves them unchanged.
     ir.Values(_)
     | ir.Num(_, _)
     | ir.Convert(_, _)
     | ir.TermOp(_, _)
-    | ir.MemSize
-    | ir.MemGrow(_)
-    | ir.MemLoad(_, _, _, _)
-    | ir.MemStore(_, _, _, _)
+    | ir.MemSize(_)
+    | ir.MemGrow(_, _)
+    | ir.MemLoad(_, _, _, _, _)
+    | ir.MemStore(_, _, _, _, _)
     | ir.GlobalGet(_)
     | ir.GlobalSet(_, _)
     | ir.CallDirect(_, _)
@@ -188,7 +190,21 @@ fn lower_expr(
     | ir.Break(_, _)
     | ir.Continue(_, _)
     | ir.Return(_)
-    | ir.Trap(_) -> Ok(expr)
+    | ir.Trap(_)
+    | ir.RefFunc(_)
+    | ir.RefIsNull(_)
+    | ir.TableGet(_, _)
+    | ir.TableSet(_, _, _)
+    | ir.TableSize(_)
+    | ir.TableGrow(_, _, _)
+    | ir.TableFill(_, _, _, _)
+    | ir.TableInit(_, _, _, _, _)
+    | ir.TableCopy(_, _, _, _, _)
+    | ir.ElemDrop(_)
+    | ir.MemFill(_, _, _, _)
+    | ir.MemCopy(_, _, _, _, _)
+    | ir.MemInit(_, _, _, _, _)
+    | ir.DataDrop(_) -> Ok(expr)
 
     // THE capability boundary — gate it; the node is left unchanged for `emit_core` to route
     ir.CallHost(cap, name, args) ->
@@ -358,6 +374,10 @@ fn import_set(module: Module) -> Set(#(String, String)) {
   list.fold(module.imports, set.new(), fn(acc, imp) {
     case imp {
       ir.ImportFn(capability, name, _ty) -> set.insert(acc, #(capability, name))
+      // Non-function imports (H4) are PROVIDED STATE, not capabilities — they are wired into
+      // the instance by the instantiation contract (unit 09), never reached via `CallHost`, so
+      // they contribute nothing to the host-capability set.
+      ir.ImportGlobal(..) | ir.ImportTable(..) | ir.ImportMemory(..) -> acc
     }
   })
 }

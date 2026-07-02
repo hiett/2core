@@ -23,7 +23,7 @@ fn mod_with_body(body: ir.Expr) -> ir.Module {
   ir.Module(
     name: "twocore@opt@baseline_test",
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [
@@ -358,7 +358,7 @@ pub fn effectful_dead_let_is_retained_test() {
   let store =
     ir.Let(
       ["d"],
-      ir.MemStore(ir.MemAccess(4, False), ir.ConstI32(0), ir.ConstI32(1), 0),
+      ir.MemStore(0, ir.MemAccess(4, False), ir.ConstI32(0), ir.ConstI32(1), 0),
       ir.Values([ir.ConstI32(9)]),
     )
   assert opt_body(store) == store

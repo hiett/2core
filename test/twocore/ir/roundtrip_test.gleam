@@ -56,7 +56,7 @@ fn add_module() -> ir.Module {
   ir.Module(
     name: "add",
     uses_numerics: True,
-    memory: None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [
@@ -85,7 +85,7 @@ fn sum_to_module() -> ir.Module {
   ir.Module(
     name: "loop",
     uses_numerics: True,
-    memory: None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [
@@ -135,7 +135,7 @@ fn fib_module() -> ir.Module {
   ir.Module(
     name: "fib",
     uses_numerics: True,
-    memory: None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [
@@ -207,7 +207,7 @@ fn expr_module(name: String, body: ir.Expr) -> ir.Module {
   ir.Module(
     name: name,
     uses_numerics: True,
-    memory: None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [
@@ -390,12 +390,12 @@ fn expr_corpus() -> List(ir.Expr) {
     // memory: size/grow (Phase-2), a plain i32.load and a sign-extending i64.load8_s
     // (distinct result widths prove the new `result` field round-trips and discriminates
     // i32.load8_s vs i64.load8_s — same bytes+sign, different result type).
-    ir.MemSize,
-    ir.MemGrow(ir.ConstI32(1)),
-    ir.MemGrow(ir.Var("delta")),
-    ir.MemLoad(ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32),
-    ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 8, ir.TI64),
-    ir.MemStore(ir.MemAccess(8, False), ir.Var("a"), ir.Var("v"), 16),
+    ir.MemSize(0),
+    ir.MemGrow(0, ir.ConstI32(1)),
+    ir.MemGrow(0, ir.Var("delta")),
+    ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32),
+    ir.MemLoad(0, ir.MemAccess(1, True), ir.Var("a"), 8, ir.TI64),
+    ir.MemStore(0, ir.MemAccess(8, False), ir.Var("a"), ir.Var("v"), 16),
     // globals
     ir.GlobalGet("g"),
     ir.GlobalSet("g", ir.ConstI32(5)),
@@ -468,7 +468,7 @@ fn kitchen_sink_module() -> ir.Module {
   ir.Module(
     name: "twocore@wasm@sink",
     uses_numerics: True,
-    memory: Some(ir.MemoryDecl(1, Some(4))),
+    memories: [ir.MemoryDecl(1, Some(4), ir.Idx32)],
     globals: [
       ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(0)])),
       ir.GlobalDecl(
@@ -497,14 +497,14 @@ fn kitchen_sink_module() -> ir.Module {
     ],
     exports: [ir.ExportFn("main", "f0"), ir.ExportFn("aux", "f1")],
     data_segments: [
-      ir.DataSegment(ir.Values([ir.ConstI32(0)]), <<
+      ir.DataSegment(ir.DataActive(0, ir.Values([ir.ConstI32(0)])), <<
         0xde,
         0xad,
         0xbe,
         0xef,
         0x00,
       >>),
-      ir.DataSegment(ir.Values([ir.ConstI32(16)]), <<>>),
+      ir.DataSegment(ir.DataActive(0, ir.Values([ir.ConstI32(16)])), <<>>),
     ],
     tables: [],
     elements: [],
@@ -521,7 +521,7 @@ fn mem_table_module() -> ir.Module {
   ir.Module(
     name: "mem_table",
     uses_numerics: True,
-    memory: Some(ir.MemoryDecl(1, Some(4))),
+    memories: [ir.MemoryDecl(1, Some(4), ir.Idx32)],
     globals: [],
     imports: [],
     functions: [
@@ -538,7 +538,7 @@ fn mem_table_module() -> ir.Module {
             ir.Convert(ir.TruncS(ir.FW64, ir.W32), ir.Var("x")),
             ir.Let(
               ["hi"],
-              ir.MemLoad(ir.MemAccess(1, True), ir.Var("n"), 8, ir.TI64),
+              ir.MemLoad(0, ir.MemAccess(1, True), ir.Var("n"), 8, ir.TI64),
               ir.Return([ir.Var("lt")]),
             ),
           ),
@@ -551,16 +551,20 @@ fn mem_table_module() -> ir.Module {
         locals: [],
         body: ir.Let(
           ["sz"],
-          ir.MemSize,
-          ir.Let(["prev"], ir.MemGrow(ir.ConstI32(1)), ir.Return([])),
+          ir.MemSize(0),
+          ir.Let(["prev"], ir.MemGrow(0, ir.ConstI32(1)), ir.Return([])),
         ),
       ),
     ],
     exports: [],
     data_segments: [],
-    tables: [ir.TableDecl("t0", 2, Some(8))],
+    tables: [ir.TableDecl("t0", ir.FuncRef, 2, Some(8))],
     elements: [
-      ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["worker", "setup"]),
+      ir.ElementSegment(
+        ir.ElemActive("t0", ir.Values([ir.ConstI32(0)])),
+        ir.FuncRef,
+        [ir.RefFunc("worker"), ir.RefFunc("setup")],
+      ),
     ],
     start: Some("setup"),
   )
@@ -608,12 +612,12 @@ pub fn mem_load_result_type_discrimination_test() {
   let m_i32 =
     expr_module(
       "ld",
-      ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI32),
+      ir.MemLoad(0, ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI32),
     )
   let m_i64 =
     expr_module(
       "ld",
-      ir.MemLoad(ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI64),
+      ir.MemLoad(0, ir.MemAccess(1, True), ir.Var("a"), 0, ir.TI64),
     )
   assert module_equal(m_i32, m_i64) == False
   check_roundtrip(m_i32)
@@ -631,7 +635,7 @@ pub fn empty_module_roundtrip_test() {
     ir.Module(
       name: "empty",
       uses_numerics: False,
-      memory: None,
+      memories: [],
       globals: [],
       imports: [],
       functions: [],

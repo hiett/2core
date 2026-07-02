@@ -274,16 +274,16 @@ Phase 7; memory64's runtime → Phase 6 (R12 — the IR axis stays, decode/valid
 
 | Milestone | Produced by | Status | Unblocks |
 |---|---|---|---|
-| `«IR3-FROZEN»` — `ir.gleam` reftype `ValType`s + `ConstNull`/`RefFunc`/`RefIsNull` + table/bulk `Expr` nodes + `Module.memories`/mem-index + `IdxType` + import/export state variants + `TableDecl.ref_ty` + passive/droppable segment model + `.ir` grammar delta; **`runtime/rt_ref.gleam`** (forge-proof ref values, R1) | P5-01 | **unclaimed** | 02, 05, 06, 07, 09, 10 |
-| `«RT3-SIG-FROZEN»` — extended `rt_state` (record + stub accessors, R5) / `rt_mem` / `rt_table` signatures (todo-free) + the `rt_ref` helpers | P5-01 | **unclaimed** | 06, 07, 08, 09 |
-| `«INSTANTIATE3»` — `instantiate/0 | instantiate/1(List(Provided))` + `link_imports` fail-closed contract (R4) + the `spectest` provider (R14) | P5-01 (sig) / P5-09 (impl) | **unclaimed** | 06, 09, 11 |
+| `«IR3-FROZEN»` — `ir.gleam` reftype `ValType`s + `ConstNull`/`RefFunc`/`RefIsNull` + table/bulk `Expr` nodes + `Module.memories`/mem-index + `IdxType` + import/export state variants + `TableDecl.ref_ty` + passive/droppable segment model + `.ir` grammar delta; **`runtime/rt_ref.gleam`** (forge-proof ref values, R1) | P5-01 | **FROZEN ✓** | 02, 05, 06, 07, 09, 10 |
+| `«RT3-SIG-FROZEN»` — extended `rt_state` (record + stub accessors, R5) / `rt_mem` / `rt_table` signatures (todo-free) + the `rt_ref` helpers | P5-01 | **FROZEN ✓** (rt_state record + index/drop/ref accessors + `rt_ref` landed; rt_mem/rt_table bulk/ref heads doc-frozen §G for 07/08) | 06, 07, 08, 09 |
+| `«INSTANTIATE3»` — `instantiate/0 | instantiate/1(List(Provided))` + `link_imports` fail-closed contract (R4) + the `spectest` provider (R14) | P5-01 (sig) / P5-09 (impl) | **sig FROZEN ✓** (IR `ImportGlobal/Table/Memory` + `ExportGlobal/Table/Memory` + arity-0/1 rule frozen; `Provided`/`link.gleam`/`spectest` → P5-09 per R4) | 06, 09, 11 |
 | `«WASM-AST3»` — extended `frontend/wasm/ast.gleam` (reftypes, ref/table/bulk instrs, memarg memidx, `IdxType`, segment modes, non-function imports/exports, datacount) | P5-03 (day 1) | **unclaimed** | 04, 05, 10 |
 
 ### Phase-5 units (specs authored + critiqued + reconciled; implementation `unclaimed`)
 
 | Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
 |---|---|---|---|---|
-| **P5-01** Interface freeze (keystone) | [`01`](phase-5/01-interface-freeze.md) | **unclaimed** | — | IR3 + `rt_ref` + rt_state record/stubs + RT3 sigs + the instantiate arity rule frozen; lands green, byte-identical defaults. |
+| **P5-01** Interface freeze (keystone) | [`01`](phase-5/01-interface-freeze.md) | **done** | — | IR3 (`ir.gleam`: reftypes/`ConstNull`/ref+table+bulk `Expr` nodes/`Module.memories`+mem-index/`IdxType`/`TableDecl.ref_ty`/`Elem`+`DataMode`/import+export state variants; `TrapReason` reused) + **`runtime/rt_ref.gleam`** (forge-proof R1) + `rt_state` grown record (memories/tables vectors, drop-state sets, `ref_globals`) with todo-free index/drop/ref accessors + Phase-4 index-0 aliases (R5–R8) + `effect.gleam` barrier classification + minimal compile-satisfying arms in printer/parser/emit_core/lower/ir_lower/ir_opt. **Lands GREEN, byte-identical: 912 tests pass (906 + 6 new `ir3_freeze_test`), 0 warnings, format clean, conformance 15747/411/0.** |
 | **P5-02** `.ir` printer/parser ext | [`02`](phase-5/02-ir-textual-form.md) | **unclaimed** | `«IR3»` | Round-trips the new IR3 surface; grammar delta reconciled. |
 | **P5-03** decode ext (+ `«WASM-AST3»`) | [`03`](phase-5/03-decode.md) | **unclaimed** | — | Decodes the full Phase-5 binary surface; owns the datacount wellformedness check (R13); publishes `«WASM-AST3»`. |
 | **P5-04** validate ext | [`04`](phase-5/04-validate.md) | **unclaimed** | `«WASM-AST3»` | Types reftypes/bulk/multi-mem/memory64/select_t/segments/imports; fail-closed. |

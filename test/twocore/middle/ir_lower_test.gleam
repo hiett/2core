@@ -25,7 +25,7 @@ fn module_with(
   ir.Module(
     name: "twocore@test@m",
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: imports,
     functions: fns,

@@ -797,12 +797,75 @@ fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
     ir.Num(op, args) -> ir.Num(op, subst_values(args, subs))
     ir.Convert(op, arg) -> ir.Convert(op, subst_value(arg, subs))
     ir.TermOp(op, args) -> ir.TermOp(op, subst_values(args, subs))
-    ir.MemSize -> e
-    ir.MemGrow(delta) -> ir.MemGrow(subst_value(delta, subs))
-    ir.MemLoad(op, addr, offset, result) ->
-      ir.MemLoad(op, subst_value(addr, subs), offset, result)
-    ir.MemStore(op, addr, value, offset) ->
-      ir.MemStore(op, subst_value(addr, subs), subst_value(value, subs), offset)
+    ir.MemSize(_) -> e
+    ir.MemGrow(mem, delta) -> ir.MemGrow(mem, subst_value(delta, subs))
+    ir.MemLoad(mem, op, addr, offset, result) ->
+      ir.MemLoad(mem, op, subst_value(addr, subs), offset, result)
+    ir.MemStore(mem, op, addr, value, offset) ->
+      ir.MemStore(
+        mem,
+        op,
+        subst_value(addr, subs),
+        subst_value(value, subs),
+        offset,
+      )
+    // ── Phase-5 reference/table/bulk nodes: substitute into their `Value` operands. ──
+    ir.RefFunc(_) -> e
+    ir.RefIsNull(arg) -> ir.RefIsNull(subst_value(arg, subs))
+    ir.TableGet(table, index) -> ir.TableGet(table, subst_value(index, subs))
+    ir.TableSet(table, index, value) ->
+      ir.TableSet(table, subst_value(index, subs), subst_value(value, subs))
+    ir.TableSize(_) -> e
+    ir.TableGrow(table, delta, init) ->
+      ir.TableGrow(table, subst_value(delta, subs), subst_value(init, subs))
+    ir.TableFill(table, offset, value, count) ->
+      ir.TableFill(
+        table,
+        subst_value(offset, subs),
+        subst_value(value, subs),
+        subst_value(count, subs),
+      )
+    ir.TableInit(table, seg, dst, src, count) ->
+      ir.TableInit(
+        table,
+        seg,
+        subst_value(dst, subs),
+        subst_value(src, subs),
+        subst_value(count, subs),
+      )
+    ir.TableCopy(dst_table, src_table, dst, src, count) ->
+      ir.TableCopy(
+        dst_table,
+        src_table,
+        subst_value(dst, subs),
+        subst_value(src, subs),
+        subst_value(count, subs),
+      )
+    ir.ElemDrop(_) -> e
+    ir.MemFill(mem, dest, value, count) ->
+      ir.MemFill(
+        mem,
+        subst_value(dest, subs),
+        subst_value(value, subs),
+        subst_value(count, subs),
+      )
+    ir.MemCopy(dst_mem, src_mem, dst, src, count) ->
+      ir.MemCopy(
+        dst_mem,
+        src_mem,
+        subst_value(dst, subs),
+        subst_value(src, subs),
+        subst_value(count, subs),
+      )
+    ir.MemInit(mem, seg, dst, src, count) ->
+      ir.MemInit(
+        mem,
+        seg,
+        subst_value(dst, subs),
+        subst_value(src, subs),
+        subst_value(count, subs),
+      )
+    ir.DataDrop(_) -> e
     ir.GlobalGet(_) -> e
     ir.GlobalSet(name, value) -> ir.GlobalSet(name, subst_value(value, subs))
     ir.CallDirect(fn_name, cargs) ->
@@ -881,11 +944,52 @@ fn expr_vars(e: ir.Expr) -> List(String) {
     ir.Num(_, args) -> values_names(args)
     ir.Convert(_, arg) -> value_name(arg)
     ir.TermOp(_, args) -> values_names(args)
-    ir.MemSize -> []
-    ir.MemGrow(delta) -> value_name(delta)
-    ir.MemLoad(_, addr, _, _) -> value_name(addr)
-    ir.MemStore(_, addr, value, _) ->
+    ir.MemSize(_) -> []
+    ir.MemGrow(_, delta) -> value_name(delta)
+    ir.MemLoad(_, _, addr, _, _) -> value_name(addr)
+    ir.MemStore(_, _, addr, value, _) ->
       list.append(value_name(addr), value_name(value))
+    // ── Phase-5 reference/table/bulk nodes: collect the `Var` names in their operands. ──
+    ir.RefFunc(_) -> []
+    ir.RefIsNull(arg) -> value_name(arg)
+    ir.TableGet(_, index) -> value_name(index)
+    ir.TableSet(_, index, value) ->
+      list.append(value_name(index), value_name(value))
+    ir.TableSize(_) -> []
+    ir.TableGrow(_, delta, init) ->
+      list.append(value_name(delta), value_name(init))
+    ir.TableFill(_, offset, value, count) ->
+      list.append(
+        value_name(offset),
+        list.append(value_name(value), value_name(count)),
+      )
+    ir.TableInit(_, _, dst, src, count) ->
+      list.append(
+        value_name(dst),
+        list.append(value_name(src), value_name(count)),
+      )
+    ir.TableCopy(_, _, dst, src, count) ->
+      list.append(
+        value_name(dst),
+        list.append(value_name(src), value_name(count)),
+      )
+    ir.ElemDrop(_) -> []
+    ir.MemFill(_, dest, value, count) ->
+      list.append(
+        value_name(dest),
+        list.append(value_name(value), value_name(count)),
+      )
+    ir.MemCopy(_, _, dst, src, count) ->
+      list.append(
+        value_name(dst),
+        list.append(value_name(src), value_name(count)),
+      )
+    ir.MemInit(_, _, dst, src, count) ->
+      list.append(
+        value_name(dst),
+        list.append(value_name(src), value_name(count)),
+      )
+    ir.DataDrop(_) -> []
     ir.GlobalGet(_) -> []
     ir.GlobalSet(_, value) -> value_name(value)
     ir.CallDirect(_, args) -> values_names(args)

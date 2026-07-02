@@ -103,7 +103,7 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
     | ir.Num(..)
     | ir.Convert(..)
     | ir.TermOp(..)
-    | ir.MemSize
+    | ir.MemSize(..)
     | ir.MemGrow(..)
     | ir.MemLoad(..)
     | ir.MemStore(..)
@@ -115,7 +115,25 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
     | ir.Break(..)
     | ir.Continue(..)
     | ir.Return(..)
-    | ir.Trap(..) -> e
+    | ir.Trap(..)
+    | // Phase-5 reference/table/bulk nodes carry only `Value` operands (no sub-`Expr`), so like
+      // the memory leaves they return unchanged from this `Expr`-traversal combinator. They are
+      // barriers (`ir/effect`), so no pass hoists across them; a pass that rewrites their `Value`
+      // operands does so in its own per-node arm, not here.
+      ir.RefFunc(..)
+    | ir.RefIsNull(..)
+    | ir.TableGet(..)
+    | ir.TableSet(..)
+    | ir.TableSize(..)
+    | ir.TableGrow(..)
+    | ir.TableFill(..)
+    | ir.TableInit(..)
+    | ir.TableCopy(..)
+    | ir.ElemDrop(..)
+    | ir.MemFill(..)
+    | ir.MemCopy(..)
+    | ir.MemInit(..)
+    | ir.DataDrop(..) -> e
     // structured-control / sequencing — recurse into each sub-`Expr`, preserving shape.
     ir.Let(names, rhs, body) ->
       ir.Let(names, map_expr(rhs, rewrite), map_expr(body, rewrite))

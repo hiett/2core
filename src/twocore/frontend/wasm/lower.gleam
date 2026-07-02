@@ -201,7 +201,7 @@ pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
   Ok(ir.Module(
     name: "twocore@wasm@" <> module_base(module),
     uses_numerics: True,
-    memory: lower_memory(module),
+    memories: lower_memory(module),
     globals: globals,
     imports: [],
     functions: functions,
@@ -495,12 +495,13 @@ fn go(
           emit_store(ir.MemAccess(4, False), m.offset, tail, ctx, st)
 
         // memory size/grow ----------------------------------------------------------
-        ast.MemorySize -> emit_nullary(ir.MemSize, ir.TI32, tail, ctx, st)
+        // memory index 0 (the default memory); P5-05 threads a real index for multi-memory.
+        ast.MemorySize -> emit_nullary(ir.MemSize(0), ir.TI32, tail, ctx, st)
         ast.MemoryGrow ->
           emit_value_op_t(
             1,
             ir.TI32,
-            fn(a) { ir.MemGrow(one(a)) },
+            fn(a) { ir.MemGrow(0, one(a)) },
             tail,
             ctx,
             st,
@@ -637,8 +638,8 @@ fn emit_load(
     result,
     fn(args) {
       case args {
-        [addr] -> ir.MemLoad(op, addr, offset, result)
-        _ -> ir.MemLoad(op, ir.ConstI32(0), offset, result)
+        [addr] -> ir.MemLoad(0, op, addr, offset, result)
+        _ -> ir.MemLoad(0, op, ir.ConstI32(0), offset, result)
       }
     },
     tail,
@@ -662,8 +663,8 @@ fn emit_store(
     2,
     fn(args) {
       case args {
-        [addr, value] -> ir.MemStore(op, addr, value, offset)
-        _ -> ir.MemStore(op, ir.ConstI32(0), ir.ConstI32(0), offset)
+        [addr, value] -> ir.MemStore(0, op, addr, value, offset)
+        _ -> ir.MemStore(0, op, ir.ConstI32(0), ir.ConstI32(0), offset)
       }
     },
     tail,
@@ -1429,6 +1430,10 @@ fn zero_value(t: ir.ValType) -> ir.Value {
     ir.TF32 -> ir.ConstF32(0)
     ir.TF64 -> ir.ConstF64(0)
     ir.TTerm -> ir.ConstI32(0)
+    // A reference-typed slot's zero value is the null reference (H1). Never arises from the
+    // Phase-1..4 WASM surface (only numeric locals); P5-05 exercises reference locals.
+    ir.TFuncRef -> ir.ConstNull(ir.FuncRef)
+    ir.TExternRef -> ir.ConstNull(ir.ExternRef)
   }
 }
 
@@ -1514,6 +1519,8 @@ fn value_type(st: LState, v: ir.Value) -> ir.ValType {
     ir.ConstI64(_) -> ir.TI64
     ir.ConstF32(_) -> ir.TF32
     ir.ConstF64(_) -> ir.TF64
+    // A null-reference literal is self-describing via its reftype tag (H1).
+    ir.ConstNull(ty) -> ir.reftype_to_valtype(ty)
     ir.Var(n) -> dict.get(st.var_types, n) |> result.unwrap(ir.TI32)
   }
 }
@@ -1542,13 +1549,14 @@ fn global_ty(ctx: LCtx, i: Int) -> ir.ValType {
 
 // ─────────────────────────────── module-level declarations ───────────────────────────────
 
-/// Lower the MVP single linear memory to `Some(MemoryDecl(min_pages, max_pages))`, or `None`
-/// if the module declares no memory. (Validation enforces ≤ 1 memory.)
-fn lower_memory(module: ast.Module) -> Option(ir.MemoryDecl) {
-  case module.memories {
-    [m, ..] -> Some(ir.MemoryDecl(m.limits.min, m.limits.max))
-    [] -> None
-  }
+/// Lower the linear memory to the IR memories vector (H3): the single MVP memory becomes a
+/// one-element `[MemoryDecl(min, max, Idx32)]` (32-bit, byte-identical to Phase-4), or `[]` if
+/// the module declares no memory. Multi-memory / memory64 lowering is P5-05's (the AST only
+/// carries one 32-bit memory at the pin).
+fn lower_memory(module: ast.Module) -> List(ir.MemoryDecl) {
+  list.map(module.memories, fn(m) {
+    ir.MemoryDecl(m.limits.min, m.limits.max, ir.Idx32)
+  })
 }
 
 /// Lower the global section to `GlobalDecl`s in declaration (= index) order: global `i` →
@@ -1567,8 +1575,9 @@ fn lower_globals(
 /// Lower the table section to `TableDecl`s: table `i` → `TableDecl("t<i>", min, max)`
 /// (funcref implicit). MVP ⇒ at most one, named `"t0"`.
 fn lower_tables(module: ast.Module) -> List(ir.TableDecl) {
+  // MVP tables are funcref (byte-identical to Phase-4); `externref` tables are P5-05's.
   list.index_map(module.tables, fn(t, i) {
-    ir.TableDecl(tname(i), t.limits.min, t.limits.max)
+    ir.TableDecl(tname(i), ir.FuncRef, t.limits.min, t.limits.max)
   })
 }
 
@@ -1581,8 +1590,15 @@ fn lower_elements(
 ) -> Result(List(ir.ElementSegment), LowerError) {
   list.map(module.elements, fn(e) {
     use offset <- result.try(lower_const_expr(e.offset))
-    let funcs = list.map(e.funcs, fn(idx) { "f" <> int.to_string(idx) })
-    Ok(ir.ElementSegment(tname(e.table), offset, funcs))
+    // Active funcref segment (byte-identical to Phase-4): each funcidx becomes a `RefFunc`
+    // init item. Passive/declarative + externref/null items are P5-05's.
+    let init =
+      list.map(e.funcs, fn(idx) { ir.RefFunc("f" <> int.to_string(idx)) })
+    Ok(ir.ElementSegment(
+      ir.ElemActive(tname(e.table), offset),
+      ir.FuncRef,
+      init,
+    ))
   })
   |> result.all
 }
@@ -1592,7 +1608,8 @@ fn lower_elements(
 fn lower_data(module: ast.Module) -> Result(List(ir.DataSegment), LowerError) {
   list.map(module.data, fn(d) {
     use offset <- result.try(lower_const_expr(d.offset))
-    Ok(ir.DataSegment(offset, d.bytes))
+    // Active-at-memory-0 (byte-identical to Phase-4); passive data is P5-05's.
+    Ok(ir.DataSegment(ir.DataActive(0, offset), d.bytes))
   })
   |> result.all
 }

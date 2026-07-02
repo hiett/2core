@@ -23,12 +23,12 @@ import twocore/ir/effect.{
 
 /// A representative side-effecting store: `i32.store` of `%v` at `%a + 0`.
 fn a_store() -> ir.Expr {
-  ir.MemStore(ir.MemAccess(4, False), ir.Var("a"), ir.Var("v"), 0)
+  ir.MemStore(0, ir.MemAccess(4, False), ir.Var("a"), ir.Var("v"), 0)
 }
 
 /// A representative side-effecting load: `i32.load` at `%a + 0`.
 fn a_load() -> ir.Expr {
-  ir.MemLoad(ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32)
+  ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32)
 }
 
 /// A representative non-trapping, side-effect-free add.
@@ -419,8 +419,8 @@ fn every_expr_variant() -> List(ir.Expr) {
     ir.Convert(ir.I32WrapI64, ir.Var("x")),
     ir.Convert(ir.TruncS(ir.FW64, ir.W32), ir.Var("x")),
     ir.TermOp(ir.MakeTuple, [ir.Var("a")]),
-    ir.MemSize,
-    ir.MemGrow(ir.ConstI32(1)),
+    ir.MemSize(0),
+    ir.MemGrow(0, ir.ConstI32(1)),
     a_load(),
     a_store(),
     ir.GlobalGet("g"),
@@ -453,8 +453,8 @@ pub fn classify_total_and_barrier_set_correct_test() {
 
   // the E6/F3 SHALLOW barrier set is exactly these variants.
   let barriers = [
-    ir.MemSize,
-    ir.MemGrow(ir.ConstI32(1)),
+    ir.MemSize(0),
+    ir.MemGrow(0, ir.ConstI32(1)),
     a_load(),
     a_store(),
     ir.GlobalGet("g"),

@@ -72,7 +72,11 @@ start_instance(Module) ->
             {ok, ok} ->
                 Parent ! {started, self(), ok},
                 instance_loop(Module);
-            {ok, {instance_state, _, _, _} = St} ->
+            {ok, St} when is_tuple(St), element(1, St) =:= instance_state ->
+                %% Match the `InstanceState` record by its TAG, not its arity — the
+                %% Phase-5 record grew (multi-memory/table vectors + drop-state +
+                %% ref-globals), so an arity-fixed `{instance_state,_,_,_}` pattern would
+                %% wrongly fall through to the fail-closed branch below.
                 Parent ! {started, self(), ok},
                 threaded_loop(Module, St);
             {ok, Other} ->

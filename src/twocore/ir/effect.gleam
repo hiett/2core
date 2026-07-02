@@ -46,9 +46,11 @@
 import gleam/list
 import twocore/ir.{
   type ConvOp, type Expr, type Function, type NumOp, Block, Break, CallDirect,
-  CallHost, CallIndirect, Charge, Continue, Convert, GlobalGet, GlobalSet, IDivS,
-  IDivU, IRemS, IRemU, If, Let, Loop, MemGrow, MemLoad, MemSize, MemStore, Num,
-  Return, Switch, TermOp, Trap, TruncS, TruncU, Values,
+  CallHost, CallIndirect, Charge, Continue, Convert, DataDrop, ElemDrop,
+  GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If, Let, Loop, MemCopy,
+  MemFill, MemGrow, MemInit, MemLoad, MemSize, MemStore, Num, RefFunc, RefIsNull,
+  Return, Switch, TableCopy, TableFill, TableGet, TableGrow, TableInit, TableSet,
+  TableSize, TermOp, Trap, TruncS, TruncU, Values,
 }
 
 /// Whether an expression is observably pure or side-effecting (F3).
@@ -79,10 +81,10 @@ pub type Effect {
 /// the DEEP `is_pure`/`classify` for that.
 pub fn is_effectful_node(e: Expr) -> Bool {
   case e {
-    MemSize
-    | MemGrow(_)
-    | MemLoad(_, _, _, _)
-    | MemStore(_, _, _, _)
+    MemSize(_)
+    | MemGrow(_, _)
+    | MemLoad(_, _, _, _, _)
+    | MemStore(_, _, _, _, _)
     | GlobalGet(_)
     | GlobalSet(_, _)
     | CallDirect(_, _)
@@ -93,7 +95,27 @@ pub fn is_effectful_node(e: Expr) -> Bool {
     | Break(_, _)
     | Continue(_, _)
     | Return(_)
-    | Loop(_, _, _, _) -> True
+    | Loop(_, _, _, _)
+    | // ── Phase-5 reference / table / bulk ops (H2): ALL barriers. ──
+      // Every one reads and/or writes mutable instance state (a table slot, a memory range,
+      // passive-segment drop state, or an instance-linked closure) → no CSE, no reorder, no DCE,
+      // exactly like `MemStore`/`GlobalSet` (§E). `RefFunc`/`RefIsNull` are conservatively
+      // classified as barriers too (the maximally-safe freeze posture — narrowing them to `Pure`
+      // is an explicit, tested refinement a later unit may make; strictly the safe direction).
+      RefFunc(_)
+    | RefIsNull(_)
+    | TableGet(_, _)
+    | TableSet(_, _, _)
+    | TableSize(_)
+    | TableGrow(_, _, _)
+    | TableFill(_, _, _, _)
+    | TableInit(_, _, _, _, _)
+    | TableCopy(_, _, _, _, _)
+    | ElemDrop(_)
+    | MemFill(_, _, _, _)
+    | MemCopy(_, _, _, _, _)
+    | MemInit(_, _, _, _, _)
+    | DataDrop(_) -> True
     Num(op, _) -> trapping_numop(op)
     Convert(op, _) -> trapping_convop(op)
     Values(_)

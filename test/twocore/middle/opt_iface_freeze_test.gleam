@@ -40,7 +40,7 @@ fn deep_expr(trap: ir.Expr) -> ir.Expr {
     1,
     ir.Let(
       ["x"],
-      ir.MemSize,
+      ir.MemSize(0),
       ir.Block(
         "b",
         [],
@@ -66,7 +66,7 @@ fn sample_module() -> ir.Module {
   ir.Module(
     name: "twocore@wasm@opt_freeze",
     uses_numerics: True,
-    memory: option_none(),
+    memories: [],
     globals: [],
     imports: [],
     functions: [
@@ -133,7 +133,7 @@ pub fn map_expr_recurses_into_every_control_form_test() {
 /// returns it faithfully (no drop/duplicate).
 pub fn map_expr_identity_on_leaf_test() {
   let id = fn(e: ir.Expr) -> ir.Expr { e }
-  assert pass.map_expr(ir.MemSize, id) == ir.MemSize
+  assert pass.map_expr(ir.MemSize(0), id) == ir.MemSize(0)
 }
 
 /// A `per_expr` pass built from a real rewrite is applied across the whole function body by
@@ -228,6 +228,7 @@ pub fn metered_default_is_bounded_test() {
 pub fn memstore_is_effectful_forever_test() {
   let store =
     ir.MemStore(
+      0,
       ir.MemAccess(bytes: 4, signed: False),
       ir.ConstI32(0),
       ir.ConstI32(42),

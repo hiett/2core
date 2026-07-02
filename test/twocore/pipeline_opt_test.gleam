@@ -33,7 +33,7 @@ fn add_module() -> ir.Module {
   ir.Module(
     name: "addmod",
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [
@@ -63,7 +63,7 @@ fn single_fn_module(body: ir.Expr) -> ir.Module {
   ir.Module(
     name: "chgmod",
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: [

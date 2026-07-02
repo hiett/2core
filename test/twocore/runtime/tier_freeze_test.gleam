@@ -20,6 +20,7 @@
 import gleam/dict
 import gleam/dynamic
 import gleam/list
+import gleam/set
 import twocore/runtime/instance.{
   type Binding, Atomics, Binding, Cell, Nif, Paged, TablePaged, Threaded,
 }
@@ -81,19 +82,29 @@ pub fn safe_forbids_nif_is_unconstructible_test() {
 
 // ───────────────────────────── the threaded box is the existing record (§A.2) ─────────────
 
-/// The threaded instance-state record IS the existing `rt_state.InstanceState` box (§A.2): a
-/// fixed-size 3-tuple of `mem`/`globals`/`table` that round-trips its three fields unchanged
-/// (mem/table stay opaque `Dynamic`, globals are raw-bit-pattern `Int`s keyed by name). Pins
-/// that the `Threaded` strategy threads the SAME box the `Cell` strategy stores — tier-orthogonal
-/// — so units 02/03/04/06 all share this one record type.
+/// The threaded instance-state record IS the `rt_state.InstanceState` box (§A.2). Phase 5 grew
+/// it to a multi-region record (memory-index vector, table-index vector, passive drop-state,
+/// reference globals — R5/R7/R8), but the DEFAULT (index-0) memory/table still round-trip
+/// through the byte-identical Phase-4 aliases (`rt_state.mem`/`rt_state.table`), and globals are
+/// still raw-bit-pattern `Int`s keyed by name. Pins that the `Threaded` strategy threads the SAME
+/// box the `Cell` strategy stores — tier-orthogonal — so units 02/03/04/06 share this record.
 pub fn threaded_box_round_trips_test() {
   let mem = dynamic.string("mem-handle")
   let table = dynamic.string("table-handle")
   let globals = dict.from_list([#("g0", 7), #("g1", 42)])
-  let st = InstanceState(mem: mem, globals: globals, table: table)
-  assert st.mem == mem
+  let st =
+    InstanceState(
+      mems: [mem],
+      globals: globals,
+      tables: [table],
+      dropped_data: set.new(),
+      dropped_elem: set.new(),
+      ref_globals: dict.new(),
+    )
+  // The index-0 aliases project the default memory/table (byte-identical to Phase-4).
+  assert rt_state.mem(st) == mem
   assert st.globals == globals
-  assert st.table == table
+  assert rt_state.table(st) == table
 }
 
 // ───────────────────────────── coexistence keys on the full build identity (§B.5) ──────────

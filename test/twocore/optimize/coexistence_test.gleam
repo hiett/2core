@@ -124,7 +124,7 @@ fn host_module(name: String) -> ir.Module {
   ir.Module(
     name: name,
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [ir.ImportFn("env", "identity", ir.FuncType([ir.TI32], [ir.TI32]))],
     functions: [

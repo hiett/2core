@@ -55,7 +55,7 @@ fn state_module(name: String) -> ir.Module {
       locals: [],
       body: ir.Let(
         [],
-        ir.MemStore(ir.MemAccess(4, False), ir.Var("addr"), ir.Var("val"), 0),
+        ir.MemStore(0, ir.MemAccess(4, False), ir.Var("addr"), ir.Var("val"), 0),
         ir.Return([ir.Var("val")]),
       ),
     ),
@@ -64,7 +64,7 @@ fn state_module(name: String) -> ir.Module {
       params: [ir.Local("addr", ir.TI32)],
       result: [ir.TI32],
       locals: [],
-      body: ir.MemLoad(ir.MemAccess(4, False), ir.Var("addr"), 0, ir.TI32),
+      body: ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("addr"), 0, ir.TI32),
     ),
     ir.Function(
       name: "setg",
@@ -88,7 +88,7 @@ fn state_module(name: String) -> ir.Module {
   ir.Module(
     name: name,
     uses_numerics: True,
-    memory: option.Some(ir.MemoryDecl(1, option.None)),
+    memories: [ir.MemoryDecl(1, option.None, ir.Idx32)],
     globals: [ir.GlobalDecl("g0", ir.TI32, True, ir.Values([ir.ConstI32(0)]))],
     imports: [],
     functions: functions,

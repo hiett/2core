@@ -120,7 +120,7 @@ fn int_range(from: Int, to: Int) -> List(Int) {
 pub fn module_flags_test() {
   let irm = build(add_wasm)
   irm.uses_numerics |> should.equal(True)
-  irm.memory |> should.equal(option.None)
+  irm.memories |> should.equal([])
 }
 
 /// The export survives lowering: `add` is exported (resolving to the function's IR
@@ -130,6 +130,7 @@ pub fn export_preserved_test() {
   list.any(irm.exports, fn(e) {
     case e {
       ir.ExportFn(export_name, _) -> export_name == "add"
+      ir.ExportGlobal(..) | ir.ExportTable(..) | ir.ExportMemory(..) -> False
     }
   })
   |> should.equal(True)
@@ -280,14 +281,14 @@ pub fn mem_load_store_structure_test() {
   let loads =
     list.filter_map(exprs, fn(e) {
       case e {
-        ir.MemLoad(op, _, _, result) -> Ok(#(op, result))
+        ir.MemLoad(_, op, _, _, result) -> Ok(#(op, result))
         _ -> Error(Nil)
       }
     })
   let stores =
     list.filter_map(exprs, fn(e) {
       case e {
-        ir.MemStore(op, _, _, _) -> Ok(op)
+        ir.MemStore(_, op, _, _, _) -> Ok(op)
         _ -> Error(Nil)
       }
     })
@@ -312,15 +313,15 @@ pub fn mem_size_grow_test() {
   let exprs = all_exprs(f.body)
   list.any(exprs, fn(e) {
     case e {
-      ir.MemGrow(_) -> True
+      ir.MemGrow(_, _) -> True
       _ -> False
     }
   })
   |> should.equal(True)
-  list.any(exprs, fn(e) { e == ir.MemSize }) |> should.equal(True)
-  case irm.memory {
-    option.Some(_) -> True
-    option.None -> False
+  list.any(exprs, fn(e) { e == ir.MemSize(0) }) |> should.equal(True)
+  case irm.memories {
+    [_, ..] -> True
+    [] -> False
   }
   |> should.equal(True)
 }
@@ -371,11 +372,15 @@ pub fn call_indirect_structure_test() {
   })
   |> should.equal(True)
   // Table declared and named "t0".
-  irm.tables |> should.equal([ir.TableDecl("t0", 1, option.None)])
+  irm.tables |> should.equal([ir.TableDecl("t0", ir.FuncRef, 1, option.None)])
   // Active element segment into "t0" at offset 0, targeting function name "f0".
   irm.elements
   |> should.equal([
-    ir.ElementSegment("t0", ir.Values([ir.ConstI32(0)]), ["f0"]),
+    ir.ElementSegment(
+      ir.ElemActive("t0", ir.Values([ir.ConstI32(0)])),
+      ir.FuncRef,
+      [ir.RefFunc("f0")],
+    ),
   ])
   // The element target name resolves to a real defined function.
   list.any(irm.functions, fn(fn_) { fn_.name == "f0" }) |> should.equal(True)
@@ -496,10 +501,13 @@ pub fn float_add_e2e_test() {
 /// `Module.start` (`Some("f<funcidx>")`). The data bytes are bit-exact (`"abc"`).
 pub fn data_start_test() {
   let irm = build(data_start_wasm)
-  irm.memory |> should.equal(option.Some(ir.MemoryDecl(1, option.None)))
+  irm.memories |> should.equal([ir.MemoryDecl(1, option.None, ir.Idx32)])
   irm.data_segments
   |> should.equal([
-    ir.DataSegment(ir.Values([ir.ConstI32(0)]), bit_array.from_string("abc")),
+    ir.DataSegment(
+      ir.DataActive(0, ir.Values([ir.ConstI32(0)])),
+      bit_array.from_string("abc"),
+    ),
   ])
   irm.start |> should.equal(option.Some("f0"))
 }

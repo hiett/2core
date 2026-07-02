@@ -60,32 +60,36 @@ import gleam/option.{type Option}
 ///
 /// The three capability axes (D5) are independent and never fused:
 /// - `uses_numerics`: whether the module uses the low-level `i32/i64/f32/f64` layer.
-/// - `memory`: linear memory is opt-in and **separate** from numerics. `None` means
-///   the module links no memory runtime; `Some(MemoryDecl)` declares its sizing.
+/// - `memories`: linear memories are opt-in and **separate** from numerics. `[]` means
+///   the module links no memory runtime; each `MemoryDecl` in the list declares one
+///   memory's sizing, and the list position **is** the memory-index space (H3). A
+///   single-memory module is a one-element list; index `0` is the default memory every
+///   Phase-1..4 memory node targets, so 32-bit single-memory output is byte-identical.
 /// - the term layer is always available (no flag).
 ///
-/// A Phase-1 WASM module sets `uses_numerics: True` and `memory: None`.
+/// A Phase-1 WASM module sets `uses_numerics: True` and `memories: []`.
 ///
 /// Fields:
 /// - `name`: the module's logical name (becomes part of the emitted module name).
 /// - `globals`: module-level mutable/immutable global slots.
 /// - `imports`: host functions reachable only through `CallHost` (the capability
-///   boundary).
+///   boundary) plus non-function imports (globals/tables/memories — H4) supplied as
+///   provided state at instantiation.
 /// - `functions`: the module's own defined functions.
-/// - `exports`: the externally callable entry points (export-name → function name).
-/// - `data_segments`: Phase-2 linear-memory initialisers (active segments written into
-///   memory at instantiation).
-/// - `tables`: the module's funcref tables (Phase-2; MVP funcref-only). A `CallIndirect`
+/// - `exports`: the externally callable entry points (functions + exported state — H4).
+/// - `data_segments`: linear-memory initialisers — active (written into a memory at
+///   instantiation) or passive (droppable, consumed by `memory.init`).
+/// - `tables`: the module's reference tables (funcref/externref — H1). A `CallIndirect`
 ///   references one of these by name.
-/// - `elements`: active element segments — funcrefs written into a `tables` entry at
-///   instantiation (an out-of-bounds active segment traps at instantiation).
+/// - `elements`: element segments — active (written into a table at instantiation),
+///   passive (droppable, consumed by `table.init`), or declarative (H2).
 /// - `start`: the name of the module's start function (run once at instantiation), or
 ///   `None`. A trapping start fails instantiation.
 pub type Module {
   Module(
     name: String,
     uses_numerics: Bool,
-    memory: Option(MemoryDecl),
+    memories: List(MemoryDecl),
     globals: List(GlobalDecl),
     imports: List(ImportDecl),
     functions: List(Function),
@@ -97,36 +101,71 @@ pub type Module {
   )
 }
 
-/// A funcref table declaration (Phase-2). The MVP's only reference type is `funcref`, so a
-/// table is described purely by its sizing.
+/// A reference table declaration. Generalizes the Phase-2 funcref-only table with a
+/// reference-type tag (H1).
 ///
-/// - `name`: the table's unique name (referenced by `CallIndirect` and `ElementSegment`).
-/// - `min`: the initial size in entries (≥ 0). Every slot starts uninitialised (null).
-/// - `max`: optional upper bound in entries; `None` means unbounded growth (table growth
-///   itself is a post-MVP op — Phase-2 only populates a table via element segments).
+/// - `name`: the table's unique name (referenced by `CallIndirect`, `ElementSegment`, and
+///   the reference/bulk table ops).
+/// - `ref_ty`: the table's element reference type (`FuncRef`/`ExternRef`). Defaults to
+///   `FuncRef` — a `FuncRef` table is the Phase-2 table, byte-identical.
+/// - `min`: the initial size in entries (≥ 0). Every slot starts as the null reference.
+/// - `max`: optional upper bound in entries; `None` means unbounded growth.
 pub type TableDecl {
-  TableDecl(name: String, min: Int, max: Option(Int))
+  TableDecl(name: String, ref_ty: RefType, min: Int, max: Option(Int))
 }
 
-/// An ACTIVE element segment (Phase-2): at instantiation, write `funcs` (each a defined
-/// IR function name) into the named `table` starting at the constant `offset`.
+/// An element segment. GENERALIZES the Phase-2 `ElementSegment(table, offset, funcs)` (H2):
 ///
-/// - `table`: the target table's name (must match a `TableDecl.name`).
-/// - `offset`: a constant expression giving the first entry index written. An offset (or
-///   offset+len) past the table bound traps at instantiation (`TableOutOfBounds`).
-/// - `funcs`: the IR function names placed into consecutive entries from `offset`. Each
-///   becomes a build-controlled type-tagged closure (never a data-driven `apply`).
+/// - `mode`: active (writes a table at instantiation) | passive (a droppable runtime
+///   segment consumed by `table.init`; `elem.drop` empties it) | declarative (carries no
+///   runtime data; forward-declares `ref.func` targets).
+/// - `ref_ty`: the element reference type (`FuncRef`/`ExternRef`).
+/// - `init`: the element items, each a **ref-producing constant expression** (`Expr`) —
+///   `RefFunc(name)` for a funcref, `Values([ConstNull(ty)])` for a null slot (a `ref.null`
+///   reduces to the `ConstNull` value, R1c), and `GlobalGet(name)` / `Values([Const…])` for the
+///   other admissible const-init forms. This replaces the Phase-2 `funcs: List(String)`, letting
+///   an element carry `externref`s and null slots. An active `FuncRef` segment whose items are
+///   all `RefFunc` is the Phase-2 case, lowered byte-identically.
 pub type ElementSegment {
-  ElementSegment(table: String, offset: Expr, funcs: List(String))
+  ElementSegment(mode: ElemMode, ref_ty: RefType, init: List(Expr))
 }
 
-/// Declares the module's single linear memory (Phase-2 subsystem; modelled now per
-/// D5 lock-now).
+/// The three element-segment modes (WebAssembly spec §2.5.6).
+///
+/// - `ElemActive(table, offset)`: written into `table` at the constant `offset` at
+///   instantiation (an out-of-bounds active segment traps, `TableOutOfBounds`). The
+///   Phase-2 case; byte-identical when `ref_ty = FuncRef` and every item is `RefFunc`.
+/// - `ElemPassive`: a droppable runtime segment consumed by `table.init`; `elem.drop`
+///   marks it empty (length 0).
+/// - `ElemDeclarative`: carries no runtime state; makes `ref.func` targets valid.
+pub type ElemMode {
+  ElemActive(table: String, offset: Expr)
+  ElemPassive
+  ElemDeclarative
+}
+
+/// Declares one of the module's linear memories (H3). The list position in
+/// `Module.memories` is this memory's index.
 ///
 /// - `min_pages`: initial size in 64 KiB WebAssembly pages (≥ 0).
 /// - `max_pages`: optional upper bound in pages; `None` means unbounded growth.
+/// - `idx_type`: the address width (`Idx32`/`Idx64`, memory64 — H3/R12). Defaults to
+///   `Idx32`, the classic 32-bit-indexed memory (byte-identical to Phase-4). `Idx64`'s
+///   runtime is deferred to Phase 6 (R12): the axis is frozen so the shape is stable and
+///   decode/validate can round-trip a 64-bit memory, but lower/link reject it.
 pub type MemoryDecl {
-  MemoryDecl(min_pages: Int, max_pages: Option(Int))
+  MemoryDecl(min_pages: Int, max_pages: Option(Int), idx_type: IdxType)
+}
+
+/// A memory's address width (H3, memory64). Neutral name (a generic multi-region address
+/// width, not a WASM immediate leaked into the IR, H7).
+///
+/// - `Idx32`: a 32-bit-indexed memory (address operand `i32`, bounds arithmetic 32-bit).
+/// - `Idx64`: a 64-bit-indexed memory (address operand `i64`, offsets may exceed 2³²).
+///   Runtime deferred to Phase 6 (R12).
+pub type IdxType {
+  Idx32
+  Idx64
 }
 
 /// A module-level global variable slot.
@@ -140,33 +179,71 @@ pub type GlobalDecl {
   GlobalDecl(name: String, ty: ValType, mutable: Bool, init: Expr)
 }
 
-/// An imported host function — the ONLY thing reachable from a body via `CallHost`
-/// (the capability boundary, high-level §6).
+/// A module import (H4). `ImportFn` is the capability boundary (host functions reached via
+/// `CallHost`); the three state variants are **provided state**, not capabilities — a value
+/// the instantiation contract SUPPLIES, whose absence is a link-time failure (fail-closed,
+/// H6), never an ambient default. The state variants deliberately key on the WASM
+/// `(module, name)` LINK key (not the capability tag), because they must not be conflated
+/// with the deny-all `CallHost` boundary.
 ///
-/// - `capability`: groups imports for the host policy (e.g. deny-all checks this).
-/// - `name`: the imported function's name within the capability.
-/// - `ty`: the nameless signature the import is expected to satisfy.
+/// - `ImportFn(capability, name, ty)`: a host function — `capability` groups imports for the
+///   host policy (deny-all checks this), `name` is the function name, `ty` its signature.
+/// - `ImportGlobal(module, name, ty, mutable)`: an imported global of value type `ty`.
+/// - `ImportTable(module, name, ref_ty, min, max)`: an imported reference table.
+/// - `ImportMemory(module, name, min_pages, max_pages, idx_type)`: an imported linear memory.
 pub type ImportDecl {
   ImportFn(capability: String, name: String, ty: FuncType)
+  ImportGlobal(module: String, name: String, ty: ValType, mutable: Bool)
+  ImportTable(
+    module: String,
+    name: String,
+    ref_ty: RefType,
+    min: Int,
+    max: Option(Int),
+  )
+  ImportMemory(
+    module: String,
+    name: String,
+    min_pages: Int,
+    max_pages: Option(Int),
+    idx_type: IdxType,
+  )
 }
 
-/// Names an externally callable entry point.
+/// Names an externally callable / observable entry point (H4). Functions plus exported
+/// state (the spec suite's `(get $m "g")` and `spectest`'s exported table/memory need these).
 ///
-/// - `export_name`: the name the outside world calls (an arbitrary string).
-/// - `fn_name`: the name of the `Function` it resolves to within this module.
+/// - `ExportFn(export_name, fn_name)`: exports the `Function` named `fn_name`.
+/// - `ExportGlobal(export_name, global_name)`: exports the global named `global_name`.
+/// - `ExportTable(export_name, table_name)`: exports the table named `table_name`.
+/// - `ExportMemory(export_name, mem_index)`: exports the memory at index `mem_index` (its
+///   position in `Module.memories`).
 pub type ExportDecl {
   ExportFn(export_name: String, fn_name: String)
+  ExportGlobal(export_name: String, global_name: String)
+  ExportTable(export_name: String, table_name: String)
+  ExportMemory(export_name: String, mem_index: Int)
 }
 
-/// An ACTIVE linear-memory data initialiser (Phase-2): write `bytes` into linear memory at
-/// `offset` during instantiation. An out-of-bounds segment traps at instantiation (reusing
-/// `MemoryOutOfBounds`).
+/// A linear-memory data segment (H2). GENERALIZES the Phase-2 `DataSegment(offset, bytes)`.
 ///
-/// - `offset`: a constant expression giving the byte offset at which `bytes` are
-///   written.
-/// - `bytes`: the raw bytes to write into linear memory at instantiation.
+/// - `mode`: active (written into a memory at instantiation) | passive (a droppable runtime
+///   value consumed by `memory.init`; `data.drop` empties it).
+/// - `bytes`: the raw payload.
 pub type DataSegment {
-  DataSegment(offset: Expr, bytes: BitArray)
+  DataSegment(mode: DataMode, bytes: BitArray)
+}
+
+/// The two data-segment modes (WebAssembly spec §2.5.7).
+///
+/// - `DataActive(mem, offset)`: written into memory index `mem` at the constant `offset` at
+///   instantiation (an out-of-bounds segment traps, `MemoryOutOfBounds`). The Phase-2 case
+///   is `DataActive(0, offset)`, byte-identical.
+/// - `DataPassive`: a droppable runtime value consumed by `memory.init`; `data.drop` marks
+///   it empty (length 0).
+pub type DataMode {
+  DataActive(mem: Int, offset: Expr)
+  DataPassive
 }
 
 // ───────────────────────────── Types ─────────────────────────────
@@ -191,12 +268,56 @@ pub type FloatWidth {
 /// - `TF32`/`TF64`: 32/64-bit floats (stored as raw IEEE-754 bit patterns).
 /// - `TTerm`: a boxed BEAM term (atoms/tuples/lists/… — the home of Phase-2 term
 ///   frontends).
+/// - `TFuncRef`: a function reference (`funcref`, H1). A runtime value is the null sentinel
+///   (`rt_ref`, R1) OR the Phase-2 type-tagged table entry `#(FuncType, target)` — a
+///   `funcref` value *is* what a table slot already holds, promoted to a first-class value.
+///   Produced by `RefFunc`, consumed by `CallIndirect`, stored in `funcref` tables.
+/// - `TExternRef`: an opaque host reference (`externref`, H1). A runtime value is the null
+///   sentinel OR any BEAM term the host supplies, wrapped `{ref_extern, Term}` (R1). Safe
+///   code may hold/pass/store/null-test it but **cannot forge or inspect** it (opacity is
+///   the security property, H6). Never callable.
 pub type ValType {
   TI32
   TI64
   TF32
   TF64
   TTerm
+  TFuncRef
+  TExternRef
+}
+
+/// The subset of `ValType` that is a reference type (H1). Used wherever the spec's `reftype`
+/// grammar appears: `TableDecl.ref_ty`, `ElementSegment.ref_ty`, `ConstNull(ty)`, an imported
+/// table's reftype, and typed `select` (validate/decode only). `FuncRef`/`ExternRef` map 1:1
+/// onto `TFuncRef`/`TExternRef`; `reftype_to_valtype`/`valtype_to_reftype` bridge the two
+/// spellings so they cannot drift.
+pub type RefType {
+  FuncRef
+  ExternRef
+}
+
+/// Widen a `RefType` to its `ValType` — `FuncRef → TFuncRef`, `ExternRef → TExternRef`.
+///
+/// - `r`: the reference type.
+/// - Returns the corresponding `ValType` reference constructor. Total — never fails.
+pub fn reftype_to_valtype(r: RefType) -> ValType {
+  case r {
+    FuncRef -> TFuncRef
+    ExternRef -> TExternRef
+  }
+}
+
+/// Narrow a `ValType` to a `RefType` iff it is a reference type.
+///
+/// - `t`: the value type to narrow.
+/// - Returns `Ok(FuncRef)`/`Ok(ExternRef)` for `TFuncRef`/`TExternRef`; `Error(Nil)` for a
+///   non-reference type (`TI32`/`TI64`/`TF32`/`TF64`/`TTerm`). Total — never panics.
+pub fn valtype_to_reftype(t: ValType) -> Result(RefType, Nil) {
+  case t {
+    TFuncRef -> Ok(FuncRef)
+    TExternRef -> Ok(ExternRef)
+    _ -> Error(Nil)
+  }
 }
 
 /// A nameless function signature: the parameter types and the result types.
@@ -270,12 +391,20 @@ pub fn signature(f: Function) -> FuncType {
 ///   bit pattern in `[0, 2^width)`.
 /// - `ConstF32(bits)`/`ConstF64(bits)`: a float constant stored as its RAW IEEE-754
 ///   bit pattern in an `Int` (D5 — never a BEAM double, so NaN/Inf/`-0.0` are exact).
+/// - `ConstNull(ty)`: the null-reference literal of reftype `ty` — the null sentinel
+///   (`rt_ref.null_ref`, R1) as an atomic operand. The static reftype `ty` is carried for
+///   validation and the `.ir` text; at runtime there is ONE null sentinel shared by both
+///   reftypes (`ref.is_null` is the same test either way). It is what `ref.null t` lowers to
+///   (R1c — no separate `RefNull` `Expr`), the default `init` of a `ref.null`-sourced
+///   `table.grow`/`table.fill`, and the value a reference-typed element/global constant
+///   initialiser const-folds to. Pure (it is a `Value`).
 pub type Value {
   Var(name: String)
   ConstI32(bits: Int)
   ConstI64(bits: Int)
   ConstF32(bits: Int)
   ConstF64(bits: Int)
+  ConstNull(ty: RefType)
 }
 
 // ───────────────────── Expressions (yield value lists) ─────────────────────
@@ -332,26 +461,81 @@ pub type Expr {
   Convert(op: ConvOp, arg: Value)
   /// Term construction / destructuring (Phase-2 term layer; lock-now placeholder).
   TermOp(op: TermOp, args: List(Value))
-  // linear-memory layer (Phase-2) --------------------------------------------
-  /// `memory.size` → the current linear-memory size in 64 KiB pages (an i32).
-  /// Side-effecting (observes mutable state; do not CSE across a `MemGrow`).
-  MemSize
-  /// `memory.grow(delta_pages)` → the PREVIOUS size in pages, or `-1` (i32) on failure
-  /// (the requested growth exceeds the declared `max_pages` or the Safe max-pages cap).
+  // reference layer (H1/H2) — all effectful barriers (§effect) -----------------
+  /// `ref.func $f` → a `funcref` to same-module function `fn_name` (the build-controlled
+  /// type-tagged closure `#(FuncType, closure)`, R1). Effectful in the barrier sense only
+  /// (it materialises instance-linked state); never traps. `fn_name` must be a defined
+  /// function. (`ref.null t` is NOT an `Expr` — it lowers to `ConstNull(t)`, R1c.)
+  RefFunc(fn_name: String)
+  /// `ref.is_null x` → i32 `1` if `x` is the null sentinel, else `0`. Lowers through
+  /// `rt_ref.is_null` (R1). Classified as a barrier for the freeze (§effect).
+  RefIsNull(arg: Value)
+  // table layer (H2) — reference read/write, size/grow/fill, bulk init/copy ----
+  /// `table.get` → the reference at `index` in `table`; **traps `TableOutOfBounds`** if
+  /// `index ≥ size`.
+  TableGet(table: String, index: Value)
+  /// `table.set` — write `value` (a reference) at `index`; **traps `TableOutOfBounds`** if
+  /// `index ≥ size`.
+  TableSet(table: String, index: Value, value: Value)
+  /// `table.size` → the table's current size in entries (i32).
+  TableSize(table: String)
+  /// `table.grow(delta, init)` → the PREVIOUS size, or `-1` if growth fails (exceeds
+  /// `max`/cap). New slots are filled with `init` (a reference). Never traps.
+  TableGrow(table: String, delta: Value, init: Value)
+  /// `table.fill(offset, value, count)` — write `value` into `count` slots from `offset`.
+  /// **Eager bounds check → traps `TableOutOfBounds` before any write** if
+  /// `offset + count > size` (R10).
+  TableFill(table: String, offset: Value, value: Value, count: Value)
+  /// `table.init(seg, dst, src, count)` — copy `count` elements from passive element `seg`
+  /// (index into `Module.elements`) at `src` into `table` at `dst`. **Eager bounds; trap
+  /// before any write** on OOB (either range) or a dropped/short segment (R10). `table` is
+  /// the target, `seg` the element-segment index (immediate order pinned by R3).
+  TableInit(table: String, seg: Int, dst: Value, src: Value, count: Value)
+  /// `table.copy(dst, src, count)` from `src_table` to `dst_table` — **memmove semantics**
+  /// (overlap-correct in either direction, R11). **Eager bounds; trap before any write.**
+  TableCopy(
+    dst_table: String,
+    src_table: String,
+    dst: Value,
+    src: Value,
+    count: Value,
+  )
+  /// `elem.drop(seg)` — mark passive element segment `seg` empty (length 0). Idempotent; a
+  /// later `table.init` from it with non-zero `count` traps.
+  ElemDrop(seg: Int)
+  // linear-memory layer (Phase-2 + H2/H3 bulk & multi-memory) ------------------
+  /// `memory.size` on memory `mem` → the current size in 64 KiB pages (an i32).
+  /// Side-effecting (observes mutable state; do not CSE across a `MemGrow`). `mem` is the
+  /// memory index (default `0`; a single-memory module keeps `mem = 0`, byte-identical).
+  MemSize(mem: Int)
+  /// `memory.grow(delta_pages)` on memory `mem` → the PREVIOUS size in pages, or `-1` (i32)
+  /// on failure (the requested growth exceeds the declared `max_pages` or the Safe cap).
   /// Side-effecting (E6): allocates/zero-fills pages and mutates the memory state.
-  MemGrow(delta: Value)
-  /// Typed load from linear memory at `addr + offset`, yielding a `result`-typed value.
+  MemGrow(mem: Int, delta: Value)
+  /// Typed load from memory `mem` at `addr + offset`, yielding a `result`-typed value.
   ///
   /// `op` (a `MemAccess`) carries the access width in bytes and, for sub-word loads, the
-  /// sign-extension flag. `result` is the value type the load PRODUCES — it is required
-  /// because `op` alone cannot distinguish `i32.load8_s` from `i64.load8_s` (identical
-  /// bytes + sign, different result bit pattern). Side-effecting (E6).
-  MemLoad(op: MemAccess, addr: Value, offset: Int, result: ValType)
-  /// Typed store of `value` to linear memory at `addr + offset`. `op.bytes` is the store
-  /// width; `op.signed` is IRRELEVANT for stores (a store writes the low `bytes` bytes of
-  /// `value` regardless of sign) and is ignored. Side-effecting (E6); the evaluation order
-  /// is addr, then value, then the store.
-  MemStore(op: MemAccess, addr: Value, value: Value, offset: Int)
+  /// sign-extension flag. `result` is the value type the load PRODUCES — required because
+  /// `op` alone cannot distinguish `i32.load8_s` from `i64.load8_s`. Side-effecting (E6).
+  MemLoad(mem: Int, op: MemAccess, addr: Value, offset: Int, result: ValType)
+  /// Typed store of `value` to memory `mem` at `addr + offset`. `op.bytes` is the store
+  /// width; `op.signed` is IRRELEVANT for stores and is ignored. Side-effecting (E6); the
+  /// evaluation order is addr, then value, then the store.
+  MemStore(mem: Int, op: MemAccess, addr: Value, value: Value, offset: Int)
+  /// `memory.fill(dest, value, count)` on memory `mem` — set `count` bytes from `dest` to
+  /// the low byte of `value`. **Eager bounds; trap `MemoryOutOfBounds` before any write** if
+  /// `dest + count > bytelen` (R10).
+  MemFill(mem: Int, dest: Value, value: Value, count: Value)
+  /// `memory.copy` from `src_mem` to `dst_mem` — **memmove semantics** (R11). **Eager
+  /// bounds; trap before any write.** (Multi-memory: source and destination may differ.)
+  MemCopy(dst_mem: Int, src_mem: Int, dst: Value, src: Value, count: Value)
+  /// `memory.init(seg, dst, src, count)` on memory `mem` — copy `count` bytes from passive
+  /// data `seg` (index into `Module.data_segments`) at `src` into memory at `dst`. **Eager
+  /// bounds; trap before any write** on OOB or a dropped/short segment (R10). `mem` is the
+  /// target, `seg` the data-segment index (immediate order pinned by R3).
+  MemInit(mem: Int, seg: Int, dst: Value, src: Value, count: Value)
+  /// `data.drop(seg)` — mark passive data segment `seg` empty (length 0). Idempotent.
+  DataDrop(seg: Int)
   /// Read the named module global's current value.
   GlobalGet(name: String)
   /// Write `value` into the named (mutable) module global.

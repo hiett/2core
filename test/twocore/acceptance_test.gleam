@@ -258,6 +258,8 @@ fn tag(ty: ir.ValType, raw: Int) -> SpecValue {
     ir.TF32 -> F32Bits(raw)
     ir.TF64 -> F64Bits(raw)
     ir.TTerm -> I32Val(raw)
+    ir.TFuncRef -> I32Val(raw)
+    ir.TExternRef -> I32Val(raw)
   }
 }
 
@@ -270,7 +272,7 @@ fn numeric_module(name: String, fns: List(ir.Function)) -> ir.Module {
       <> "_"
       <> int.to_string(ffi.unique_int()),
     uses_numerics: True,
-    memory: option.None,
+    memories: [],
     globals: [],
     imports: [],
     functions: fns,
@@ -361,6 +363,7 @@ fn export_types(m: ir.Module) -> Dict(String, List(ir.ValType)) {
           Ok(results) -> dict.insert(acc, export_name, results)
           Error(_) -> acc
         }
+      ir.ExportGlobal(..) | ir.ExportTable(..) | ir.ExportMemory(..) -> acc
     }
   })
 }
