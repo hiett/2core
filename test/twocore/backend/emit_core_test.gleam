@@ -1637,3 +1637,246 @@ fn find_seed_decl(e: CExpr) -> CExpr {
       panic as "find_seed_decl: no rt_state:seed call in the Cell instantiate body"
   }
 }
+
+// ════════════════════ Phase-5 (P5-06): reference / table / bulk / multi-mem goldens ════════════════════
+
+/// A Safe binding switched to the tier-P `Threaded` state strategy.
+fn threaded() -> instance.Binding {
+  instance.Binding(..instance.safe_default(), state_strategy: instance.Threaded)
+}
+
+/// A module with a `target : [i32]->[i32]` function, one memory, one passive `<<1,2,3,4>>` data
+/// segment, and a funcref table `t0` (size 4) — wrapping `f(p0)` with body `body`/result `result`.
+fn p5_module(body: ir.Expr, result: List(ir.ValType)) -> ir.Module {
+  let target =
+    ir.Function(
+      "target",
+      [ir.Local("x", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Return([ir.Var("x")]),
+    )
+  let f = ir.Function("f", [ir.Local("p0", ir.TI32)], result, [], body)
+  ir.Module(
+    name: "twocore@test@p5",
+    uses_numerics: True,
+    memories: [ir.MemoryDecl(1, option.None, ir.Idx32)],
+    globals: [],
+    imports: [],
+    functions: [target, f],
+    exports: [],
+    data_segments: [ir.DataSegment(ir.DataPassive, <<1, 2, 3, 4>>)],
+    tables: [ir.TableDecl("t0", ir.FuncRef, 4, option.None)],
+    elements: [],
+    start: option.None,
+  )
+}
+
+/// The `f` `FunDef` emitted from `p5_module(body, result)` under `binding`.
+fn p5_fdef(
+  body: ir.Expr,
+  result: List(ir.ValType),
+  b: instance.Binding,
+) -> core_erlang.FunDef {
+  let assert Ok(m) = emit_core.emit_module(p5_module(body, result), b)
+  let assert Ok(def) =
+    list.find(m.defs, fn(d) {
+      let FunDef(FName(n, _), _) = d
+      n == "f"
+    })
+  def
+}
+
+/// `ConstNull(ty)` lowers to the SHARED null sentinel literal `{ref_null}` (R1) — a pure literal
+/// (no `call`), reftype-agnostic. Cite §4.4.2 (`ref.null`).
+pub fn const_null_is_sentinel_test() {
+  let assert FunDef(_, CFun(_, CTuple([CAtom("ref_null")]))) =
+    p5_fdef(ir.Values([ir.ConstNull(ir.FuncRef)]), [ir.TFuncRef], binding())
+}
+
+/// `RefIsNull(arg)` delegates the sentinel test to `rt_ref:is_null` and maps the `'true'`/`'false'`
+/// result to the i32 `1`/`0` the spec requires — a bare pure value (no state threading). §4.4.2.
+pub fn ref_is_null_test() {
+  let assert FunDef(
+    _,
+    CFun(
+      _,
+      CCase(
+        CCall(CAtom("twocore@runtime@rt_ref"), CAtom("is_null"), [CVar("p0")]),
+        [
+          CClause([PAtom("true")], CAtom("true"), CInt(1)),
+          CClause([PVar(_)], CAtom("true"), CInt(0)),
+        ],
+      ),
+    ),
+  ) = p5_fdef(ir.RefIsNull(ir.Var("p0")), [ir.TI32], binding())
+}
+
+/// `RefFunc($target)` lowers to the `{TypeTag, Closure}` funcref entry — the SAME `{FuncType,
+/// CFun}` shape an element segment stores (§B): a `funcref` value *is* a table-entry shape (R1).
+pub fn ref_func_is_entry_test() {
+  let assert FunDef(
+    _,
+    CFun(_, CTuple([CTuple([_params, _results]), CFun(_, _)])),
+  ) = p5_fdef(ir.RefFunc("target"), [ir.TFuncRef], binding())
+}
+
+/// `TableGet(t0, i)` (Cell) → a trapping-value `case`-and-`raise` over `rt_table:get(0, i)` — an
+/// in-bounds unfilled slot returns the null sentinel (a value); an OOB index traps. §4.4.6.
+pub fn table_get_test() {
+  let assert FunDef(
+    _,
+    CFun(
+      _,
+      CLet(
+        [_],
+        CCase(
+          CCall(CAtom(_), CAtom("get"), [CInt(0), CVar("p0")]),
+          [
+            CClause([PTuple([PAtom("ok"), _])], _, _),
+            CClause([PTuple([PAtom("error"), _])], _, _),
+          ],
+        ),
+        _,
+      ),
+    ),
+  ) = p5_fdef(ir.TableGet("t0", ir.Var("p0")), [ir.TFuncRef], binding())
+}
+
+/// `TableSize(t0)` → a bare `rt_table:size(0)` (never traps). §4.4.6.
+pub fn table_size_test() {
+  let assert FunDef(_, CFun(_, CCall(CAtom(_), CAtom("size"), [CInt(0)]))) =
+    p5_fdef(ir.TableSize("t0"), [ir.TI32], binding())
+}
+
+/// `TableGrow(t0, delta, init)` (Cell) → a bare `rt_table:grow(0, Delta, Init)` returning the old
+/// size / `-1` (never traps). §4.4.6 (grow returns `-1` on failure).
+pub fn table_grow_test() {
+  let assert FunDef(
+    _,
+    CFun(
+      _,
+      CCall(
+        CAtom(_),
+        CAtom("grow"),
+        [CInt(0), CInt(1), CTuple([CAtom("ref_null")])],
+      ),
+    ),
+  ) =
+    p5_fdef(
+      ir.TableGrow("t0", ir.ConstI32(1), ir.ConstNull(ir.FuncRef)),
+      [ir.TI32],
+      binding(),
+    )
+}
+
+/// The memory-index ROUTING (H3/H7): `MemLoad(0, …)` emits the byte-identical Phase-4 `rt_mem:load`
+/// (NO index arg); `MemLoad(1, …)` emits `rt_mem:load_at(1, …)` (a leading memidx). A single-memory
+/// index-0 module is unchanged from Phase-4.
+pub fn mem_load_index_routing_test() {
+  // index 0 → the un-indexed head.
+  let load0 = ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("p0"), 0, ir.TI32)
+  let assert FunDef(
+    _,
+    CFun(
+      _,
+      CLet(
+        [_],
+        CCase(
+          CCall(CAtom(_), CAtom("load"), [CInt(4), _, _, CVar("p0"), CInt(0)]),
+          _,
+        ),
+        _,
+      ),
+    ),
+  ) = p5_fdef(load0, [ir.TI32], binding())
+  // index 1 → the `_at` head with a leading memory index.
+  let load1 = ir.MemLoad(1, ir.MemAccess(4, False), ir.Var("p0"), 0, ir.TI32)
+  let assert FunDef(
+    _,
+    CFun(
+      _,
+      CLet(
+        [_],
+        CCase(
+          CCall(
+            CAtom(_),
+            CAtom("load_at"),
+            [CInt(1), CInt(4), _, _, CVar("p0"), CInt(0)],
+          ),
+          _,
+        ),
+        _,
+      ),
+    ),
+  ) = p5_fdef(load1, [ir.TI32], binding())
+}
+
+/// `MemFill(0, …)` → an eager trapping `rt_mem:fill(0, D, V, N)`; `MemCopy(1, 0, …)` →
+/// `rt_mem:copy(1, 0, D, S, N)` (the memory indices lead). §4.4.7.
+pub fn mem_bulk_test() {
+  let fill =
+    ir.Let(
+      [],
+      ir.MemFill(0, ir.ConstI32(0), ir.ConstI32(0xAB), ir.Var("p0")),
+      ir.Values([]),
+    )
+  let assert FunDef(_, CFun(_, CLet([_], fill_case, _))) =
+    p5_fdef(fill, [], binding())
+  let assert CCase(
+    CCall(CAtom(_), CAtom("fill"), [CInt(0), CInt(0), CInt(0xAB), CVar("p0")]),
+    _,
+  ) = fill_case
+  let copy =
+    ir.Let(
+      [],
+      ir.MemCopy(1, 0, ir.ConstI32(0), ir.ConstI32(0), ir.Var("p0")),
+      ir.Values([]),
+    )
+  let assert FunDef(_, CFun(_, CLet([_], copy_case, _))) =
+    p5_fdef(copy, [], binding())
+  let assert CCase(
+    CCall(
+      CAtom(_),
+      CAtom("copy"),
+      [CInt(1), CInt(0), CInt(0), CInt(0), CVar("p0")],
+    ),
+    _,
+  ) = copy_case
+}
+
+/// `MemInit(0, 0, …)` DROP-GATES the segment payload (R2): the bytes are
+/// `case rt_state:data_dropped(0) of 'true' -> <<>>; _ -> <<1,2,3,4>> end`, so a dropped segment
+/// behaves as length-0 (a later init with `count > 0` traps on the source bound). §4.4.9.
+pub fn mem_init_drop_gate_test() {
+  let init =
+    ir.Let(
+      [],
+      ir.MemInit(0, 0, ir.ConstI32(0), ir.ConstI32(0), ir.Var("p0")),
+      ir.Values([]),
+    )
+  // the drop-gate binds the payload, which is empty when dropped and the literal bytes otherwise.
+  let assert FunDef(_, CFun(_, CLet([seg], gate, _))) =
+    p5_fdef(init, [], binding())
+  let assert CCase(
+    CCall(CAtom(_), CAtom("data_dropped"), [CInt(0)]),
+    [
+      CClause([PAtom("true")], CAtom("true"), CBinary([])),
+      CClause([PVar(_)], CAtom("true"), CBinary([_, _, _, _])),
+    ],
+  ) = gate
+  // …then the gated payload feeds `rt_mem:init(0, Seg, …)`.
+  assert seg != ""
+}
+
+/// H7 threading-neutrality of REFERENCES (§A.2): under `Threaded`, a REFERENCE-only function keeps
+/// its pure Phase-1 arity `f/1` (a `ref.func` alone does NOT force record threading), while a
+/// TABLE-op function is state-reaching and threads the record at `f/2`.
+pub fn reference_only_stays_pure_under_threaded_test() {
+  // ref.func only → still `f/1` (pure), no leading `InstanceState`.
+  let assert FunDef(FName("f", 1), _) =
+    p5_fdef(ir.RefFunc("target"), [ir.TFuncRef], threaded())
+  // a table op → `f/2` (state-reaching), the record threaded as the leading parameter.
+  let assert FunDef(FName("f", 2), _) =
+    p5_fdef(ir.TableSize("t0"), [ir.TI32], threaded())
+}

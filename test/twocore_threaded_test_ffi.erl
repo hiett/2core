@@ -8,13 +8,24 @@
 %% turns a trap / capability-denial into `{error, Reason}` instead of crashing the test process.
 %% It does not touch any unit-owned source file.
 -module(twocore_threaded_test_ffi).
--export([instantiate/1, invoke/4]).
+-export([instantiate/1, instantiate_with/2, invoke/4]).
 
 %% Run Mod:instantiate() and YIELD the threaded instance-state record.
 %% On success `{ok, St}` (a Gleam `Ok(Dynamic)` — the record travels opaquely); on a trap at
 %% instantiation (e.g. an out-of-bounds active data/element segment) `{error, ReasonBin}`.
 instantiate(Mod) ->
     try Mod:instantiate() of
+        St -> {ok, St}
+    catch
+        _Class:Reason ->
+            {error, unicode:characters_to_binary(io_lib:format("~0p", [Reason]))}
+    end.
+
+%% Run Mod:instantiate(Imports) (the `instantiate/1` ABI of an import-bearing module, P5-06/09)
+%% and YIELD the threaded instance-state record. `Imports` is the positional `[Provided ...]`
+%% list `link:link_imports` returns. Same capture semantics as `instantiate/1`.
+instantiate_with(Mod, Imports) ->
+    try Mod:instantiate(Imports) of
         St -> {ok, St}
     catch
         _Class:Reason ->

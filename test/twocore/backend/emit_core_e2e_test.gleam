@@ -19,6 +19,7 @@ import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/ir
 import twocore/runtime/instance
+import twocore/runtime/link
 
 // Test-only FFI (see `test/twocore_emit_test_ffi.erl`): apply `M:F(Args)` and capture a
 // trap / capability-denial as `Error(text)` instead of crashing the test process.
@@ -28,6 +29,21 @@ fn catch_apply(
   function: Atom,
   args: List(Int),
 ) -> Result(Int, String)
+
+// The SAME `catch_apply/3` FFI, re-typed for `Dynamic` arguments/results — used to drive the
+// `instantiate/1(Imports)` ABI of an import-bearing module (the single argument is the whole
+// positional `[Provided ...]` list). `erlang:apply` is untyped at runtime, so this is sound.
+@external(erlang, "twocore_emit_test_ffi", "catch_apply")
+fn catch_apply_dyn(
+  module: Atom,
+  function: Atom,
+  args: List(Dynamic),
+) -> Result(Dynamic, String)
+
+// Coerce any Gleam value to `Dynamic` (identity at runtime) — to hand the `List(Provided)`
+// import list to `instantiate/1` as a single opaque argument.
+@external(erlang, "gleam_stdlib", "identity")
+fn to_dynamic(x: a) -> Dynamic
 
 // ───────────────────────────── plumbing ─────────────────────────────
 
@@ -1090,3 +1106,458 @@ pub fn threaded_oob_element_segment_traps_at_instantiation_e2e_test() {
   let assert Error(reason) = t_instantiate(mod)
   assert string.contains(reason, "table_out_of_bounds")
 }
+
+// ════════════════════ Phase-5 (P5-06): references / tables / bulk / multi-mem / imports ════════════════════
+//
+// The P5-06 payoff (unit-doc §"Verification" test 6): hand-built IR3 modules using the new
+// reference/table/bulk/multi-memory/import surface compile, instantiate, and RUN spec-correctly on
+// the BEAM, under BOTH `Cell` and `Threaded`, with every new trap fail-closing. Results are held
+// to the WebAssembly spec (reference-types + bulk-memory proposals, now the living standard).
+
+/// A reference/table module: a funcref table `t0` (size 3), `inc : [i32]->[i32]` placed at slot 0
+/// by an active element segment (slots 1,2 null), and functions exercising `ref.func` /
+/// `table.set` / `table.get` / `ref.is_null` / `table.grow` / `call_indirect`.
+fn reftype_module(name: String) -> ir.Module {
+  let inc =
+    ir.Function(
+      "inc",
+      [ir.Local("x", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Let(
+        ["r"],
+        ir.Num(ir.IAdd(ir.W32), [ir.Var("x"), ir.ConstI32(1)]),
+        ir.Return([ir.Var("r")]),
+      ),
+    )
+  // `table.get $t0 i` then `ref.is_null` → i32 1 (null slot) / 0 (filled); an OOB index traps.
+  let isnull =
+    ir.Function(
+      "isnull",
+      [ir.Local("i", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Let(["r"], ir.TableGet("t0", ir.Var("i")), ir.RefIsNull(ir.Var("r"))),
+    )
+  // `call_indirect` through the pre-filled slot 0 (spec-correct dispatch).
+  let call0 =
+    ir.Function(
+      "call0",
+      [ir.Local("x", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.CallIndirect("t0", ir.ConstI32(0), ir.FuncType([ir.TI32], [ir.TI32]), [
+        ir.Var("x"),
+      ]),
+    )
+  // `ref.func inc` → `table.set` slot 1 → `call_indirect` slot 1 (the set/get round-trip).
+  let setcall =
+    ir.Function(
+      "setcall",
+      [ir.Local("x", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Let(
+        ["r"],
+        ir.RefFunc("inc"),
+        ir.Let(
+          [],
+          ir.TableSet("t0", ir.ConstI32(1), ir.Var("r")),
+          ir.CallIndirect(
+            "t0",
+            ir.ConstI32(1),
+            ir.FuncType([ir.TI32], [ir.TI32]),
+            [ir.Var("x")],
+          ),
+        ),
+      ),
+    )
+  // `call_indirect` through the null slot 2 → traps UninitializedElement (spec §4.4.6).
+  let callnull =
+    ir.Function(
+      "callnull",
+      [ir.Local("x", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.CallIndirect("t0", ir.ConstI32(2), ir.FuncType([ir.TI32], [ir.TI32]), [
+        ir.Var("x"),
+      ]),
+    )
+  // `table.grow(+1, ref.func inc)` → the new slot (at the OLD size) is callable.
+  let growcall =
+    ir.Function(
+      "growcall",
+      [ir.Local("x", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Let(
+        ["r"],
+        ir.RefFunc("inc"),
+        ir.Let(
+          ["old"],
+          ir.TableGrow("t0", ir.ConstI32(1), ir.Var("r")),
+          ir.CallIndirect(
+            "t0",
+            ir.Var("old"),
+            ir.FuncType([ir.TI32], [ir.TI32]),
+            [ir.Var("x")],
+          ),
+        ),
+      ),
+    )
+  ir.Module(
+    name: "twocore@e2e@" <> name,
+    uses_numerics: True,
+    memories: [],
+    globals: [],
+    imports: [],
+    functions: [inc, isnull, call0, setcall, callnull, growcall],
+    exports: [
+      ir.ExportFn("isnull", "isnull"),
+      ir.ExportFn("call0", "call0"),
+      ir.ExportFn("setcall", "setcall"),
+      ir.ExportFn("callnull", "callnull"),
+      ir.ExportFn("growcall", "growcall"),
+    ],
+    data_segments: [],
+    tables: [ir.TableDecl("t0", ir.FuncRef, 3, option.None)],
+    elements: [
+      ir.ElementSegment(
+        ir.ElemActive("t0", ir.Values([ir.ConstI32(0)])),
+        ir.FuncRef,
+        [ir.RefFunc("inc")],
+      ),
+    ],
+    start: option.None,
+  )
+}
+
+/// REFERENCE/TABLE end-to-end (Cell): `ref.func`/`table.set`/`table.get`/`ref.is_null`/
+/// `table.grow`/`call_indirect` run spec-correctly, and a null-slot `call_indirect` + an OOB
+/// `table.get` fail-closed. Cite reference-types §4.4.6 (`table.get` OOB → `TableOutOfBounds`;
+/// a null `call_indirect` slot → `UninitializedElement`; `table.grow` returns the old size).
+pub fn reftype_table_e2e_test() {
+  let mod = load(reftype_module("reftype"))
+  instantiate(mod)
+  // slot 0 = inc (not null); slot 1 = null; an OOB get traps.
+  assert catch_apply(mod, atom.create("isnull"), [0]) == Ok(0)
+  assert catch_apply(mod, atom.create("isnull"), [1]) == Ok(1)
+  assert catch_apply(mod, atom.create("call0"), [41]) == Ok(42)
+  let assert Error(uninit) = catch_apply(mod, atom.create("callnull"), [7])
+  assert string.contains(uninit, "uninitialized_element")
+  let assert Error(oob) = catch_apply(mod, atom.create("isnull"), [5])
+  assert string.contains(oob, "table_out_of_bounds")
+  // set slot 1 = inc, then call it; the slot is now non-null.
+  assert catch_apply(mod, atom.create("setcall"), [5]) == Ok(6)
+  assert catch_apply(mod, atom.create("isnull"), [1]) == Ok(0)
+  // grow(+1, inc) and call the freshly-grown slot.
+  assert catch_apply(mod, atom.create("growcall"), [9]) == Ok(10)
+}
+
+/// REFERENCE/TABLE end-to-end (Threaded): the SAME program threads the `InstanceState` record
+/// through every table op — spec-correct results and the same fail-closed traps as `Cell` (G7).
+pub fn reftype_table_threaded_e2e_test() {
+  let mod = load_threaded(reftype_module("reftypethreaded"))
+  let assert Ok(st0) = t_instantiate(mod)
+  let assert Ok(#(a, st1)) = t_invoke_int(mod, atom.create("isnull"), st0, [0])
+  assert a == 0
+  let assert Ok(#(b, st2)) = t_invoke_int(mod, atom.create("isnull"), st1, [1])
+  assert b == 1
+  let assert Ok(#(c, st3)) = t_invoke_int(mod, atom.create("call0"), st2, [41])
+  assert c == 42
+  let assert Error(uninit) =
+    t_invoke_int(mod, atom.create("callnull"), st3, [7])
+  assert string.contains(uninit, "uninitialized_element")
+  let assert Error(oob) = t_invoke_int(mod, atom.create("isnull"), st3, [5])
+  assert string.contains(oob, "table_out_of_bounds")
+  let assert Ok(#(d, st4)) = t_invoke_int(mod, atom.create("setcall"), st3, [5])
+  assert d == 6
+  // the threaded record carries the set — slot 1 is now non-null.
+  let assert Ok(#(e, st5)) = t_invoke_int(mod, atom.create("isnull"), st4, [1])
+  assert e == 0
+  let assert Ok(#(g, _)) = t_invoke_int(mod, atom.create("growcall"), st5, [9])
+  assert g == 10
+}
+
+/// A bulk-memory module: one memory + a PASSIVE data segment `<<1,2,3,4>>`, with
+/// `memory.fill`/`memory.copy`/`memory.init`/`data.drop` + byte load/store.
+fn bulk_module(name: String) -> ir.Module {
+  let store8 = store_fn("store8", 1)
+  let load8 = load_fn("load8", 1, False, ir.TI32)
+  let fill =
+    ir.Function(
+      "fill",
+      [ir.Local("d", ir.TI32), ir.Local("v", ir.TI32), ir.Local("n", ir.TI32)],
+      [],
+      [],
+      ir.Let(
+        [],
+        ir.MemFill(0, ir.Var("d"), ir.Var("v"), ir.Var("n")),
+        ir.Values([]),
+      ),
+    )
+  let copy =
+    ir.Function(
+      "copy",
+      [ir.Local("d", ir.TI32), ir.Local("s", ir.TI32), ir.Local("n", ir.TI32)],
+      [],
+      [],
+      ir.Let(
+        [],
+        ir.MemCopy(0, 0, ir.Var("d"), ir.Var("s"), ir.Var("n")),
+        ir.Values([]),
+      ),
+    )
+  let meminit =
+    ir.Function(
+      "meminit",
+      [ir.Local("d", ir.TI32), ir.Local("s", ir.TI32), ir.Local("n", ir.TI32)],
+      [],
+      [],
+      ir.Let(
+        [],
+        ir.MemInit(0, 0, ir.Var("d"), ir.Var("s"), ir.Var("n")),
+        ir.Values([]),
+      ),
+    )
+  let dropdata =
+    ir.Function(
+      "dropdata",
+      [],
+      [],
+      [],
+      ir.Let([], ir.DataDrop(0), ir.Values([])),
+    )
+  ir.Module(
+    name: "twocore@e2e@" <> name,
+    uses_numerics: True,
+    memories: [ir.MemoryDecl(1, option.None, ir.Idx32)],
+    globals: [],
+    imports: [],
+    functions: [store8, load8, fill, copy, meminit, dropdata],
+    exports: list.map(
+      ["store8", "load8", "fill", "copy", "meminit", "dropdata"],
+      fn(n) { ir.ExportFn(n, n) },
+    ),
+    data_segments: [ir.DataSegment(ir.DataPassive, <<1, 2, 3, 4>>)],
+    tables: [],
+    elements: [],
+    start: option.None,
+  )
+}
+
+/// BULK-MEMORY end-to-end (Cell): `memory.init` from a passive segment writes it; `memory.copy`
+/// is overlap-correct; `memory.fill` writes a byte run; `data.drop` then `memory.init` from the
+/// dropped segment with non-zero count TRAPS; an out-of-range `memory.fill` traps with no partial
+/// write. Cite bulk-memory §4.4.7/§4.4.9 (eager bounds, dropped segment ⇒ length-0).
+pub fn bulk_memory_e2e_test() {
+  let mod = load(bulk_module("bulk"))
+  instantiate(mod)
+  // memory.init(dst=10, src=0, n=4) copies the passive segment <<1,2,3,4>> to offset 10.
+  let assert Ok(_) = catch_apply(mod, atom.create("meminit"), [10, 0, 4])
+  assert catch_apply(mod, atom.create("load8"), [10]) == Ok(1)
+  assert catch_apply(mod, atom.create("load8"), [13]) == Ok(4)
+  // memory.copy(dst=20, src=10, n=4) is memmove-correct.
+  let assert Ok(_) = catch_apply(mod, atom.create("copy"), [20, 10, 4])
+  assert catch_apply(mod, atom.create("load8"), [20]) == Ok(1)
+  assert catch_apply(mod, atom.create("load8"), [23]) == Ok(4)
+  // overlapping forward copy(dst=21, src=20, n=3): <<1,2,3>> → 21,22,23 (memmove, not a naive
+  // forward loop which would smear 1s).
+  let assert Ok(_) = catch_apply(mod, atom.create("copy"), [21, 20, 3])
+  assert catch_apply(mod, atom.create("load8"), [21]) == Ok(1)
+  assert catch_apply(mod, atom.create("load8"), [22]) == Ok(2)
+  assert catch_apply(mod, atom.create("load8"), [23]) == Ok(3)
+  // memory.fill(dest=30, value=0xAB, n=5) writes the low byte.
+  let assert Ok(_) = catch_apply(mod, atom.create("fill"), [30, 0xAB, 5])
+  assert catch_apply(mod, atom.create("load8"), [30]) == Ok(0xAB)
+  assert catch_apply(mod, atom.create("load8"), [34]) == Ok(0xAB)
+  // an out-of-range fill traps with no partial write (dest+n > 65536).
+  let assert Error(fo) = catch_apply(mod, atom.create("fill"), [65_535, 0, 4])
+  assert string.contains(fo, "memory_out_of_bounds")
+  // data.drop then memory.init from the dropped (length-0) segment with n>0 traps.
+  let assert Ok(_) = catch_apply(mod, atom.create("dropdata"), [])
+  let assert Error(di) = catch_apply(mod, atom.create("meminit"), [0, 0, 4])
+  assert string.contains(di, "memory_out_of_bounds")
+  // n=0 from a dropped segment is a no-op (does NOT trap).
+  let assert Ok(_) = catch_apply(mod, atom.create("meminit"), [0, 0, 0])
+}
+
+/// BULK-MEMORY end-to-end (Threaded): the SAME bulk ops thread the record; spec-correct writes +
+/// the same fail-closed traps as `Cell` (G7).
+pub fn bulk_memory_threaded_e2e_test() {
+  let mod = load_threaded(bulk_module("bulkthreaded"))
+  let assert Ok(st0) = t_instantiate(mod)
+  let assert Ok(#(_, st1)) =
+    t_invoke_unit(mod, atom.create("meminit"), st0, [10, 0, 4])
+  let assert Ok(#(v1, st2)) = t_invoke_int(mod, atom.create("load8"), st1, [10])
+  assert v1 == 1
+  let assert Ok(#(_, st3)) =
+    t_invoke_unit(mod, atom.create("copy"), st2, [20, 10, 4])
+  let assert Ok(#(v2, st4)) = t_invoke_int(mod, atom.create("load8"), st3, [23])
+  assert v2 == 4
+  let assert Ok(#(_, st5)) =
+    t_invoke_unit(mod, atom.create("fill"), st4, [30, 0xAB, 5])
+  let assert Ok(#(v3, st6)) = t_invoke_int(mod, atom.create("load8"), st5, [34])
+  assert v3 == 0xAB
+  // data.drop threads the record; a later init from the dropped segment traps.
+  let assert Ok(#(_, st7)) =
+    t_invoke_unit(mod, atom.create("dropdata"), st6, [])
+  let assert Error(di) =
+    t_invoke_int(mod, atom.create("meminit"), st7, [0, 0, 4])
+  assert string.contains(di, "memory_out_of_bounds")
+}
+
+/// A two-memory module: independent i32 store/load on memory 0 and memory 1 + each memory's size.
+fn multimem_module(name: String) -> ir.Module {
+  let store = fn(fname: String, mem: Int) {
+    ir.Function(
+      fname,
+      [ir.Local("a", ir.TI32), ir.Local("v", ir.TI32)],
+      [],
+      [],
+      ir.Let(
+        [],
+        ir.MemStore(mem, ir.MemAccess(4, False), ir.Var("a"), ir.Var("v"), 0),
+        ir.Values([]),
+      ),
+    )
+  }
+  let load = fn(fname: String, mem: Int) {
+    ir.Function(
+      fname,
+      [ir.Local("a", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.MemLoad(mem, ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32),
+    )
+  }
+  let fns = [
+    store("store0", 0),
+    load("load0", 0),
+    store("store1", 1),
+    load("load1", 1),
+    ir.Function("size0", [], [ir.TI32], [], ir.MemSize(0)),
+    ir.Function("size1", [], [ir.TI32], [], ir.MemSize(1)),
+  ]
+  ir.Module(
+    name: "twocore@e2e@" <> name,
+    uses_numerics: True,
+    memories: [
+      ir.MemoryDecl(1, option.None, ir.Idx32),
+      ir.MemoryDecl(2, option.None, ir.Idx32),
+    ],
+    globals: [],
+    imports: [],
+    functions: fns,
+    exports: list.map(fns, fn(f) { ir.ExportFn(f.name, f.name) }),
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
+  )
+}
+
+/// MULTI-MEMORY end-to-end (Cell): a store to memory 1 round-trips from memory 1 and does NOT
+/// disturb memory 0; each memory's `memory.size` is independent (memory 0 = 1 page, memory 1 = 2
+/// pages, from their distinct declared minimums). Cite H3 (every memory instruction carries a
+/// memory index; the memories are independent regions).
+pub fn multi_memory_e2e_test() {
+  let mod = load(multimem_module("multimem"))
+  instantiate(mod)
+  // sizes reflect the distinct declared minimums (1 vs 2 pages) → routing is by index.
+  assert catch_apply(mod, atom.create("size0"), []) == Ok(1)
+  assert catch_apply(mod, atom.create("size1"), []) == Ok(2)
+  // store to memory 1; read it back from memory 1; memory 0 at the same address is untouched.
+  let assert Ok(_) = catch_apply(mod, atom.create("store1"), [0, 42])
+  assert catch_apply(mod, atom.create("load1"), [0]) == Ok(42)
+  assert catch_apply(mod, atom.create("load0"), [0]) == Ok(0)
+  // store to memory 0; both memories now hold their own value independently.
+  let assert Ok(_) = catch_apply(mod, atom.create("store0"), [0, 7])
+  assert catch_apply(mod, atom.create("load0"), [0]) == Ok(7)
+  assert catch_apply(mod, atom.create("load1"), [0]) == Ok(42)
+}
+
+/// MULTI-MEMORY end-to-end (Threaded): the two memories thread through one record independently.
+pub fn multi_memory_threaded_e2e_test() {
+  let mod = load_threaded(multimem_module("multimemthreaded"))
+  let assert Ok(st0) = t_instantiate(mod)
+  let assert Ok(#(s0, st1)) = t_invoke_int(mod, atom.create("size0"), st0, [])
+  assert s0 == 1
+  let assert Ok(#(s1, st2)) = t_invoke_int(mod, atom.create("size1"), st1, [])
+  assert s1 == 2
+  let assert Ok(#(_, st3)) =
+    t_invoke_unit(mod, atom.create("store1"), st2, [0, 42])
+  let assert Ok(#(v1, st4)) = t_invoke_int(mod, atom.create("load1"), st3, [0])
+  assert v1 == 42
+  let assert Ok(#(v0, _)) = t_invoke_int(mod, atom.create("load0"), st4, [0])
+  assert v0 == 0
+}
+
+/// An import module: imports `spectest.global_i32 : i32` (= 666) and `spectest.memory (1 2)`.
+/// The imported global is local name `g0`; the imported memory is memory index 0. Reads the
+/// global; stores/loads the imported memory.
+fn import_module(name: String) -> ir.Module {
+  let read_global =
+    ir.Function("read_global", [], [ir.TI32], [], ir.GlobalGet("g0"))
+  let store = store_fn("store32", 4)
+  let load = load_fn("load32", 4, False, ir.TI32)
+  ir.Module(
+    name: "twocore@e2e@" <> name,
+    uses_numerics: True,
+    memories: [],
+    globals: [],
+    imports: [
+      ir.ImportGlobal("spectest", "global_i32", ir.TI32, False),
+      ir.ImportMemory("spectest", "memory", 1, option.Some(2), ir.Idx32),
+    ],
+    functions: [read_global, store, load],
+    exports: [
+      ir.ExportFn("read_global", "read_global"),
+      ir.ExportFn("store32", "store32"),
+      ir.ExportFn("load32", "load32"),
+    ],
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
+  )
+}
+
+/// IMPORT end-to-end (Cell): a module importing a `spectest` global + memory is linked via
+/// `link.link_imports` (fail-closed matching) and instantiated through the generated
+/// `instantiate/1(Imports)`; it reads the provided global (`= 666`, the official `spectest`
+/// value) and round-trips the provided memory. Cite H4 (imported globals/memories are provided
+/// state, wired at the low indices) + R14 (`spectest.global_i32 = 666`).
+pub fn import_spectest_e2e_test() {
+  let m = import_module("import")
+  let mod = load(m)
+  let assert Ok(imports) = link.link_imports(m, [])
+  let assert Ok(_) =
+    catch_apply_dyn(mod, atom.create("instantiate"), [to_dynamic(imports)])
+  // the imported global's value is the official spectest 666.
+  assert catch_apply(mod, atom.create("read_global"), []) == Ok(666)
+  // the imported memory round-trips a store/load.
+  let assert Ok(_) = catch_apply(mod, atom.create("store32"), [0, 123_456])
+  assert catch_apply(mod, atom.create("load32"), [0]) == Ok(123_456)
+}
+
+/// IMPORT end-to-end (Threaded): the same import wiring under `Threaded` — `instantiate/1(Imports)`
+/// RETURNS the seeded record, then the reads thread it.
+pub fn import_spectest_threaded_e2e_test() {
+  let m = import_module("importthreaded")
+  let mod = load_threaded(m)
+  let assert Ok(imports) = link.link_imports(m, [])
+  let assert Ok(st0) = t_instantiate_with(mod, to_dynamic(imports))
+  let assert Ok(#(g, st1)) =
+    t_invoke_int(mod, atom.create("read_global"), st0, [])
+  assert g == 666
+  let assert Ok(#(_, st2)) =
+    t_invoke_unit(mod, atom.create("store32"), st1, [0, 123_456])
+  let assert Ok(#(v, _)) = t_invoke_int(mod, atom.create("load32"), st2, [0])
+  assert v == 123_456
+}
+
+// Test-only FFI: run `Mod:instantiate(Imports)` (the `instantiate/1` ABI), yielding the threaded
+// record or a trap text.
+@external(erlang, "twocore_threaded_test_ffi", "instantiate_with")
+fn t_instantiate_with(module: Atom, imports: Dynamic) -> Result(Dynamic, String)

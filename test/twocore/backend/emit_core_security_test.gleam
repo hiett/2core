@@ -30,7 +30,11 @@ import twocore/runtime/instance
 import twocore/runtime/profiles
 
 /// The set of fixed runtime module names the `Binding` permits a `call` to target. Extended
-/// in Phase 2 with the memory/table/state modules — the new stateful-op authority (D3a).
+/// in Phase 2 with the memory/table/state modules, and in Phase 5 with the two build-controlled
+/// atoms `emit_core` reaches WITHOUT a `Binding` field (R1/R4): `rt_ref` (`RefIsNull`'s
+/// `is_null`) and `link` (the `instantiate/1` `provided_*` externval extractors). Both are fixed
+/// literal atoms, admitted here exactly like a `binding.*_module` (D3a — still no ambient
+/// authority: a larger allow-set is more permissive, but every atom in it is build-controlled).
 fn runtime_modules(b: instance.Binding) -> Set(String) {
   set.from_list([
     b.num_module,
@@ -41,6 +45,8 @@ fn runtime_modules(b: instance.Binding) -> Set(String) {
     b.mem_module,
     b.table_module,
     b.state_module,
+    "twocore@runtime@rt_ref",
+    "twocore@runtime@link",
   ])
 }
 
@@ -363,6 +369,249 @@ pub fn no_ambient_authority_under_threaded_test() {
   // (c) The three call_indirect faults still delegate to `rt_table`/`rt_trap` (no emit-time
   // per-fault branching) — threading the record widens no emit-site authority.
   assert has_call(m, binding.trap_module, "raise")
+}
+
+/// A Phase-5 module exercising the WHOLE new authority surface (§Verification test 5):
+/// `ref.func`/`ref.is_null`, every table op (`get`/`set`/`size`/`grow`/`fill`/`init`/`copy`),
+/// every bulk-memory op (`fill`/`copy`/`init`/`data.drop`/`elem.drop`), a SECOND memory (memidx
+/// 1, `_at` routing), a passive data + passive element segment (drop-gated payloads), a
+/// `table.copy` between two tables, a non-function import (a `spectest` global + an `env` memory
+/// → the `link.provided_*` weaving in `instantiate/1`), a reference-typed global (the
+/// `ref_globals` path), and exported STATE (global/table/memory accessors).
+fn phase5_module() -> ir.Module {
+  let target =
+    ir.Function(
+      name: "target",
+      params: [ir.Local("p0", ir.TI32)],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.Return([ir.Var("p0")]),
+    )
+  let f =
+    ir.Function(
+      name: "f",
+      params: [ir.Local("p0", ir.TI32)],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.Let(
+        ["ref"],
+        ir.RefFunc("target"),
+        ir.Let(
+          ["nn"],
+          ir.RefIsNull(ir.Var("ref")),
+          ir.Let(
+            [],
+            ir.TableSet("t0", ir.ConstI32(0), ir.Var("ref")),
+            ir.Let(
+              ["g"],
+              ir.TableGet("t0", ir.ConstI32(0)),
+              ir.Let(
+                ["_sz"],
+                ir.TableSize("t0"),
+                ir.Let(
+                  ["_og"],
+                  ir.TableGrow("t0", ir.ConstI32(1), ir.Var("ref")),
+                  ir.Let(
+                    [],
+                    ir.TableFill(
+                      "t0",
+                      ir.ConstI32(0),
+                      ir.Var("ref"),
+                      ir.ConstI32(1),
+                    ),
+                    ir.Let(
+                      [],
+                      ir.TableInit(
+                        "t0",
+                        2,
+                        ir.ConstI32(0),
+                        ir.ConstI32(0),
+                        ir.ConstI32(0),
+                      ),
+                      ir.Let(
+                        [],
+                        ir.TableCopy(
+                          "t0",
+                          "t1",
+                          ir.ConstI32(0),
+                          ir.ConstI32(0),
+                          ir.ConstI32(0),
+                        ),
+                        ir.Let(
+                          [],
+                          ir.ElemDrop(2),
+                          ir.Let(
+                            [],
+                            ir.MemFill(
+                              0,
+                              ir.ConstI32(0),
+                              ir.ConstI32(0),
+                              ir.ConstI32(0),
+                            ),
+                            ir.Let(
+                              [],
+                              ir.MemCopy(
+                                0,
+                                1,
+                                ir.ConstI32(0),
+                                ir.ConstI32(0),
+                                ir.ConstI32(0),
+                              ),
+                              ir.Let(
+                                [],
+                                ir.MemInit(
+                                  0,
+                                  0,
+                                  ir.ConstI32(0),
+                                  ir.ConstI32(0),
+                                  ir.ConstI32(0),
+                                ),
+                                ir.Let(
+                                  [],
+                                  ir.DataDrop(0),
+                                  ir.Let(
+                                    [],
+                                    ir.MemStore(
+                                      1,
+                                      ir.MemAccess(4, False),
+                                      ir.ConstI32(0),
+                                      ir.Var("p0"),
+                                      0,
+                                    ),
+                                    ir.Let(
+                                      ["ld"],
+                                      ir.MemLoad(
+                                        1,
+                                        ir.MemAccess(4, False),
+                                        ir.ConstI32(0),
+                                        0,
+                                        ir.TI32,
+                                      ),
+                                      ir.CallIndirect(
+                                        "t0",
+                                        ir.Var("ld"),
+                                        ir.FuncType([ir.TI32], [ir.TI32]),
+                                        [ir.Var("p0")],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    )
+  ir.Module(
+    name: "twocore@test@phase5",
+    uses_numerics: True,
+    // Imported memory (env) at memidx 0; defined memory at memidx 1.
+    memories: [ir.MemoryDecl(1, option.None, ir.Idx32)],
+    globals: [
+      ir.GlobalDecl(
+        "gref",
+        ir.TFuncRef,
+        False,
+        ir.Values([
+          ir.ConstNull(ir.FuncRef),
+        ]),
+      ),
+    ],
+    imports: [
+      ir.ImportGlobal("spectest", "global_i32", ir.TI32, False),
+      ir.ImportMemory("env", "mem", 1, option.None, ir.Idx32),
+    ],
+    functions: [target, f],
+    exports: [
+      ir.ExportFn("f", "f"),
+      ir.ExportGlobal("eg", "g0"),
+      ir.ExportGlobal("egref", "gref"),
+      ir.ExportTable("et", "t0"),
+      ir.ExportMemory("em", 1),
+    ],
+    data_segments: [ir.DataSegment(ir.DataPassive, <<1, 2>>)],
+    tables: [
+      ir.TableDecl("t0", ir.FuncRef, 4, option.None),
+      ir.TableDecl("t1", ir.FuncRef, 4, option.None),
+    ],
+    elements: [
+      ir.ElementSegment(
+        ir.ElemActive("t0", ir.Values([ir.ConstI32(0)])),
+        ir.FuncRef,
+        [ir.RefFunc("target")],
+      ),
+      // active at table 1 → routes through `init_elem_ref` (non-zero table).
+      ir.ElementSegment(
+        ir.ElemActive("t1", ir.Values([ir.ConstI32(0)])),
+        ir.FuncRef,
+        [ir.RefFunc("target")],
+      ),
+      // passive → consumed by `table.init`, dropped by `elem.drop` (seg index 2).
+      ir.ElementSegment(ir.ElemPassive, ir.FuncRef, [ir.RefFunc("target")]),
+    ],
+    start: option.None,
+  )
+}
+
+/// EXTENDED D3a walk over the WHOLE Phase-5 authority (references/tables/bulk/multi-mem/passive
+/// segments/imports/exported state), under Cell, Threaded, AND Unsafe — all three must pass with
+/// the same allow-set: (a) every `call` targets a fixed runtime-module atom (a `binding.*_module`
+/// OR the fixed `rt_ref`/`link` atoms) with a literal function atom; (b) every `apply` is a static
+/// local `FName` (the `ref.func`/element closures are literal captures — no data-driven apply);
+/// (c) the new seam calls are delegated to the runtime, and the import weaving/exports/drops go
+/// through fixed `link`/`rt_state` calls — never a program-driven dispatch (D3a).
+pub fn phase5_ops_have_no_ambient_authority_test() {
+  let cell = instance.safe_default()
+  let threaded =
+    instance.Binding(
+      ..instance.safe_default(),
+      state_strategy: instance.Threaded,
+    )
+  let unsafe = profiles.unsafe()
+  list.each([cell, threaded, unsafe], fn(binding) {
+    let assert Ok(m) = emit_core.emit_module(phase5_module(), binding)
+    // (a) every call → a fixed runtime module + literal function atom.
+    assert_calls_are_runtime(m, binding)
+    // (b) every apply → a static local FName, never a runtime-module atom.
+    let allowed = runtime_modules(binding)
+    let applies =
+      list.flat_map(m.defs, fn(d) {
+        let core_erlang.FunDef(_, v) = d
+        applies_in(v)
+      })
+    list.each(applies, fn(name) {
+      let core_erlang.FName(n, _arity) = name
+      assert set.contains(allowed, n) == False
+    })
+    // (c) the new authority is delegated to fixed runtime calls (a representative sample).
+    // `has_op` accepts either the cell op or its `t_`-prefixed threaded twin, so the same
+    // structural assertions hold across `Cell`/`Threaded`/`Unsafe`.
+    assert has_call(m, "twocore@runtime@rt_ref", "is_null")
+    assert has_op(m, binding.table_module, "fill")
+    assert has_op(m, binding.table_module, "table_copy")
+    assert has_op(m, binding.table_module, "init_elem_ref")
+    assert has_op(m, binding.mem_module, "copy")
+    assert has_op(m, binding.state_module, "drop_data")
+    assert has_op(m, binding.state_module, "drop_elem")
+    assert has_call(m, "twocore@runtime@link", "provided_memory_value")
+    assert has_call(m, "twocore@runtime@link", "provided_global_bits")
+    // the import-bearing module builds its state via `seed_full`/`fresh_full`.
+    assert has_call(m, binding.state_module, "seed_full")
+      || has_call(m, binding.state_module, "fresh_full")
+  })
+}
+
+/// True iff `m` contains either the cell op `fun` or its `t_`-prefixed threaded twin on `module`.
+fn has_op(m: CModule, module: String, fun: String) -> Bool {
+  has_call(m, module, fun) || has_call(m, module, "t_" <> fun)
 }
 
 /// True iff some def in `m` contains a `call '<module>':'<fun>'(…)`.

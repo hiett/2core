@@ -111,6 +111,21 @@ import twocore/runtime/instance.{
   MeterOff, Threaded,
 }
 
+// ─────────────────────────────── fixed runtime-module atoms (D3a) ───────────────────────────────
+
+/// The reference-value runtime module (`runtime/rt_ref` → `twocore@runtime@rt_ref`, R1). The
+/// keystone deliberately did NOT add a `binding.ref_module` field (R1 minor), so this fixed,
+/// build-controlled atom is the home for `RefIsNull`'s `is_null` seam call. It is D3a-clean —
+/// a literal module atom, never program-derived — and is admitted by the security walk's
+/// allow-set exactly like a `binding.*_module`.
+const ref_module = "twocore@runtime@rt_ref"
+
+/// The non-function-import link/instantiate contract module (`runtime/link` →
+/// `twocore@runtime@link`, R4). Home for the `provided_*` externval extractors the generated
+/// `instantiate/1(Imports)` calls to weave each positional `Provided` into its `FullDecl`
+/// slot. A fixed build-controlled atom (D3a); never a `Binding` field.
+const link_module = "twocore@runtime@link"
+
 // ─────────────────────────────── error type (D4) ───────────────────────────────
 
 /// This stage's own error type (D4 — there is no shared `StageError`). `emit_module`
@@ -162,6 +177,17 @@ pub type EmitError {
 ///   arity `n+1`, threads the `InstanceState` record as its leading parameter, and returns
 ///   `{ResultPackage, St'}`. Computed once in `emit_module`; unused (but harmless) under
 ///   `Cell`, where every function keeps its Phase-1 shape.
+/// - `table_index`: each table NAME → its absolute tableidx in the imports-first WASM table
+///   index space (imported tables at the low indices, then `module.tables`, R7/§E.2). The
+///   reference/bulk table ops carry a `table: String`; this resolves it to the `Int` index the
+///   `rt_table` seam takes. Index 0 is the Phase-2 single/default table (byte-identical).
+/// - `elements`: the module's element segments, indexed by `table.init`'s `seg` immediate to
+///   recover the segment's compile-time init items (rendered to references + drop-gated, R2).
+/// - `data_segments`: the module's data segments, indexed by `memory.init`'s `seg` immediate to
+///   recover the segment's compile-time bytes (drop-gated, R2).
+/// - `ref_global_names`: the set of REFERENCE-typed global names (funcref/externref, R8) — an
+///   `ExportGlobal` of one routes through `ref_global_get` (the `ref_globals` map) rather than
+///   the numeric `global_get`.
 type Ctx {
   Ctx(
     binding: Binding,
@@ -169,6 +195,10 @@ type Ctx {
     fn_results: Dict(String, Int),
     fn_sig: Dict(String, FuncType),
     fn_state_reaching: Set(String),
+    table_index: Dict(String, Int),
+    elements: List(ir.ElementSegment),
+    data_segments: List(ir.DataSegment),
+    ref_global_names: Set(String),
   )
 }
 
@@ -306,6 +336,10 @@ pub fn emit_module(
       fn_results: fn_results,
       fn_sig: fn_sig,
       fn_state_reaching: fn_state_reaching,
+      table_index: build_table_index(module),
+      elements: module.elements,
+      data_segments: module.data_segments,
+      ref_global_names: reference_global_names(module),
     )
   use defs <- result.try(
     list.try_map(module.functions, fn(f) { emit_function(f, ctx) }),
@@ -315,9 +349,15 @@ pub fn emit_module(
   // the active element/data segments + start in WASM spec order. Always emitted and
   // exported so the harness (unit 11) can call `instantiate/0` in the instance process.
   use inst_def <- result.try(emit_instantiate(module, ctx))
+  // The generated entry is `instantiate/1(Imports)` for an import-bearing module (R4) and
+  // `instantiate/0` for an import-free one (byte-identical, H7).
+  let inst_arity = case count_state_imports(module) > 0 {
+    True -> 1
+    False -> 0
+  }
   Ok(core_erlang.CModule(
     name: module.name,
-    exports: list.append(export_names, [FName("instantiate", 0)]),
+    exports: list.append(export_names, [FName("instantiate", inst_arity)]),
     attributes: [],
     defs: list.append(list.append(defs, wrappers), [inst_def]),
   ))
@@ -354,87 +394,166 @@ fn emit_exports(
 ) -> Result(#(List(FName), List(FunDef)), EmitError) {
   list.try_fold(exports, #([], []), fn(acc, exp) {
     let #(names, wrappers) = acc
-    // Only FUNCTION exports lower here (the Phase-1..4 surface, byte-identical). Exported state
-    // (global/table/memory — H4) is P5-06/09's; it never appears in the existing corpus, so a
-    // typed error keeps the tree green without moving conformance.
-    use #(export_name, fn_name) <- result.try(case exp {
-      ir.ExportFn(export_name, fn_name) -> Ok(#(export_name, fn_name))
-      ir.ExportGlobal(..) -> Error(UnsupportedNode("export_global"))
-      ir.ExportTable(..) -> Error(UnsupportedNode("export_table"))
-      ir.ExportMemory(..) -> Error(UnsupportedNode("export_memory"))
-    })
-    case dict.get(ctx.fn_arity, fn_name) {
-      Error(_) -> Error(UnknownFunction(fn_name))
-      Ok(arity) ->
-        case is_threaded(ctx) {
-          False ->
-            // ── Cell: unchanged (direct export when names match, else a bare forwarder). ──
-            case export_name == fn_name {
-              True -> Ok(#([FName(fn_name, arity), ..names], wrappers))
-              False -> {
-                let params = wrapper_arg_params(arity)
-                let body = CApply(FName(fn_name, arity), list.map(params, CVar))
-                let wrapper =
-                  FunDef(FName(export_name, arity), CFun(params, body))
-                Ok(
-                  #([FName(export_name, arity), ..names], [wrapper, ..wrappers]),
-                )
-              }
-            }
-          True ->
-            case set.contains(ctx.fn_state_reaching, fn_name) {
-              // A state-reaching def already IS the `n+1` run-ABI export.
-              True ->
-                case export_name == fn_name {
-                  // Export it directly — NO second def (the P3 collision fix).
-                  True -> Ok(#([FName(fn_name, arity + 1), ..names], wrappers))
-                  // A distinctly-named forwarder to the internal `n+1` def.
-                  False -> {
-                    let params = wrapper_arg_params(arity)
-                    let body =
-                      CApply(FName(fn_name, arity + 1), [
-                        CVar(wrapper_state_param),
-                        ..list.map(params, CVar)
-                      ])
-                    let wrapper =
-                      FunDef(
-                        FName(export_name, arity + 1),
-                        CFun([wrapper_state_param, ..params], body),
-                      )
-                    Ok(
-                      #([FName(export_name, arity + 1), ..names], [
-                        wrapper,
-                        ..wrappers
-                      ]),
-                    )
-                  }
-                }
-              // A pure def gets a thin `n+1` adapter returning `{apply 'g'/n(A…), St}`.
-              False -> {
-                let params = wrapper_arg_params(arity)
-                let applied =
-                  CApply(FName(fn_name, arity), list.map(params, CVar))
-                let body = CTuple([applied, CVar(wrapper_state_param)])
-                let wrapper =
-                  FunDef(
-                    FName(export_name, arity + 1),
-                    CFun([wrapper_state_param, ..params], body),
-                  )
-                Ok(
-                  #([FName(export_name, arity + 1), ..names], [
-                    wrapper,
-                    ..wrappers
-                  ]),
-                )
-              }
-            }
+    case exp {
+      // FUNCTION exports (the Phase-1..4 surface, byte-identical) lower via the existing
+      // cell/threaded run-ABI wrappers below.
+      ir.ExportFn(export_name, fn_name) ->
+        emit_fn_export(export_name, fn_name, names, wrappers, ctx)
+      // Exported STATE (H4): a build-controlled `<export_name>/0` (cell) / `<export_name>/1(St)`
+      // (threaded) accessor reading the exported global/table/memory out of the instance state,
+      // so the harness's `(get $m "x")` and `spectest`'s exported table/memory resolve (09/11).
+      ir.ExportGlobal(export_name, global_name) -> {
+        let ref = set.contains(ctx.ref_global_names, global_name)
+        let cell_fn = case ref {
+          True -> "ref_global_get"
+          False -> "global_get"
         }
+        let threaded_fn = case ref {
+          True -> "t_ref_global_get"
+          False -> "t_global_get"
+        }
+        let cell =
+          seam_call(ctx.binding.state_module, cell_fn, [
+            core_binary_string(global_name),
+          ])
+        let threaded =
+          seam_call(ctx.binding.state_module, threaded_fn, [
+            CVar(wrapper_state_param),
+            core_binary_string(global_name),
+          ])
+        Ok(add_state_export(export_name, cell, threaded, names, wrappers, ctx))
+      }
+      ir.ExportTable(export_name, table_name) -> {
+        let idx = table_idx(ctx, table_name)
+        let cell = seam_call(ctx.binding.state_module, "table_at", [CInt(idx)])
+        let threaded =
+          seam_call(ctx.binding.state_module, "t_table_at", [
+            CVar(wrapper_state_param),
+            CInt(idx),
+          ])
+        Ok(add_state_export(export_name, cell, threaded, names, wrappers, ctx))
+      }
+      ir.ExportMemory(export_name, mem_index) -> {
+        let cell =
+          seam_call(ctx.binding.state_module, "mem_at", [
+            CInt(mem_index),
+          ])
+        let threaded =
+          seam_call(ctx.binding.state_module, "t_mem_at", [
+            CVar(wrapper_state_param),
+            CInt(mem_index),
+          ])
+        Ok(add_state_export(export_name, cell, threaded, names, wrappers, ctx))
+      }
     }
   })
   |> result.map(fn(acc) {
     let #(names, wrappers) = acc
     #(list.reverse(names), list.reverse(wrappers))
   })
+}
+
+/// Lower one `ExportFn(export_name, fn_name)` to its export name/arity + any forwarding/adapting
+/// wrapper, prepending to `names`/`wrappers` (unchanged Phase-1..4 cell/threaded run-ABI logic —
+/// see `emit_exports`). `Error(UnknownFunction)` if `fn_name` is not defined.
+fn emit_fn_export(
+  export_name: String,
+  fn_name: String,
+  names: List(FName),
+  wrappers: List(FunDef),
+  ctx: Ctx,
+) -> Result(#(List(FName), List(FunDef)), EmitError) {
+  case dict.get(ctx.fn_arity, fn_name) {
+    Error(_) -> Error(UnknownFunction(fn_name))
+    Ok(arity) ->
+      case is_threaded(ctx) {
+        False ->
+          // ── Cell: unchanged (direct export when names match, else a bare forwarder). ──
+          case export_name == fn_name {
+            True -> Ok(#([FName(fn_name, arity), ..names], wrappers))
+            False -> {
+              let params = wrapper_arg_params(arity)
+              let body = CApply(FName(fn_name, arity), list.map(params, CVar))
+              let wrapper =
+                FunDef(FName(export_name, arity), CFun(params, body))
+              Ok(#([FName(export_name, arity), ..names], [wrapper, ..wrappers]))
+            }
+          }
+        True ->
+          case set.contains(ctx.fn_state_reaching, fn_name) {
+            // A state-reaching def already IS the `n+1` run-ABI export.
+            True ->
+              case export_name == fn_name {
+                // Export it directly — NO second def (the P3 collision fix).
+                True -> Ok(#([FName(fn_name, arity + 1), ..names], wrappers))
+                // A distinctly-named forwarder to the internal `n+1` def.
+                False -> {
+                  let params = wrapper_arg_params(arity)
+                  let body =
+                    CApply(FName(fn_name, arity + 1), [
+                      CVar(wrapper_state_param),
+                      ..list.map(params, CVar)
+                    ])
+                  let wrapper =
+                    FunDef(
+                      FName(export_name, arity + 1),
+                      CFun([wrapper_state_param, ..params], body),
+                    )
+                  Ok(
+                    #([FName(export_name, arity + 1), ..names], [
+                      wrapper,
+                      ..wrappers
+                    ]),
+                  )
+                }
+              }
+            // A pure def gets a thin `n+1` adapter returning `{apply 'g'/n(A…), St}`.
+            False -> {
+              let params = wrapper_arg_params(arity)
+              let applied =
+                CApply(FName(fn_name, arity), list.map(params, CVar))
+              let body = CTuple([applied, CVar(wrapper_state_param)])
+              let wrapper =
+                FunDef(
+                  FName(export_name, arity + 1),
+                  CFun([wrapper_state_param, ..params], body),
+                )
+              Ok(
+                #([FName(export_name, arity + 1), ..names], [
+                  wrapper,
+                  ..wrappers
+                ]),
+              )
+            }
+          }
+      }
+  }
+}
+
+/// Build a STATE-export accessor and prepend it to `names`/`wrappers`. Cell:
+/// `'<export_name>'/0 = fun () -> <cell>` (the reader). Threaded: `'<export_name>'/1 =
+/// fun (St) -> {<threaded>, St}` — the run-ABI (a value paired with the unchanged record, since a
+/// state export is read-only). `cell`/`threaded` are the runtime reads (`global_get`/`table_at`/
+/// `mem_at` and their `t_*` twins); `threaded` references `wrapper_state_param` as its `St`.
+fn add_state_export(
+  export_name: String,
+  cell: CExpr,
+  threaded: CExpr,
+  names: List(FName),
+  wrappers: List(FunDef),
+  ctx: Ctx,
+) -> #(List(FName), List(FunDef)) {
+  case is_threaded(ctx) {
+    False -> {
+      let def = FunDef(FName(export_name, 0), CFun([], cell))
+      #([FName(export_name, 0), ..names], [def, ..wrappers])
+    }
+    True -> {
+      let body = CTuple([threaded, CVar(wrapper_state_param)])
+      let def = FunDef(FName(export_name, 1), CFun([wrapper_state_param], body))
+      #([FName(export_name, 1), ..names], [def, ..wrappers])
+    }
+  }
 }
 
 /// The `arity` positional argument-parameter names for a synthesized export wrapper
@@ -495,6 +614,74 @@ fn emit_function(f: Function, ctx: Ctx) -> Result(FunDef, EmitError) {
 /// `False` for the `Cell` (pdict) strategy — the ONE codegen-shape switch (§A.1).
 fn is_threaded(ctx: Ctx) -> Bool {
   ctx.binding.state_strategy == Threaded
+}
+
+// ─────────────────────────── the imports-first index spaces (R7/§E.2) ───────────────────────────
+
+/// Build the table NAME → absolute-tableidx map over the imports-first WASM table index space
+/// (spec §2.5.1: imports precede definitions). Imported tables occupy the low indices in import
+/// order (local name `t<idx>`, the `lower` convention), then `module.tables` continue at
+/// `imported_table_count + i` (their `TableDecl.name` is already `t<abs>`). For the H7 case (no
+/// imported tables, one table) every name resolves to `0` → byte-identical `call_indirect`.
+fn build_table_index(module: Module) -> Dict(String, Int) {
+  let #(imported, itc) =
+    list.fold(module.imports, #([], 0), fn(acc, imp) {
+      let #(pairs, k) = acc
+      case imp {
+        ir.ImportTable(..) -> #([#("t" <> int.to_string(k), k), ..pairs], k + 1)
+        _ -> #(pairs, k)
+      }
+    })
+  let defined = list.index_map(module.tables, fn(t, i) { #(t.name, itc + i) })
+  dict.from_list(list.append(list.reverse(imported), defined))
+}
+
+/// The set of REFERENCE-typed global NAMES (funcref/externref, R8) — the union of imported
+/// reference globals (named `g<idx>` in imports-first order) and defined reference globals
+/// (`GlobalDecl.name`). Used so `ExportGlobal` routes a reference global through the
+/// `ref_globals` map (`ref_global_get`), not the numeric raw-bit `globals` path.
+fn reference_global_names(module: Module) -> Set(String) {
+  let #(imported, _gidx) =
+    list.fold(module.imports, #(set.new(), 0), fn(acc, imp) {
+      let #(names, k) = acc
+      case imp {
+        ir.ImportGlobal(_, _, ty, _) ->
+          case is_reference_type(ty) {
+            True -> #(set.insert(names, "g" <> int.to_string(k)), k + 1)
+            False -> #(names, k + 1)
+          }
+        _ -> #(names, k)
+      }
+    })
+  list.fold(module.globals, imported, fn(names, g) {
+    case is_reference_type(g.ty) {
+      True -> set.insert(names, g.name)
+      False -> names
+    }
+  })
+}
+
+/// `True` iff `ty` is a reference type (`TFuncRef`/`TExternRef`) — the funcref/externref
+/// globals that route through `rt_state`'s parallel `ref_globals` map (R8).
+fn is_reference_type(ty: ValType) -> Bool {
+  case ty {
+    ir.TFuncRef | ir.TExternRef -> True
+    _ -> False
+  }
+}
+
+/// Resolve a table NAME to its absolute tableidx. Defaults to `0` when the map has no entry
+/// (validation guarantees the name exists; the default preserves the H7 single-table path).
+fn table_idx(ctx: Ctx, name: String) -> Int {
+  result.unwrap(dict.get(ctx.table_index, name), 0)
+}
+
+/// The `index`-th element of `xs`, or `Error(Nil)` — a total list index (no partial `list.at`).
+fn nth(xs: List(a), index: Int) -> Result(a, Nil) {
+  case list.drop(xs, index) {
+    [x, ..] -> Ok(x)
+    [] -> Error(Nil)
+  }
 }
 
 // ─────────────────────────── the state-reaching call-graph closure (§A.3) ───────────────────────────
@@ -570,12 +757,13 @@ fn expr_touches_state(expr: Expr) -> Bool {
     | GlobalGet(..)
     | GlobalSet(..)
     | CallIndirect(..)
-    | // Phase-5 reference/table/bulk nodes all read/write mutable instance state (a table slot,
-      // a memory range, passive drop-state, or an instance-linked closure), so a function
-      // containing one is state-reaching under `Threaded` (§A.3). No Phase-1..4 module has them.
-      ir.RefFunc(..)
-    | ir.RefIsNull(..)
-    | ir.TableGet(..)
+    | // Phase-5 TABLE + BULK-MEMORY nodes read/write mutable instance state (a table slot, a
+      // memory range, or passive drop-state), so a function containing one is state-reaching
+      // under `Threaded` (§A.2/§A.3). No Phase-1..4 module has them. The REFERENCE nodes
+      // (`RefFunc`/`RefIsNull`, and the `ConstNull` value) are PURE — a reference is produced
+      // from a compile-time name or a constant sentinel and reaches no record — so they are NOT
+      // seeds (a reference-only function keeps its Phase-1 pure arity, the H7-neutral rule §A.2).
+      ir.TableGet(..)
     | ir.TableSet(..)
     | ir.TableSize(..)
     | ir.TableGrow(..)
@@ -667,37 +855,59 @@ fn emit(
     // ── Stateful ops — routed through the ONE state-access seam (`seam_call`). Under
     // `NoState` each is today's cell `call '<binding.X_module>':'op'(...)`; under
     // `Threading(cur)` each threads the `InstanceState` record through the `t_*` family. ──
-    // The `mem` index is IGNORED here (always `0` for the Phase-1..4 corpus, so byte-
-    // identical); P5-06 adds the leading memory-index argument for `mem != 0`.
-    MemSize(_mem) -> emit_mem_size(cont, sc, state, ctx)
-    MemGrow(_mem, delta) -> emit_mem_grow(delta, cont, sc, state, ctx)
-    MemLoad(_mem, op, addr, offset, result) ->
-      emit_mem_load(op, addr, offset, result, cont, sc, state, ctx)
-    MemStore(_mem, op, addr, value, offset) ->
-      emit_mem_store(op, addr, value, offset, cont, sc, state, ctx)
+    // The `mem` index routes the memory-node seam (§E): index `0` emits the EXACT Phase-4 head
+    // (no index arg — byte-identical, H7); index `>= 1` emits the `_at` head with a leading
+    // memory-index argument.
+    MemSize(mem) -> emit_mem_size(mem, cont, sc, state, ctx)
+    MemGrow(mem, delta) -> emit_mem_grow(mem, delta, cont, sc, state, ctx)
+    MemLoad(mem, op, addr, offset, result) ->
+      emit_mem_load(mem, op, addr, offset, result, cont, sc, state, ctx)
+    MemStore(mem, op, addr, value, offset) ->
+      emit_mem_store(mem, op, addr, value, offset, cont, sc, state, ctx)
     GlobalGet(name) -> emit_global_get(name, cont, sc, state, ctx)
     GlobalSet(name, value) -> emit_global_set(name, value, cont, sc, state, ctx)
-    CallIndirect(_table, index, ty, args) ->
-      emit_call_indirect(index, ty, args, cont, sc, state, ctx)
+    CallIndirect(table, index, ty, args) ->
+      emit_call_indirect(table, index, ty, args, cont, sc, state, ctx)
+    // ── Phase-5 reference layer (H1/H2) — PURE, state-neutral (they touch no memory/table/
+    // global, §B). `cur` flows through unchanged under `Threading`. ──
+    ir.RefFunc(name) -> emit_ref_func(name, cont, sc, state, ctx)
+    ir.RefIsNull(arg) -> emit_ref_is_null(arg, cont, sc, state, ctx)
+    // ── Phase-5 table layer (H2) — state-reaching (§C). ──
+    ir.TableGet(table, index) ->
+      emit_table_get(table, index, cont, sc, state, ctx)
+    ir.TableSet(table, index, value) ->
+      emit_table_set(table, index, value, cont, sc, state, ctx)
+    ir.TableSize(table) -> emit_table_size(table, cont, sc, state, ctx)
+    ir.TableGrow(table, delta, init) ->
+      emit_table_grow(table, delta, init, cont, sc, state, ctx)
+    ir.TableFill(table, offset, value, count) ->
+      emit_table_fill(table, offset, value, count, cont, sc, state, ctx)
+    ir.TableInit(table, seg, dst, src, count) ->
+      emit_table_init(table, seg, dst, src, count, cont, sc, state, ctx)
+    ir.TableCopy(dst_table, src_table, dst, src, count) ->
+      emit_table_copy(
+        dst_table,
+        src_table,
+        dst,
+        src,
+        count,
+        cont,
+        sc,
+        state,
+        ctx,
+      )
+    ir.ElemDrop(seg) -> emit_elem_drop(seg, cont, sc, state, ctx)
+    // ── Phase-5 bulk-memory layer (H2/H3) — state-reaching (§D). ──
+    ir.MemFill(mem, dest, value, count) ->
+      emit_mem_fill(mem, dest, value, count, cont, sc, state, ctx)
+    ir.MemCopy(dst_mem, src_mem, dst, src, count) ->
+      emit_mem_copy(dst_mem, src_mem, dst, src, count, cont, sc, state, ctx)
+    ir.MemInit(mem, seg, dst, src, count) ->
+      emit_mem_init(mem, seg, dst, src, count, cont, sc, state, ctx)
+    ir.DataDrop(seg) -> emit_data_drop(seg, cont, sc, state, ctx)
     // Out of scope — typed error, never a panic. The term layer (`TermOp`) + the term↔numeric
-    // boxing `Convert`s remain unlowered, plus the Phase-5 reference/table/bulk nodes whose
-    // real codegen is P5-06. No Phase-1..4 module contains any of these, so the corpus + suite
-    // stay byte-identical (they are never reached by the existing surface).
+    // boxing `Convert`s remain unlowered (still a later-phase deferral).
     TermOp(..) -> Error(UnsupportedNode("term_op"))
-    ir.RefFunc(..) -> Error(UnsupportedNode("ref_func"))
-    ir.RefIsNull(..) -> Error(UnsupportedNode("ref_is_null"))
-    ir.TableGet(..) -> Error(UnsupportedNode("table_get"))
-    ir.TableSet(..) -> Error(UnsupportedNode("table_set"))
-    ir.TableSize(..) -> Error(UnsupportedNode("table_size"))
-    ir.TableGrow(..) -> Error(UnsupportedNode("table_grow"))
-    ir.TableFill(..) -> Error(UnsupportedNode("table_fill"))
-    ir.TableInit(..) -> Error(UnsupportedNode("table_init"))
-    ir.TableCopy(..) -> Error(UnsupportedNode("table_copy"))
-    ir.ElemDrop(..) -> Error(UnsupportedNode("elem_drop"))
-    ir.MemFill(..) -> Error(UnsupportedNode("mem_fill"))
-    ir.MemCopy(..) -> Error(UnsupportedNode("mem_copy"))
-    ir.MemInit(..) -> Error(UnsupportedNode("mem_init"))
-    ir.DataDrop(..) -> Error(UnsupportedNode("data_drop"))
   }
 }
 
@@ -718,39 +928,35 @@ fn emit_return(
 
 // ─────────────────────────── the per-op state seam (cell / threaded) ───────────────────────────
 
-/// `memory.size` (read-only). `NoState`: `call '<mem>':'size'()`. `Threading(cur)`:
-/// `call '<mem>':'t_size'(St)` — the record is threaded on UNCHANGED.
+/// `memory.size` on memory `mem` (read-only). Index `0` emits the byte-identical Phase-4 head
+/// (`size`/`t_size`, no index arg — H7); index `>= 1` the `_at` head (`size_at`/`t_size_at`).
+/// `NoState`: `call '<mem>':'size'()`. `Threading(cur)`: `call '<mem>':'t_size'(St)` — the
+/// record is threaded on UNCHANGED.
 fn emit_mem_size(
+  mem: Int,
   cont: Cont,
   sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  case sc {
-    NoState ->
-      apply_cont(
-        cont,
-        [seam_call(ctx.binding.mem_module, "size", [])],
-        sc,
-        state,
-        ctx,
-      )
-    Threading(cur) ->
-      apply_cont(
-        cont,
-        [seam_call(ctx.binding.mem_module, "t_size", [CVar(cur)])],
-        sc,
-        state,
-        ctx,
-      )
+  let call = case mem, sc {
+    0, NoState -> seam_call(ctx.binding.mem_module, "size", [])
+    0, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_size", [CVar(cur)])
+    _, NoState -> seam_call(ctx.binding.mem_module, "size_at", [CInt(mem)])
+    _, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_size_at", [CVar(cur), CInt(mem)])
   }
+  apply_cont(cont, [call], sc, state, ctx)
 }
 
-/// `memory.grow` (effectful). `NoState`: a bare `call '<mem>':'grow'(Delta)` (i32).
-/// `Threading(cur)`: `{V, St2} = call '<mem>':'t_grow'(St, Delta)` — bind the old page count
-/// `V`, REBIND the record to `St2` (`t_grow` charges the success-path fuel internally, unit
-/// 04, so emit charges nothing here).
+/// `memory.grow` on memory `mem` (effectful). Index `0` emits the byte-identical Phase-4 head
+/// (`grow`/`t_grow`); index `>= 1` the `_at` head (`grow_at`/`t_grow_at`, leading memidx).
+/// `NoState`: a bare `call '<mem>':'grow'(Delta)` (i32). `Threading(cur)`: `{V, St2} =
+/// call '<mem>':'t_grow'(St, Delta)` — bind the old page count `V`, REBIND the record to `St2`
+/// (`t_grow` charges the success-path fuel internally, unit 04, so emit charges nothing here).
 fn emit_mem_grow(
+  mem: Int,
   delta: Value,
   cont: Cont,
   sc: StateChan,
@@ -758,20 +964,31 @@ fn emit_mem_grow(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case sc {
-    NoState ->
-      apply_cont(
-        cont,
-        [seam_call(ctx.binding.mem_module, "grow", [emit_value(delta)])],
-        sc,
-        state,
-        ctx,
-      )
+    NoState -> {
+      let call = case mem {
+        0 -> seam_call(ctx.binding.mem_module, "grow", [emit_value(delta)])
+        _ ->
+          seam_call(ctx.binding.mem_module, "grow_at", [
+            CInt(mem),
+            emit_value(delta),
+          ])
+      }
+      apply_cont(cont, [call], sc, state, ctx)
+    }
     Threading(cur) -> {
-      let call =
-        seam_call(ctx.binding.mem_module, "t_grow", [
-          CVar(cur),
-          emit_value(delta),
-        ])
+      let call = case mem {
+        0 ->
+          seam_call(ctx.binding.mem_module, "t_grow", [
+            CVar(cur),
+            emit_value(delta),
+          ])
+        _ ->
+          seam_call(ctx.binding.mem_module, "t_grow_at", [
+            CVar(cur),
+            CInt(mem),
+            emit_value(delta),
+          ])
+      }
       emit_value_state_pair(call, cont, state, ctx)
     }
   }
@@ -782,6 +999,7 @@ fn emit_mem_grow(
 /// trapping `Result(Int, _)` to one value (`emit_trapping_result`); the record is read-only,
 /// so `cur` is threaded on unchanged (the surrounding `sc` is preserved).
 fn emit_mem_load(
+  mem: Int,
   op: ir.MemAccess,
   addr: Value,
   offset: Int,
@@ -791,23 +1009,24 @@ fn emit_mem_load(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let call = case sc {
-    NoState ->
-      seam_call(ctx.binding.mem_module, "load", [
-        CInt(op.bytes),
-        bool_atom(op.signed),
-        CInt(result_width(result)),
-        emit_value(addr),
-        CInt(offset),
-      ])
-    Threading(cur) ->
-      seam_call(ctx.binding.mem_module, "t_load", [
+  let tail = [
+    CInt(op.bytes),
+    bool_atom(op.signed),
+    CInt(result_width(result)),
+    emit_value(addr),
+    CInt(offset),
+  ]
+  let call = case mem, sc {
+    0, NoState -> seam_call(ctx.binding.mem_module, "load", tail)
+    0, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_load", [CVar(cur), ..tail])
+    _, NoState ->
+      seam_call(ctx.binding.mem_module, "load_at", [CInt(mem), ..tail])
+    _, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_load_at", [
         CVar(cur),
-        CInt(op.bytes),
-        bool_atom(op.signed),
-        CInt(result_width(result)),
-        emit_value(addr),
-        CInt(offset),
+        CInt(mem),
+        ..tail
       ])
   }
   emit_trapping_result(call, cont, sc, state, ctx)
@@ -821,6 +1040,7 @@ fn emit_mem_load(
 /// `Threading(St2)` disposing zero values. This makes store-before-load a visible dataflow
 /// edge through `St` (stronger than the cell `let`-discard barrier, §G).
 fn emit_mem_store(
+  mem: Int,
   op: ir.MemAccess,
   addr: Value,
   value: Value,
@@ -830,27 +1050,31 @@ fn emit_mem_store(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
+  let tail = [
+    CInt(op.bytes),
+    emit_value(addr),
+    emit_value(value),
+    CInt(offset),
+  ]
   case sc {
     NoState -> {
-      let call =
-        seam_call(ctx.binding.mem_module, "store", [
-          CInt(op.bytes),
-          emit_value(addr),
-          emit_value(value),
-          CInt(offset),
-        ])
+      let call = case mem {
+        0 -> seam_call(ctx.binding.mem_module, "store", tail)
+        _ -> seam_call(ctx.binding.mem_module, "store_at", [CInt(mem), ..tail])
+      }
       let #(effect, state2) = trapping_effect(call, ctx, state)
       emit_zero_effect(effect, cont, sc, state2, ctx)
     }
     Threading(cur) -> {
-      let call =
-        seam_call(ctx.binding.mem_module, "t_store", [
-          CVar(cur),
-          CInt(op.bytes),
-          emit_value(addr),
-          emit_value(value),
-          CInt(offset),
-        ])
+      let call = case mem {
+        0 -> seam_call(ctx.binding.mem_module, "t_store", [CVar(cur), ..tail])
+        _ ->
+          seam_call(ctx.binding.mem_module, "t_store_at", [
+            CVar(cur),
+            CInt(mem),
+            ..tail
+          ])
+      }
       emit_threaded_record_effect(call, cont, state, ctx)
     }
   }
@@ -1541,9 +1765,15 @@ fn resolve_stdlib(capability: String, name: String) -> Option(String) {
 ///
 /// The result is `Result(List(Int), TrapReason)`: `{ok,V}`/`{error,R}` → `case`-and-`raise`
 /// (`emit_trapping_result`) binding the result LIST `V`, then the list is unpacked into
-/// `len(ty.results)` values and disposed through `cont`. The IR's `table` name is ignored
-/// (the MVP cell holds a single funcref table).
+/// `len(ty.results)` values and disposed through `cont`.
+///
+/// `table` resolves to its absolute tableidx. The frozen `rt_table` dispatch reads the DEFAULT
+/// (index-0) table (`call_indirect`/`t_call_indirect` have no table-index argument), so a
+/// `call_indirect` through a NON-zero table (multi-table) is fail-closed here with a categorized
+/// `Error(UnsupportedNode("call_indirect_table"))` — an indexed dispatch head is 07's to add; the
+/// conformance harness reports the module as a categorized skip until then (never a wrong dispatch).
 fn emit_call_indirect(
+  table: String,
   index: Value,
   ty: FuncType,
   args: List(Value),
@@ -1552,6 +1782,10 @@ fn emit_call_indirect(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
+  use _ <- result.try(case table_idx(ctx, table) {
+    0 -> Ok(Nil)
+    _ -> Error(UnsupportedNode("call_indirect_table"))
+  })
   let r = list.length(ty.results)
   case sc {
     NoState -> {
@@ -1661,6 +1895,631 @@ fn unpack_result_list(
       let clause = CClause([list_pattern(names)], CAtom("true"), rest)
       Ok(#(CCase(CVar(lvar), [clause]), state3))
     }
+  }
+}
+
+// ─────────────────────────── Phase-5 reference layer (§B) ───────────────────────────
+
+/// Lower `RefFunc($name)` (§B). PURE (state-neutral): produce the `{TypeTag, Closure}` funcref
+/// value and dispose it through `cont`; under `Threading(cur)`, `cur` flows through unchanged.
+fn emit_ref_func(
+  name: String,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use #(entry, state2) <- result.try(reference_func_entry(name, ctx, state))
+  apply_cont(cont, [entry], sc, state2, ctx)
+}
+
+/// Build the `{TypeTag, Closure}` funcref value for `ref.func $name` — the SAME renderer the
+/// active element segment uses (`element_entry` / `threaded_element_entry`), so a `ref.func`
+/// stored into a table then `call_indirect`-ed is byte-identical to a segment-placed entry (§B).
+/// The closure ABI follows the BUILD strategy (`is_threaded`), NOT `sc`: a `Cell` build makes
+/// the cell closure `fun(Args) -> Results`, a `Threaded` build the threaded closure
+/// `fun(St, Args) -> {Results, St'}` — because a funcref is consumed by `call_indirect` /
+/// `t_call_indirect` uniformly across the whole build (a `Cell`-ABI closure invoked by
+/// `t_call_indirect` would arity-mismatch). `Error(UnknownFunction)` if `name` is undefined.
+fn reference_func_entry(
+  name: String,
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case is_threaded(ctx) {
+    True -> threaded_element_entry(name, ctx, state)
+    False -> element_entry(name, ctx, state)
+  }
+}
+
+/// Lower `RefIsNull(arg)` (§B): delegate the sentinel test to the runtime
+/// (`call '<rt_ref>':'is_null'(Arg)` → a Core `'true'`/`'false'`) and map it to the i32
+/// `1`/`0` the spec requires (`ref.is_null` yields an i32). Keeping the comparison inside
+/// `rt_ref` preserves `externref` opacity (emit never pattern-matches a host term) and keeps
+/// the sentinel shape runtime-owned. PURE / state-neutral. Cite spec §4.4.2.
+fn emit_ref_is_null(
+  arg: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let call = seam_call(ref_module, "is_null", [emit_value(arg)])
+  let #(wild, state2) = fresh_var(state)
+  let i32 =
+    CCase(call, [
+      CClause([PAtom("true")], CAtom("true"), CInt(1)),
+      CClause([PVar(wild)], CAtom("true"), CInt(0)),
+    ])
+  apply_cont(cont, [i32], sc, state2, ctx)
+}
+
+// ─────────────────────────── Phase-5 table layer (§C) ───────────────────────────
+//
+// Each op resolves `table` name → its absolute tableidx (`table_idx`, §E.2) and routes through
+// the `binding.table_module` seam against the FROZEN idx-based rt_table heads (`get(idx,index)`,
+// `set(idx,index,v)`, `size(idx)`, `grow(idx,delta,init)`, `fill(idx,off,v,n)`,
+// `table_init(idx,items,dst,src,n)`, `table_copy(dst_idx,src_idx,dst,src,n)` + the `t_*` twins).
+// The dispositions REUSE the verified Phase-2/4 shapes (§G). All held to the finalized WASM 2.0
+// semantics — the traps live inside rt_table (07); emit only routes.
+
+/// `table.get` — trapping value, read-only (`Result(ref, TableOutOfBounds)`). Cell:
+/// `get(Idx, Index)`; threaded: `t_get(St, Idx, Index)` (read `St`, `cur` unchanged, like
+/// `MemLoad`). Cite §4.4.6 (an in-bounds unfilled slot reads the null sentinel — a value, not a
+/// trap; an OOB index traps `TableOutOfBounds`).
+fn emit_table_get(
+  table: String,
+  index: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let idx = table_idx(ctx, table)
+  let call = case sc {
+    NoState ->
+      seam_call(ctx.binding.table_module, "get", [CInt(idx), emit_value(index)])
+    Threading(cur) ->
+      seam_call(ctx.binding.table_module, "t_get", [
+        CVar(cur),
+        CInt(idx),
+        emit_value(index),
+      ])
+  }
+  emit_trapping_result(call, cont, sc, state, ctx)
+}
+
+/// `table.set` — trapping ZERO-RESULT write (`Result(_, TableOutOfBounds)`, eager). Cell:
+/// `set(Idx, Index, V)` reduced to a discardable effect; threaded: `t_set(St, Idx, Index, V)`
+/// REBINDS `cur` (like `MemStore`). Cite §4.4.6.
+fn emit_table_set(
+  table: String,
+  index: Value,
+  value: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let idx = table_idx(ctx, table)
+  case sc {
+    NoState -> {
+      let call =
+        seam_call(ctx.binding.table_module, "set", [
+          CInt(idx),
+          emit_value(index),
+          emit_value(value),
+        ])
+      let #(effect, state2) = trapping_effect(call, ctx, state)
+      emit_zero_effect(effect, cont, sc, state2, ctx)
+    }
+    Threading(cur) -> {
+      let call =
+        seam_call(ctx.binding.table_module, "t_set", [
+          CVar(cur),
+          CInt(idx),
+          emit_value(index),
+          emit_value(value),
+        ])
+      emit_threaded_record_effect(call, cont, state, ctx)
+    }
+  }
+}
+
+/// `table.size` — bare i32, never traps. Cell: `size(Idx)`; threaded: `t_size(St, Idx)`
+/// (read-only). Cite §4.4.6.
+fn emit_table_size(
+  table: String,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let idx = table_idx(ctx, table)
+  let call = case sc {
+    NoState -> seam_call(ctx.binding.table_module, "size", [CInt(idx)])
+    Threading(cur) ->
+      seam_call(ctx.binding.table_module, "t_size", [CVar(cur), CInt(idx)])
+  }
+  apply_cont(cont, [call], sc, state, ctx)
+}
+
+/// `table.grow(delta, init)` — the PREVIOUS size or `-1`; NEVER traps (like `memory.grow`).
+/// Cell: bare `grow(Idx, Delta, Init)`; threaded: `t_grow(St, Idx, Delta, Init)` returns
+/// `#(i32, St)` → `emit_value_state_pair` rebinds `cur`. Cite §4.4.6 (grow returns `-1` on
+/// failure, never traps).
+fn emit_table_grow(
+  table: String,
+  delta: Value,
+  init: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let idx = table_idx(ctx, table)
+  case sc {
+    NoState ->
+      apply_cont(
+        cont,
+        [
+          seam_call(ctx.binding.table_module, "grow", [
+            CInt(idx),
+            emit_value(delta),
+            emit_value(init),
+          ]),
+        ],
+        sc,
+        state,
+        ctx,
+      )
+    Threading(cur) -> {
+      let call =
+        seam_call(ctx.binding.table_module, "t_grow", [
+          CVar(cur),
+          CInt(idx),
+          emit_value(delta),
+          emit_value(init),
+        ])
+      emit_value_state_pair(call, cont, state, ctx)
+    }
+  }
+}
+
+/// `table.fill(offset, value, count)` — EAGER trapping ZERO-RESULT write (bounds-checked before
+/// any write, no partial effect, R10). Cell: `fill(Idx, O, V, N)`; threaded: `t_fill(St, Idx, O,
+/// V, N)` rebinds `cur`. Cite §4.4.6.
+fn emit_table_fill(
+  table: String,
+  offset: Value,
+  value: Value,
+  count: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let idx = table_idx(ctx, table)
+  case sc {
+    NoState -> {
+      let call =
+        seam_call(ctx.binding.table_module, "fill", [
+          CInt(idx),
+          emit_value(offset),
+          emit_value(value),
+          emit_value(count),
+        ])
+      let #(effect, state2) = trapping_effect(call, ctx, state)
+      emit_zero_effect(effect, cont, sc, state2, ctx)
+    }
+    Threading(cur) -> {
+      let call =
+        seam_call(ctx.binding.table_module, "t_fill", [
+          CVar(cur),
+          CInt(idx),
+          emit_value(offset),
+          emit_value(value),
+          emit_value(count),
+        ])
+      emit_threaded_record_effect(call, cont, state, ctx)
+    }
+  }
+}
+
+/// `table.init(seg, dst, src, count)` — copy references from passive element segment `seg` into
+/// `table` (EAGER trapping, R10). The segment payload is emit-supplied, drop-GATED (R2): emit
+/// `case rt_state:elem_dropped(Seg) of 'true' -> []; _ -> <items> end` so a dropped segment
+/// behaves as length-0 (a later `init` with `count > 0` traps on the source bound). Cell:
+/// `table_init(Idx, Items, D, S, N)`; threaded: `t_table_init(St, Idx, Items, D, S, N)`. Cite
+/// §4.4.6 + §4.4.9.
+fn emit_table_init(
+  table: String,
+  seg: Int,
+  dst: Value,
+  src: Value,
+  count: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let idx = table_idx(ctx, table)
+  use segment <- result.try(
+    nth(ctx.elements, seg)
+    |> result.replace_error(UnsupportedNode("table_init_seg")),
+  )
+  use #(entries, state2) <- result.try(render_ref_items(
+    segment.init,
+    ctx,
+    state,
+  ))
+  let #(gated, state3) =
+    drop_gate(seg, "elem_dropped", CNil, core_list(entries), sc, state2, ctx)
+  let #(segvar, state4) = fresh_var(state3)
+  case sc {
+    NoState -> {
+      let call =
+        seam_call(ctx.binding.table_module, "table_init", [
+          CInt(idx),
+          CVar(segvar),
+          emit_value(dst),
+          emit_value(src),
+          emit_value(count),
+        ])
+      let #(effect, state5) = trapping_effect(call, ctx, state4)
+      use #(rest, state6) <- result.try(emit_zero_effect(
+        effect,
+        cont,
+        sc,
+        state5,
+        ctx,
+      ))
+      Ok(#(CLet([segvar], gated, rest), state6))
+    }
+    Threading(cur) -> {
+      let call =
+        seam_call(ctx.binding.table_module, "t_table_init", [
+          CVar(cur),
+          CInt(idx),
+          CVar(segvar),
+          emit_value(dst),
+          emit_value(src),
+          emit_value(count),
+        ])
+      use #(rest, state5) <- result.try(emit_threaded_record_effect(
+        call,
+        cont,
+        state4,
+        ctx,
+      ))
+      Ok(#(CLet([segvar], gated, rest), state5))
+    }
+  }
+}
+
+/// `table.copy(dst, src, count)` from `src_table` to `dst_table` — memmove-correct, EAGER
+/// trapping (R10/R11). Cell: `table_copy(DstIdx, SrcIdx, D, S, N)`; threaded:
+/// `t_table_copy(St, DstIdx, SrcIdx, D, S, N)`. Cite §4.4.6.
+fn emit_table_copy(
+  dst_table: String,
+  src_table: String,
+  dst: Value,
+  src: Value,
+  count: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let didx = table_idx(ctx, dst_table)
+  let sidx = table_idx(ctx, src_table)
+  case sc {
+    NoState -> {
+      let call =
+        seam_call(ctx.binding.table_module, "table_copy", [
+          CInt(didx),
+          CInt(sidx),
+          emit_value(dst),
+          emit_value(src),
+          emit_value(count),
+        ])
+      let #(effect, state2) = trapping_effect(call, ctx, state)
+      emit_zero_effect(effect, cont, sc, state2, ctx)
+    }
+    Threading(cur) -> {
+      let call =
+        seam_call(ctx.binding.table_module, "t_table_copy", [
+          CVar(cur),
+          CInt(didx),
+          CInt(sidx),
+          emit_value(dst),
+          emit_value(src),
+          emit_value(count),
+        ])
+      emit_threaded_record_effect(call, cont, state, ctx)
+    }
+  }
+}
+
+/// `elem.drop(seg)` — mark passive element segment `seg` empty; NEVER traps (R2). Cell:
+/// `rt_state:drop_elem(Seg)` as a discarded effect; threaded: `t_drop_elem(St, Seg)` returns the
+/// record directly (non-trapping) → REBIND `cur`. Cite §4.4.6.
+fn emit_elem_drop(
+  seg: Int,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  emit_drop(seg, "drop_elem", cont, sc, state, ctx)
+}
+
+// ─────────────────────────── Phase-5 bulk-memory layer (§D) ───────────────────────────
+//
+// Each op carries an explicit memory index and routes through the `binding.mem_module` seam
+// against the FROZEN idx-based bulk heads (`fill(idx,d,v,n)`, `copy(dst,src,d,s,n)`,
+// `init(idx,seg,d,s,n)` + `t_*` twins). Same dispositions as §C.
+
+/// `memory.fill(dest, value, count)` on memory `mem` — EAGER trapping ZERO-RESULT write (R10).
+/// Cell: `fill(Mem, D, V, N)`; threaded: `t_fill(St, Mem, D, V, N)`. Cite §4.4.7.
+fn emit_mem_fill(
+  mem: Int,
+  dest: Value,
+  value: Value,
+  count: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case sc {
+    NoState -> {
+      let call =
+        seam_call(ctx.binding.mem_module, "fill", [
+          CInt(mem),
+          emit_value(dest),
+          emit_value(value),
+          emit_value(count),
+        ])
+      let #(effect, state2) = trapping_effect(call, ctx, state)
+      emit_zero_effect(effect, cont, sc, state2, ctx)
+    }
+    Threading(cur) -> {
+      let call =
+        seam_call(ctx.binding.mem_module, "t_fill", [
+          CVar(cur),
+          CInt(mem),
+          emit_value(dest),
+          emit_value(value),
+          emit_value(count),
+        ])
+      emit_threaded_record_effect(call, cont, state, ctx)
+    }
+  }
+}
+
+/// `memory.copy` from `src_mem` to `dst_mem` — memmove, EAGER trapping on BOTH ranges (R10/R11);
+/// cross-memory when the indices differ. Cell: `copy(DstMem, SrcMem, D, S, N)`; threaded:
+/// `t_copy(St, DstMem, SrcMem, D, S, N)`. Cite §4.4.7.
+fn emit_mem_copy(
+  dst_mem: Int,
+  src_mem: Int,
+  dst: Value,
+  src: Value,
+  count: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case sc {
+    NoState -> {
+      let call =
+        seam_call(ctx.binding.mem_module, "copy", [
+          CInt(dst_mem),
+          CInt(src_mem),
+          emit_value(dst),
+          emit_value(src),
+          emit_value(count),
+        ])
+      let #(effect, state2) = trapping_effect(call, ctx, state)
+      emit_zero_effect(effect, cont, sc, state2, ctx)
+    }
+    Threading(cur) -> {
+      let call =
+        seam_call(ctx.binding.mem_module, "t_copy", [
+          CVar(cur),
+          CInt(dst_mem),
+          CInt(src_mem),
+          emit_value(dst),
+          emit_value(src),
+          emit_value(count),
+        ])
+      emit_threaded_record_effect(call, cont, state, ctx)
+    }
+  }
+}
+
+/// `memory.init(seg, dst, src, count)` on memory `mem` — copy bytes from passive data segment
+/// `seg` into memory (EAGER trapping, R10). The segment payload is emit-supplied, drop-GATED
+/// (R2): emit `case rt_state:data_dropped(Seg) of 'true' -> <<>>; _ -> <bytes> end` so a dropped
+/// segment traps for `count > 0` (source bound) and no-ops for `count = 0`. Cell:
+/// `init(Mem, Bytes, D, S, N)`; threaded: `t_init(St, Mem, Bytes, D, S, N)`. Cite §4.4.7 + §4.4.9.
+fn emit_mem_init(
+  mem: Int,
+  seg: Int,
+  dst: Value,
+  src: Value,
+  count: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use segment <- result.try(
+    nth(ctx.data_segments, seg)
+    |> result.replace_error(UnsupportedNode("mem_init_seg")),
+  )
+  let #(gated, state2) =
+    drop_gate(
+      seg,
+      "data_dropped",
+      core_binary_bytes(<<>>),
+      core_binary_bytes(segment.bytes),
+      sc,
+      state,
+      ctx,
+    )
+  let #(segvar, state3) = fresh_var(state2)
+  case sc {
+    NoState -> {
+      let call =
+        seam_call(ctx.binding.mem_module, "init", [
+          CInt(mem),
+          CVar(segvar),
+          emit_value(dst),
+          emit_value(src),
+          emit_value(count),
+        ])
+      let #(effect, state4) = trapping_effect(call, ctx, state3)
+      use #(rest, state5) <- result.try(emit_zero_effect(
+        effect,
+        cont,
+        sc,
+        state4,
+        ctx,
+      ))
+      Ok(#(CLet([segvar], gated, rest), state5))
+    }
+    Threading(cur) -> {
+      let call =
+        seam_call(ctx.binding.mem_module, "t_init", [
+          CVar(cur),
+          CInt(mem),
+          CVar(segvar),
+          emit_value(dst),
+          emit_value(src),
+          emit_value(count),
+        ])
+      use #(rest, state4) <- result.try(emit_threaded_record_effect(
+        call,
+        cont,
+        state3,
+        ctx,
+      ))
+      Ok(#(CLet([segvar], gated, rest), state4))
+    }
+  }
+}
+
+/// `data.drop(seg)` — mark passive data segment `seg` empty; NEVER traps (R2). Cell:
+/// `rt_state:drop_data(Seg)`; threaded: `t_drop_data(St, Seg)` rebinds `cur`. Cite §4.4.7.
+fn emit_data_drop(
+  seg: Int,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  emit_drop(seg, "drop_data", cont, sc, state, ctx)
+}
+
+// ─────────────────────────── shared drop / reference-item helpers ───────────────────────────
+
+/// The shared `data.drop`/`elem.drop` lowering (non-trapping, R2). Cell: the `rt_state`
+/// `drop_fn(Seg)` effect (`Nil`), sequenced+discarded (`emit_zero_effect`). Threaded: the
+/// `t_<drop_fn>(St, Seg)` twin returns the rebound record directly (non-trapping) → REBIND `cur`
+/// and continue disposing zero values (the `t_global_set` shape).
+fn emit_drop(
+  seg: Int,
+  drop_fn: String,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case sc {
+    NoState -> {
+      let effect = seam_call(ctx.binding.state_module, drop_fn, [CInt(seg)])
+      emit_zero_effect(effect, cont, sc, state, ctx)
+    }
+    Threading(cur) -> {
+      let call =
+        seam_call(ctx.binding.state_module, "t_" <> drop_fn, [
+          CVar(cur),
+          CInt(seg),
+        ])
+      let #(newst, state2) = fresh_var(state)
+      use #(rest, state3) <- result.try(apply_cont(
+        cont,
+        [],
+        Threading(newst),
+        state2,
+        ctx,
+      ))
+      Ok(#(CLet([newst], call, rest), state3))
+    }
+  }
+}
+
+/// The passive-segment drop-GATE (R2): bind the segment payload to a value that is `empty` when
+/// the segment is dropped and `present` otherwise, via
+/// `case rt_state:<base>_dropped(Seg) of 'true' -> empty; _ -> present end` (threaded reads the
+/// same via the read-only `t_<base>_dropped(St, Seg)` twin). Returns the gate expression and the
+/// advanced state; the caller `let`-binds it and passes it to the `rt_mem`/`rt_table` op.
+fn drop_gate(
+  seg: Int,
+  dropped_fn: String,
+  empty: CExpr,
+  present: CExpr,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> #(CExpr, EmitState) {
+  let check = case sc {
+    NoState -> seam_call(ctx.binding.state_module, dropped_fn, [CInt(seg)])
+    Threading(cur) ->
+      seam_call(ctx.binding.state_module, "t_" <> dropped_fn, [
+        CVar(cur),
+        CInt(seg),
+      ])
+  }
+  let #(wild, state2) = fresh_var(state)
+  let gate =
+    CCase(check, [
+      CClause([PAtom("true")], CAtom("true"), empty),
+      CClause([PVar(wild)], CAtom("true"), present),
+    ])
+  #(gate, state2)
+}
+
+/// Render an element segment's `init` items (each a ref-producing const-expr `Expr`) to a list
+/// of Core reference VALUES — the payload `table.init` / active reference-segment seeding pass to
+/// `rt_table`. `RefFunc($f)` → the `{TypeTag, Closure}` funcref entry (build-strategy ABI, §B);
+/// `Values([ConstNull(_)])` → the null sentinel `{ref_null}`. `Error(UnsupportedNode)` for a
+/// `global.get`-initialised item (its provided-state resolution is 09's) or any other shape.
+fn render_ref_items(
+  items: List(Expr),
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(List(CExpr), EmitState), EmitError) {
+  list.try_fold(items, #([], state), fn(acc, item) {
+    let #(rendered, st) = acc
+    use #(c, st2) <- result.try(render_ref_item(item, ctx, st))
+    Ok(#(list.append(rendered, [c]), st2))
+  })
+}
+
+/// Render ONE element-init item to a Core reference value (see `render_ref_items`).
+fn render_ref_item(
+  item: Expr,
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case item {
+    ir.RefFunc(name) -> reference_func_entry(name, ctx, state)
+    Values([ir.ConstNull(_)]) -> Ok(#(null_ref_term(), state))
+    _ -> Error(UnsupportedNode("elem_item"))
   }
 }
 
@@ -1914,10 +2773,19 @@ fn emit_value(v: Value) -> CExpr {
     ConstF32(bits) -> CInt(bits)
     ConstF64(bits) -> CInt(bits)
     // The null-reference literal (both reftypes share ONE sentinel, R1) — the forge-proof
-    // `{ref_null}` term `rt_ref.null_ref` produces. Reftype-agnostic at runtime. No Phase-1..4
-    // operand is `ConstNull`, so this arm is never reached by the existing corpus.
-    ir.ConstNull(_ty) -> CTuple([CAtom("ref_null")])
+    // `{ref_null}` term `rt_ref.null_ref` produces. Reftype-agnostic at runtime.
+    ir.ConstNull(_ty) -> null_ref_term()
   }
+}
+
+/// The shared null-reference sentinel literal `{ref_null}` (R1) — the SINGLE build-controlled
+/// term `ConstNull`/`ref.null` lowers to, byte-identical to what `rt_ref.null_ref` produces and
+/// what `rt_table` stores/compares in an unfilled slot. A pure literal (not a `call`), so it is
+/// const-foldable (element/global reference inits) and D3a-trivially-clean. Reftype-agnostic:
+/// both `funcref` and `externref` null share this one sentinel (Phase 5 has no typed dispatch on
+/// a null reference — the `ty` on `ConstNull` is carried only for validation / the `.ir` text).
+fn null_ref_term() -> CExpr {
+  CTuple([CAtom("ref_null")])
 }
 
 /// A Core value list: a single value is itself; zero or many become `<…>` (`CValues`).
@@ -2063,9 +2931,354 @@ fn byte_seg(b: Int) -> CBitSeg {
 /// record (`emit_instantiate_threaded`, §E); the `seed_fuel`/`seed_policy` seeds are unchanged
 /// (metering/host are pdict-seeded — orthogonal to state threading).
 fn emit_instantiate(module: Module, ctx: Ctx) -> Result(FunDef, EmitError) {
-  case is_threaded(ctx) {
-    False -> emit_instantiate_cell(module, ctx)
-    True -> emit_instantiate_threaded(module, ctx)
+  case needs_full_decl(module) {
+    // The byte-identical Phase-4 path (StateDecl + `seed`/`fresh`, `instantiate/0`) for a
+    // single-region, import-free, no-reference-global module (H7) — UNCHANGED.
+    False ->
+      case is_threaded(ctx) {
+        False -> emit_instantiate_cell(module, ctx)
+        True -> emit_instantiate_threaded(module, ctx)
+      }
+    // The general path (FullDecl + `seed_full`/`fresh_full`) for a multi-memory / multi-table /
+    // non-function-import / reference-global module (R4/R5/R7/R8). `instantiate/1(Imports)` when
+    // the module has ≥1 state import, else `instantiate/0`.
+    True -> emit_instantiate_full(module, ctx)
+  }
+}
+
+/// `True` iff `module` needs the general `FullDecl` seed (`seed_full`/`fresh_full`): it has a
+/// non-function import (imported provided state), ≥2 memories, ≥2 tables, or a defined
+/// reference-typed global. Otherwise the byte-identical Phase-4 `StateDecl` path applies (H7) —
+/// a single-region, import-free, numeric-global module keeps its exact prior `.core`.
+fn needs_full_decl(module: Module) -> Bool {
+  count_state_imports(module) > 0
+  || list.length(module.memories) >= 2
+  || list.length(module.tables) >= 2
+  || list.any(module.globals, fn(g) { is_reference_type(g.ty) })
+}
+
+/// The number of STATE imports (imported globals/tables/memories) — the length of the positional
+/// `Imports` list `instantiate/1` destructures, and `> 0` ⇔ the module gets `instantiate/1`.
+/// Function imports (call-site capabilities, H4) contribute NO positional slot.
+fn count_state_imports(module: Module) -> Int {
+  list.fold(module.imports, 0, fn(n, imp) {
+    case imp {
+      ir.ImportFn(..) -> n
+      _ -> n + 1
+    }
+  })
+}
+
+/// Emit the general `instantiate` entry (R4/R5): `instantiate/1(Imports)` for an import-bearing
+/// module (weaving each positional `link.Provided` into its `FullDecl` slot), else
+/// `instantiate/0`. Builds the `FullDecl` (a memories vector + a tables vector + numeric and
+/// reference globals, imports woven at the low indices — spec §2.5.1), seeds via `seed_full`
+/// (cell) / `fresh_full` (threaded), runs the active element → data segments (element BEFORE
+/// data — spec instantiation order) and the `start`, and returns `'ok'` (cell) / the record
+/// (threaded).
+fn emit_instantiate_full(
+  module: Module,
+  ctx: Ctx,
+) -> Result(FunDef, EmitError) {
+  let state0 =
+    EmitState(
+      counter: 0,
+      vars: set.new(),
+      fns: set.from_list(dict.keys(ctx.fn_arity)),
+      labels: [],
+    )
+  let n_imports = count_state_imports(module)
+  // The positional `Imports` parameter (only present at arity 1) + one destructuring var per
+  // state import (`Imp<p>`). Gensym'd, so they never collide with each other or the seeds.
+  let #(imports_param, state1) = fresh_var(state0)
+  let #(imp_vars, state2) = fresh_n_vars(state1, n_imports)
+  use #(decl_term, state3) <- result.try(full_decl_term(
+    module,
+    ctx,
+    imp_vars,
+    state2,
+  ))
+  use body <- result.try(case is_threaded(ctx) {
+    False -> full_cell_body(module, ctx, decl_term, state3)
+    True -> full_threaded_body(module, ctx, decl_term, state3)
+  })
+  Ok(wrap_instantiate(n_imports, imports_param, imp_vars, body))
+}
+
+/// Wrap the general instantiate `body` in its entry function. Import-free (`n == 0`) →
+/// `instantiate/0 = fun () -> body`; import-bearing → `instantiate/1 = fun (Imports) ->
+/// case Imports of <[Imp0, …]> -> body` — destructuring the positional list ONCE at the top so
+/// each `Imp<p>` is in scope for the `link.provided_*` weaving (D3a — the slot wiring is
+/// statically baked, no runtime name lookup).
+fn wrap_instantiate(
+  n_imports: Int,
+  imports_param: String,
+  imp_vars: List(String),
+  body: CExpr,
+) -> FunDef {
+  case n_imports {
+    0 -> FunDef(FName("instantiate", 0), CFun([], body))
+    _ -> {
+      let destructure =
+        CCase(CVar(imports_param), [
+          CClause([list_pattern(imp_vars)], CAtom("true"), body),
+        ])
+      FunDef(FName("instantiate", 1), CFun([imports_param], destructure))
+    }
+  }
+}
+
+/// The `Cell` general-instantiate body: `seed_full(Decl)` then the active element → data segment
+/// effects → `start`, chained as ordered effects (same shape as `emit_instantiate_cell`, but with
+/// `seed_full` instead of `seed`). Returns `'ok'`.
+fn full_cell_body(
+  module: Module,
+  ctx: Ctx,
+  decl_term: CExpr,
+  state: EmitState,
+) -> Result(CExpr, EmitError) {
+  let seed_effect =
+    seam_call(ctx.binding.state_module, "seed_full", [decl_term])
+  use #(elem_fx, state2) <- result.try(element_segment_effects(
+    module.elements,
+    ctx,
+    state,
+  ))
+  use #(data_fx, state3) <- result.try(data_segment_effects(
+    module.data_segments,
+    ctx,
+    state2,
+  ))
+  use start_fx <- result.try(start_effects(module, ctx))
+  let effects =
+    list.flatten([
+      seed_fuel_effect(ctx),
+      seed_policy_effect(ctx),
+      [seed_effect],
+      elem_fx,
+      data_fx,
+      start_fx,
+    ])
+  let #(body, _state4) = chain_effects(effects, state3)
+  Ok(body)
+}
+
+/// The `Threaded` general-instantiate body: `St0 = fresh_full(Decl)` then the record-threading
+/// active element → data → start wrappers (same shape as `emit_instantiate_threaded`, but with
+/// `fresh_full`). Returns the final `InstanceState`.
+fn full_threaded_body(
+  module: Module,
+  ctx: Ctx,
+  decl_term: CExpr,
+  state: EmitState,
+) -> Result(CExpr, EmitError) {
+  let seed_effects =
+    list.flatten([seed_fuel_effect(ctx), seed_policy_effect(ctx)])
+  let #(seed_wraps, state2) = discard_wrappers(seed_effects, state)
+  let #(st0, state3) = fresh_var(state2)
+  let fresh_wrap = fn(rest) {
+    CLet(
+      [st0],
+      seam_call(ctx.binding.state_module, "fresh_full", [decl_term]),
+      rest,
+    )
+  }
+  use #(elem_wraps, cur1, state4) <- result.try(threaded_elem_wrappers(
+    module.elements,
+    st0,
+    state3,
+    ctx,
+  ))
+  use #(data_wraps, cur2, state5) <- result.try(threaded_data_wrappers(
+    module.data_segments,
+    cur1,
+    state4,
+    ctx,
+  ))
+  use #(start_wraps, cur3, _state6) <- result.try(threaded_start_wrapper(
+    module,
+    cur2,
+    state5,
+    ctx,
+  ))
+  let all_wraps =
+    list.flatten([seed_wraps, [fresh_wrap], elem_wraps, data_wraps, start_wraps])
+  Ok(list.fold_right(all_wraps, CVar(cur3), fn(rest, wrap) { wrap(rest) }))
+}
+
+/// Build the `FullDecl` Core term `{full_decl, Mems, Globals, Tables, RefGlobals}` (R5/R7/R8):
+/// imported memories/tables/globals occupy the LOW indices (each pulled from its positional
+/// `Imp<p>` via a `link.provided_*` extractor — spec §2.5.1), then the module's defined
+/// memories (`rt_mem:fresh`) / tables (`rt_table:new`) / globals (const-folded numeric bits or a
+/// rendered reference value). `imp_vars` are the destructuring vars of the positional `Imports`
+/// list, in state-import order. Threads `state` (defined reference-global funcref closures gensym).
+fn full_decl_term(
+  module: Module,
+  ctx: Ctx,
+  imp_vars: List(String),
+  state: EmitState,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use #(imp_mems, imp_tables, imp_nums, imp_refs) <- result.try(imported_slots(
+    module,
+    imp_vars,
+  ))
+  let def_mems = list.map(module.memories, fn(m) { mem_fresh_term(m, ctx) })
+  let def_tables = list.map(module.tables, fn(t) { table_new_term(t, ctx) })
+  use #(def_nums, def_refs, state2) <- result.try(defined_globals(
+    module.globals,
+    ctx,
+    state,
+  ))
+  let mems = core_list(list.append(imp_mems, def_mems))
+  let globals = core_list(list.append(imp_nums, def_nums))
+  let tables = core_list(list.append(imp_tables, def_tables))
+  let ref_globals = core_list(list.append(imp_refs, def_refs))
+  Ok(#(CTuple([CAtom("full_decl"), mems, globals, tables, ref_globals]), state2))
+}
+
+/// Walk `module.imports` and build the IMPORTED slot vectors for the `FullDecl` — each imported
+/// memory/table/global pulled from its positional `Imp<p>` (`imp_vars[p]`) via the matching
+/// `link.provided_*` extractor (D3a — a fixed `link` module call, the slot chosen statically).
+/// Returns `#(mems, tables, numeric_globals, reference_globals)`, each a Core list in import
+/// order; function imports contribute nothing. Numeric globals are `{<<name>>, Bits}`, reference
+/// globals `{<<name>>, Ref}`, keyed by the imported global's local name `g<idx>`.
+fn imported_slots(
+  module: Module,
+  imp_vars: List(String),
+) -> Result(#(List(CExpr), List(CExpr), List(CExpr), List(CExpr)), EmitError) {
+  use #(mems, tables, nums, refs, _p, _g) <- result.map(
+    list.try_fold(module.imports, #([], [], [], [], 0, 0), fn(acc, imp) {
+      let #(mems, tables, nums, refs, p, gidx) = acc
+      case imp {
+        ir.ImportFn(..) -> Ok(#(mems, tables, nums, refs, p, gidx))
+        ir.ImportGlobal(_, _, ty, _) -> {
+          use v <- result.map(import_var(imp_vars, p))
+          let name = core_binary_string("g" <> int.to_string(gidx))
+          case is_reference_type(ty) {
+            True -> #(
+              mems,
+              tables,
+              nums,
+              list.append(refs, [
+                CTuple([
+                  name,
+                  seam_call(link_module, "provided_ref_value", [CVar(v)]),
+                ]),
+              ]),
+              p + 1,
+              gidx + 1,
+            )
+            False -> #(
+              mems,
+              tables,
+              list.append(nums, [
+                CTuple([
+                  name,
+                  seam_call(link_module, "provided_global_bits", [CVar(v)]),
+                ]),
+              ]),
+              refs,
+              p + 1,
+              gidx + 1,
+            )
+          }
+        }
+        ir.ImportTable(..) -> {
+          use v <- result.map(import_var(imp_vars, p))
+          #(
+            mems,
+            list.append(tables, [
+              seam_call(link_module, "provided_table_value", [CVar(v)]),
+            ]),
+            nums,
+            refs,
+            p + 1,
+            gidx,
+          )
+        }
+        ir.ImportMemory(..) -> {
+          use v <- result.map(import_var(imp_vars, p))
+          #(
+            list.append(mems, [
+              seam_call(link_module, "provided_memory_value", [CVar(v)]),
+            ]),
+            tables,
+            nums,
+            refs,
+            p + 1,
+            gidx,
+          )
+        }
+      }
+    }),
+  )
+  #(mems, tables, nums, refs)
+}
+
+/// The positional import var `imp_vars[p]` (the `Imp<p>` destructured from `Imports`), or a
+/// fail-closed `Error` if `p` is out of range (an internal codegen invariant — the count is baked
+/// from the same import list).
+fn import_var(imp_vars: List(String), p: Int) -> Result(String, EmitError) {
+  nth(imp_vars, p)
+  |> result.replace_error(UnsupportedNode("import_positional"))
+}
+
+/// The `rt_mem:fresh(MinPages, MaxOpt, SafeCap)` term for a DEFINED memory (the same head the
+/// byte-identical `StateDecl` path uses).
+fn mem_fresh_term(m: ir.MemoryDecl, ctx: Ctx) -> CExpr {
+  seam_call(ctx.binding.mem_module, "fresh", [
+    CInt(m.min_pages),
+    option_int_term(m.max_pages),
+    CInt(ctx.binding.safe_max_pages),
+  ])
+}
+
+/// The `rt_table:new(Min, MaxOpt)` term for a DEFINED table.
+fn table_new_term(t: ir.TableDecl, ctx: Ctx) -> CExpr {
+  seam_call(ctx.binding.table_module, "new", [
+    CInt(t.min),
+    option_int_term(t.max),
+  ])
+}
+
+/// Split the DEFINED globals into the numeric `{<<name>>, Bits}` pairs (const-folded raw bits,
+/// D5) and the reference `{<<name>>, Ref}` pairs (R8), threading `state` for funcref-closure
+/// gensyms. `Error(NonConstInit)` on a non-constant numeric init or an inadmissible reference
+/// init. Returns `#(numeric_pairs, reference_pairs, state)`.
+fn defined_globals(
+  globals: List(ir.GlobalDecl),
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(List(CExpr), List(CExpr), EmitState), EmitError) {
+  list.try_fold(globals, #([], [], state), fn(acc, g) {
+    let #(nums, refs, st) = acc
+    let name = core_binary_string(g.name)
+    case is_reference_type(g.ty) {
+      True -> {
+        use #(refval, st2) <- result.try(render_ref_global_init(g.init, ctx, st))
+        Ok(#(nums, list.append(refs, [CTuple([name, refval])]), st2))
+      }
+      False -> {
+        use bits <- result.try(const_fold(g.init))
+        Ok(#(list.append(nums, [CTuple([name, CInt(bits)])]), refs, st))
+      }
+    }
+  })
+}
+
+/// Render a DEFINED reference-typed global's constant init to a Core reference value (R8):
+/// `ref.null` (`Values([ConstNull(_)])`) → the null sentinel; `ref.func` (`RefFunc`) → the
+/// `{TypeTag, Closure}` funcref entry (build-strategy ABI). `Error(NonConstInit)` for any other
+/// init (e.g. `global.get` — imported-global-init resolution is 09's).
+fn render_ref_global_init(
+  init: Expr,
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case init {
+    Values([ir.ConstNull(_)]) -> Ok(#(null_ref_term(), state))
+    ir.RefFunc(name) -> reference_func_entry(name, ctx, state)
+    _ -> Error(NonConstInit("non-constant reference global init"))
   }
 }
 
@@ -2201,19 +3414,47 @@ fn threaded_elem_wrappers(
 ) -> Result(#(List(fn(CExpr) -> CExpr), String, EmitState), EmitError) {
   list.try_fold(segs, #([], cur, state), fn(acc, seg) {
     let #(wraps, cur, st) = acc
-    use #(offset_expr, funcs) <- result.try(elem_active_funcs(seg))
-    use offset <- result.try(const_fold(offset_expr))
-    use #(entries, st2) <- result.try(build_threaded_entries(funcs, ctx, st))
-    let call =
-      seam_call(ctx.binding.table_module, "t_init_elem", [
-        CVar(cur),
-        CInt(offset),
-        core_list(entries),
-      ])
-    let #(reduced, st3) = record_result_case(call, ctx, st2)
-    let #(newvar, st4) = fresh_var(st3)
-    let wrap = fn(rest) { CLet([newvar], reduced, rest) }
-    Ok(#(list.append(wraps, [wrap]), newvar, st4))
+    case seg.mode {
+      ir.ElemActive(table, offset_expr) -> {
+        use offset <- result.try(const_fold(offset_expr))
+        let tidx = table_idx(ctx, table)
+        use #(call, st2) <- result.try(case byte_ident_funcref(seg, tidx) {
+          True -> {
+            use funcs <- result.try(reffunc_names(seg.init))
+            use #(entries, st2) <- result.try(build_threaded_entries(
+              funcs,
+              ctx,
+              st,
+            ))
+            Ok(#(
+              seam_call(ctx.binding.table_module, "t_init_elem", [
+                CVar(cur),
+                CInt(offset),
+                core_list(entries),
+              ]),
+              st2,
+            ))
+          }
+          False -> {
+            use #(refs, st2) <- result.try(render_ref_items(seg.init, ctx, st))
+            Ok(#(
+              seam_call(ctx.binding.table_module, "t_init_elem_ref", [
+                CVar(cur),
+                CInt(tidx),
+                CInt(offset),
+                core_list(refs),
+              ]),
+              st2,
+            ))
+          }
+        })
+        let #(reduced, st3) = record_result_case(call, ctx, st2)
+        let #(newvar, st4) = fresh_var(st3)
+        let wrap = fn(rest) { CLet([newvar], reduced, rest) }
+        Ok(#(list.append(wraps, [wrap]), newvar, st4))
+      }
+      ir.ElemPassive | ir.ElemDeclarative -> Ok(#(wraps, cur, st))
+    }
   })
 }
 
@@ -2228,18 +3469,31 @@ fn threaded_data_wrappers(
 ) -> Result(#(List(fn(CExpr) -> CExpr), String, EmitState), EmitError) {
   list.try_fold(segs, #([], cur, state), fn(acc, seg) {
     let #(wraps, cur, st) = acc
-    use offset_expr <- result.try(data_active_offset(seg))
-    use offset <- result.try(const_fold(offset_expr))
-    let call =
-      seam_call(ctx.binding.mem_module, "t_init_data", [
-        CVar(cur),
-        CInt(offset),
-        core_binary_bytes(seg.bytes),
-      ])
-    let #(reduced, st2) = record_result_case(call, ctx, st)
-    let #(newvar, st3) = fresh_var(st2)
-    let wrap = fn(rest) { CLet([newvar], reduced, rest) }
-    Ok(#(list.append(wraps, [wrap]), newvar, st3))
+    case seg.mode {
+      ir.DataActive(mem, offset_expr) -> {
+        use offset <- result.try(const_fold(offset_expr))
+        let call = case mem {
+          0 ->
+            seam_call(ctx.binding.mem_module, "t_init_data", [
+              CVar(cur),
+              CInt(offset),
+              core_binary_bytes(seg.bytes),
+            ])
+          _ ->
+            seam_call(ctx.binding.mem_module, "t_init_data_at", [
+              CVar(cur),
+              CInt(mem),
+              CInt(offset),
+              core_binary_bytes(seg.bytes),
+            ])
+        }
+        let #(reduced, st2) = record_result_case(call, ctx, st)
+        let #(newvar, st3) = fresh_var(st2)
+        let wrap = fn(rest) { CLet([newvar], reduced, rest) }
+        Ok(#(list.append(wraps, [wrap]), newvar, st3))
+      }
+      ir.DataPassive -> Ok(#(wraps, cur, st))
+    }
   })
 }
 
@@ -2509,10 +3763,12 @@ fn option_int_term(o: Option(Int)) -> CExpr {
   }
 }
 
-/// Build the ordered `init_elem` effects for the active element segments. Each →
-/// `case call '<table_module>':'init_elem'(Off, Entries) of {ok,_}->'ok'; {error,E}->raise`,
-/// where `Entries` is a list of `{TypeTag, Closure}` (see `element_entry`). `Off` is the
-/// constant-folded offset.
+/// Build the ordered element-seeding effects for the ACTIVE element segments (passive /
+/// declarative segments carry no instantiation write — R2 — and are SKIPPED). A funcref-only,
+/// all-`RefFunc`, table-0 active segment takes the byte-identical Phase-4 `init_elem(Off,
+/// Entries)` fast path (H7); any other active segment (externref, a `ref.null` slot, or a
+/// non-zero table) routes through `init_elem_ref(TblIdx, Off, Refs)`. Each is reduced to a
+/// discardable trapping effect (`{ok,_}`→`'ok'`, `{error,E}`→raise).
 fn element_segment_effects(
   segs: List(ir.ElementSegment),
   ctx: Ctx,
@@ -2520,16 +3776,68 @@ fn element_segment_effects(
 ) -> Result(#(List(CExpr), EmitState), EmitError) {
   list.try_fold(segs, #([], state), fn(acc, seg) {
     let #(effects, st) = acc
-    use #(offset_expr, funcs) <- result.try(elem_active_funcs(seg))
-    use offset <- result.try(const_fold(offset_expr))
-    use #(entries, st2) <- result.try(build_entries(funcs, ctx, st))
-    let call =
-      seam_call(ctx.binding.table_module, "init_elem", [
-        CInt(offset),
-        core_list(entries),
-      ])
-    let #(effect, st3) = trapping_effect(call, ctx, st2)
-    Ok(#(list.append(effects, [effect]), st3))
+    case seg.mode {
+      ir.ElemActive(table, offset_expr) -> {
+        use offset <- result.try(const_fold(offset_expr))
+        let tidx = table_idx(ctx, table)
+        use #(call, st2) <- result.try(case byte_ident_funcref(seg, tidx) {
+          True -> {
+            use funcs <- result.try(reffunc_names(seg.init))
+            use #(entries, st2) <- result.try(build_entries(funcs, ctx, st))
+            Ok(#(
+              seam_call(ctx.binding.table_module, "init_elem", [
+                CInt(offset),
+                core_list(entries),
+              ]),
+              st2,
+            ))
+          }
+          False -> {
+            use #(refs, st2) <- result.try(render_ref_items(seg.init, ctx, st))
+            Ok(#(
+              seam_call(ctx.binding.table_module, "init_elem_ref", [
+                CInt(tidx),
+                CInt(offset),
+                core_list(refs),
+              ]),
+              st2,
+            ))
+          }
+        })
+        let #(effect, st3) = trapping_effect(call, ctx, st2)
+        Ok(#(list.append(effects, [effect]), st3))
+      }
+      ir.ElemPassive | ir.ElemDeclarative -> Ok(#(effects, st))
+    }
+  })
+}
+
+/// `True` iff active element segment `seg` targeting table index `tidx` is the byte-identical
+/// Phase-4 shape: a `FuncRef` table-0 segment whose every init item is a `RefFunc` (so it seeds
+/// through the frozen `init_elem`/`t_init_elem` fast path). Any other active segment routes
+/// through the generalised `init_elem_ref`/`t_init_elem_ref` (arbitrary references, any table).
+fn byte_ident_funcref(seg: ir.ElementSegment, tidx: Int) -> Bool {
+  seg.ref_ty == ir.FuncRef && tidx == 0 && all_reffunc(seg.init)
+}
+
+/// `True` iff every element-init item is a `RefFunc` (the Phase-2 funcidx-only shape).
+fn all_reffunc(items: List(Expr)) -> Bool {
+  list.all(items, fn(it) {
+    case it {
+      ir.RefFunc(_) -> True
+      _ -> False
+    }
+  })
+}
+
+/// The `RefFunc` target names of an all-`RefFunc` init list. `Error(UnsupportedNode)` if any
+/// item is not a `RefFunc` (unreachable when `byte_ident_funcref` gated the call).
+fn reffunc_names(items: List(Expr)) -> Result(List(String), EmitError) {
+  list.try_map(items, fn(it) {
+    case it {
+      ir.RefFunc(n) -> Ok(n)
+      _ -> Error(UnsupportedNode("elem_item"))
+    }
   })
 }
 
@@ -2619,9 +3927,11 @@ fn wrap_result_list(
   }
 }
 
-/// Build the ordered `init_data` effects for the active data segments. Each →
-/// `case call '<mem_module>':'init_data'(Off, Bytes) of {ok,_}->'ok'; {error,E}->raise`,
-/// `Bytes` the segment payload as a `CBinary` literal, `Off` the constant-folded offset.
+/// Build the ordered data-seeding effects for the ACTIVE data segments (passive segments carry
+/// no instantiation write — R2 — and are SKIPPED). A memory-0 active segment takes the
+/// byte-identical Phase-4 `init_data(Off, Bytes)` head (H7); a memory-`>=1` active segment routes
+/// through `init_data_at(MemIdx, Off, Bytes)`. Each →
+/// `case call '<mem_module>':'init_data…'(…) of {ok,_}->'ok'; {error,E}->raise`.
 fn data_segment_effects(
   segs: List(ir.DataSegment),
   ctx: Ctx,
@@ -2629,15 +3939,27 @@ fn data_segment_effects(
 ) -> Result(#(List(CExpr), EmitState), EmitError) {
   list.try_fold(segs, #([], state), fn(acc, seg) {
     let #(effects, st) = acc
-    use offset_expr <- result.try(data_active_offset(seg))
-    use offset <- result.try(const_fold(offset_expr))
-    let call =
-      seam_call(ctx.binding.mem_module, "init_data", [
-        CInt(offset),
-        core_binary_bytes(seg.bytes),
-      ])
-    let #(effect, st2) = trapping_effect(call, ctx, st)
-    Ok(#(list.append(effects, [effect]), st2))
+    case seg.mode {
+      ir.DataActive(mem, offset_expr) -> {
+        use offset <- result.try(const_fold(offset_expr))
+        let call = case mem {
+          0 ->
+            seam_call(ctx.binding.mem_module, "init_data", [
+              CInt(offset),
+              core_binary_bytes(seg.bytes),
+            ])
+          _ ->
+            seam_call(ctx.binding.mem_module, "init_data_at", [
+              CInt(mem),
+              CInt(offset),
+              core_binary_bytes(seg.bytes),
+            ])
+        }
+        let #(effect, st2) = trapping_effect(call, ctx, st)
+        Ok(#(list.append(effects, [effect]), st2))
+      }
+      ir.DataPassive -> Ok(#(effects, st))
+    }
   })
 }
 
@@ -2675,42 +3997,6 @@ fn const_value_bits(v: Value) -> Result(Int, EmitError) {
     // P5-06/09's (a `ConstNull` never appears in a Phase-1..4 numeric offset/init).
     ir.ConstNull(_) ->
       Error(NonConstInit("null reference in constant init/offset"))
-  }
-}
-
-/// Extract the Phase-2 active-funcref parts of an element segment for the keystone codegen
-/// path: the target-table offset expression + the funcref function names. Returns
-/// `Error(UnsupportedNode(_))` for a passive/declarative segment, an `externref` segment, or a
-/// non-`RefFunc` init item (their real lowering is P5-06/07). No Phase-1..4 module has one, so
-/// the active-funcref path is byte-identical and the error paths are never reached.
-fn elem_active_funcs(
-  seg: ir.ElementSegment,
-) -> Result(#(Expr, List(String)), EmitError) {
-  case seg.mode, seg.ref_ty {
-    ir.ElemActive(_table, offset), ir.FuncRef -> {
-      use funcs <- result.try(
-        list.try_map(seg.init, fn(item) {
-          case item {
-            ir.RefFunc(name) -> Ok(name)
-            _ -> Error(UnsupportedNode("elem_item"))
-          }
-        }),
-      )
-      Ok(#(offset, funcs))
-    }
-    _, _ -> Error(UnsupportedNode("elem_segment"))
-  }
-}
-
-/// Extract the Phase-2 active-at-memory-0 offset of a data segment. Returns
-/// `Error(UnsupportedNode(_))` for a passive segment or an active-at-mem>0 segment (their
-/// lowering is P5-06/08). No Phase-1..4 module has one, so the active-at-0 path is byte-
-/// identical and the error paths are never reached.
-fn data_active_offset(seg: ir.DataSegment) -> Result(Expr, EmitError) {
-  case seg.mode {
-    ir.DataActive(0, offset) -> Ok(offset)
-    ir.DataActive(_, _) -> Error(UnsupportedNode("data_segment_mem"))
-    ir.DataPassive -> Error(UnsupportedNode("data_passive"))
   }
 }
 
