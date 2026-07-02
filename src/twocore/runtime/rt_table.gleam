@@ -222,6 +222,45 @@ pub fn call_indirect(
   }
 }
 
+/// Dispatch a `call_indirect` through table `table_idx` — the INDEXED twin of `call_indirect`
+/// (reference-types multi-table dispatch, <https://webassembly.github.io/spec/core/exec/instructions.html>).
+///
+/// Behaviourally IDENTICAL to `call_indirect` for `table_idx == 0` (the default table), so a
+/// funcref-only single-table module keeps emitting the un-indexed head (byte-identity, H7); a
+/// module declaring MULTIPLE tables dispatches through the selected table here. The 3-fault
+/// fail-closed dispatch is otherwise VERBATIM the frozen `call_indirect`: guard 1 `index` in
+/// `[0, size)` else `UndefinedElement`; guard 2 slot non-null else `UninitializedElement`; guard 3
+/// exact STRUCTURAL `FuncType` match else `IndirectCallTypeMismatch`. NO ambient `apply` of a
+/// data-derived name (D3a) — the dispatched target is the build-controlled slot closure.
+///
+/// - `table_idx`: the absolute table index the dispatch reads (via `rt_state.table_at`).
+/// - `index`/`expected_type`/`args`: the entry index, the call site's required `FuncType`, and the
+///   raw-bit arguments — exactly as `call_indirect`.
+/// - Returns `Ok(results)` or an `Error(reason)` in guard order. Raises (fail-closed) on an
+///   un-seeded cell.
+pub fn call_indirect_at(
+  table_idx: Int,
+  index: Int,
+  expected_type: FuncType,
+  args: List(Int),
+) -> Result(List(Int), TrapReason) {
+  let table = dynamic_to_table(rt_state.table_at(table_idx))
+  case index < 0 || index >= table.size {
+    True -> Error(UndefinedElement)
+    False ->
+      case dict.get(table.slots, index) {
+        Error(Nil) -> Error(UninitializedElement)
+        Ok(value) -> {
+          let #(entry_type, target) = ref_to_cell_funcref(value)
+          case entry_type == expected_type {
+            False -> Error(IndirectCallTypeMismatch)
+            True -> Ok(target(args))
+          }
+        }
+      }
+  }
+}
+
 // ───────────────────────────── cell-backed reference/bulk surface (§B) ─────────────────────────────
 //
 // The Phase-5 reference-types + bulk-table ops (state_strategy: Cell). Each reaches table `idx` via
@@ -383,6 +422,34 @@ pub fn t_call_indirect(
   args: List(Int),
 ) -> Result(#(List(Int), InstanceState), TrapReason) {
   let table = dynamic_to_table(rt_state.table(st))
+  case index < 0 || index >= table.size {
+    True -> Error(UndefinedElement)
+    False ->
+      case dict.get(table.slots, index) {
+        Error(Nil) -> Error(UninitializedElement)
+        Ok(value) -> {
+          let #(entry_type, target) = ref_to_threaded_funcref(value)
+          case entry_type == expected_type {
+            False -> Error(IndirectCallTypeMismatch)
+            True -> Ok(target(st, args))
+          }
+        }
+      }
+  }
+}
+
+/// Threaded `call_indirect` through table `table_idx` — the INDEXED twin of `t_call_indirect`
+/// (multi-table dispatch over `st`'s `tables` vector). Behaviourally identical to
+/// `t_call_indirect` for `table_idx == 0`; the 3-fault dispatch is VERBATIM the frozen twin,
+/// invoking the target as `target(st, args) -> #(results, st')`. See `call_indirect_at`.
+pub fn t_call_indirect_at(
+  st: InstanceState,
+  table_idx: Int,
+  index: Int,
+  expected_type: FuncType,
+  args: List(Int),
+) -> Result(#(List(Int), InstanceState), TrapReason) {
+  let table = dynamic_to_table(rt_state.t_table_at(st, table_idx))
   case index < 0 || index >= table.size {
     True -> Error(UndefinedElement)
     False ->

@@ -218,6 +218,34 @@ pub fn call_indirect(
   }
 }
 
+/// Dispatch a `call_indirect` through table `table_idx` — the INDEXED twin of `call_indirect`
+/// (reference-types multi-table dispatch). Behaviourally identical to `call_indirect` for
+/// `table_idx == 0`; reads table `table_idx` via `rt_state.table_at`, then applies the SAME
+/// 3-fault fail-closed dispatch (bounds → null → exact `FuncType`) verbatim. No ambient `apply`
+/// of a data-derived name (D3a). See `rt_table.call_indirect_at`.
+pub fn call_indirect_at(
+  table_idx: Int,
+  index: Int,
+  expected_type: FuncType,
+  args: List(Int),
+) -> Result(List(Int), TrapReason) {
+  let table = dynamic_to_ets(rt_state.table_at(table_idx))
+  case index < 0 || index >= table.size {
+    True -> Error(UndefinedElement)
+    False ->
+      case ets_lookup(table.tid, index) {
+        Error(Nil) -> Error(UninitializedElement)
+        Ok(entry) -> {
+          let #(entry_type, target) = dynamic_to_cell_entry(entry)
+          case entry_type == expected_type {
+            False -> Error(IndirectCallTypeMismatch)
+            True -> Ok(target(args))
+          }
+        }
+      }
+  }
+}
+
 /// Read THIS process's current `EtsTable` out of the cell. Fail-closed: `rt_state.table_get`
 /// `panic`s on an un-seeded cell (never returns garbage), which propagates here.
 fn current_ets() -> EtsTable {
@@ -269,6 +297,34 @@ pub fn t_call_indirect(
   args: List(Int),
 ) -> Result(#(List(Int), InstanceState), TrapReason) {
   let table = project(st)
+  case index < 0 || index >= table.size {
+    True -> Error(UndefinedElement)
+    False ->
+      case ets_lookup(table.tid, index) {
+        Error(Nil) -> Error(UninitializedElement)
+        Ok(entry) -> {
+          let #(entry_type, target) = dynamic_to_threaded_entry(entry)
+          case entry_type == expected_type {
+            False -> Error(IndirectCallTypeMismatch)
+            True -> Ok(target(st, args))
+          }
+        }
+      }
+  }
+}
+
+/// Threaded `call_indirect` through table `table_idx` — the INDEXED twin of `t_call_indirect`
+/// (multi-table dispatch over `st`'s `tables` vector). Behaviourally identical to
+/// `t_call_indirect` for `table_idx == 0`; the 3-fault dispatch is VERBATIM the frozen twin. See
+/// `rt_table.t_call_indirect_at`.
+pub fn t_call_indirect_at(
+  st: InstanceState,
+  table_idx: Int,
+  index: Int,
+  expected_type: FuncType,
+  args: List(Int),
+) -> Result(#(List(Int), InstanceState), TrapReason) {
+  let table = dynamic_to_ets(rt_state.t_table_at(st, table_idx))
   case index < 0 || index >= table.size {
     True -> Error(UndefinedElement)
     False ->

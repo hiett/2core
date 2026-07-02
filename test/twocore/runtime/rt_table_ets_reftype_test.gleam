@@ -13,11 +13,12 @@ import gleam/dynamic
 import gleam/option.{None, Some}
 import gleeunit/should
 import twocore/ir.{
-  type FuncType, FuncType, TI32, TableOutOfBounds, UninitializedElement,
+  type FuncType, FuncType, IndirectCallTypeMismatch, TI32, TableOutOfBounds,
+  UndefinedElement, UninitializedElement,
 }
 import twocore/runtime/rt_meter
 import twocore/runtime/rt_ref
-import twocore/runtime/rt_state.{type InstanceState, StateDecl}
+import twocore/runtime/rt_state.{type InstanceState, FullDecl, StateDecl}
 import twocore/runtime/rt_table
 import twocore/runtime/rt_table_ets as ets
 
@@ -167,4 +168,74 @@ pub fn threaded_ops_test() {
   let assert Ok(st) = ets.t_fill(st, 0, 2, ext(3), 2)
   ets.t_get(st, 0, 3) |> should.equal(Ok(ext(3)))
   ets.t_set(st, 0, 4, ext(1)) |> should.equal(Error(TableOutOfBounds))
+}
+
+// ── Multi-table call_indirect (Phase-5 follow-up) — the ETS substrate ──
+//
+// `call_indirect_at(k, …)` / `t_call_indirect_at(st, k, …)` dispatch through table `k` over the
+// in-place ETS store, with the SAME 3-fault fail-closed order (bounds → null → type) as the
+// byte-identical `call_indirect` (reference-types multi-table dispatch,
+// <https://webassembly.github.io/spec/core/exec/instructions.html#control-instructions>).
+
+/// CELL: dispatch through the non-default table 1; the three faults fire in spec order.
+pub fn call_indirect_at_multi_table_cell_test() {
+  rt_state.seed_full(
+    FullDecl(
+      mems: [],
+      globals: [],
+      tables: [ets.new(1, None), ets.new(4, None)],
+      ref_globals: [],
+    ),
+  )
+  let assert Ok(Nil) =
+    ets.set(
+      1,
+      1,
+      rt_table.funcref(ii_i(), fn(a) {
+        case a {
+          [x, y] -> [x + y]
+          _ -> []
+        }
+      }),
+    )
+  ets.call_indirect_at(1, 1, ii_i(), [3, 4]) |> should.equal(Ok([7]))
+  ets.call_indirect_at(1, 4, ii_i(), [3, 4])
+  |> should.equal(Error(UndefinedElement))
+  ets.call_indirect_at(1, 0, ii_i(), [3, 4])
+  |> should.equal(Error(UninitializedElement))
+  ets.call_indirect_at(1, 1, FuncType([TI32], [TI32]), [3])
+  |> should.equal(Error(IndirectCallTypeMismatch))
+}
+
+/// THREADED: the same multi-table dispatch over `t_call_indirect_at`.
+pub fn t_call_indirect_at_multi_table_test() {
+  let st =
+    rt_state.fresh_full(
+      FullDecl(
+        mems: [],
+        globals: [],
+        tables: [ets.new(1, None), ets.new(4, None)],
+        ref_globals: [],
+      ),
+    )
+  let assert Ok(st) =
+    ets.t_set(
+      st,
+      1,
+      1,
+      rt_table.funcref_t(ii_i(), fn(s, a) {
+        case a {
+          [x, y] -> #([x + y], s)
+          _ -> #([], s)
+        }
+      }),
+    )
+  let assert Ok(#(res, _)) = ets.t_call_indirect_at(st, 1, 1, ii_i(), [3, 4])
+  res |> should.equal([7])
+  ets.t_call_indirect_at(st, 1, 4, ii_i(), [3, 4])
+  |> should.equal(Error(UndefinedElement))
+  ets.t_call_indirect_at(st, 1, 0, ii_i(), [3, 4])
+  |> should.equal(Error(UninitializedElement))
+  ets.t_call_indirect_at(st, 1, 1, FuncType([TI32], [TI32]), [3])
+  |> should.equal(Error(IndirectCallTypeMismatch))
 }

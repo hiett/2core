@@ -1767,11 +1767,11 @@ fn resolve_stdlib(capability: String, name: String) -> Option(String) {
 /// (`emit_trapping_result`) binding the result LIST `V`, then the list is unpacked into
 /// `len(ty.results)` values and disposed through `cont`.
 ///
-/// `table` resolves to its absolute tableidx. The frozen `rt_table` dispatch reads the DEFAULT
-/// (index-0) table (`call_indirect`/`t_call_indirect` have no table-index argument), so a
-/// `call_indirect` through a NON-zero table (multi-table) is fail-closed here with a categorized
-/// `Error(UnsupportedNode("call_indirect_table"))` — an indexed dispatch head is 07's to add; the
-/// conformance harness reports the module as a categorized skip until then (never a wrong dispatch).
+/// `table` resolves to its absolute tableidx. Index 0 (the default table) emits the frozen
+/// un-indexed `call_indirect`/`t_call_indirect` head (byte-identical to Phase-4, H7); a NON-zero
+/// table (reference-types multi-table) emits the INDEXED `call_indirect_at(Idx, …)` /
+/// `t_call_indirect_at(St, Idx, …)` head, which reads table `Idx` via `rt_state.table_at` and runs
+/// the SAME 3-fault fail-closed dispatch. The result/trap handling below is identical for both.
 fn emit_call_indirect(
   table: String,
   index: Value,
@@ -1782,19 +1782,26 @@ fn emit_call_indirect(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  use _ <- result.try(case table_idx(ctx, table) {
-    0 -> Ok(Nil)
-    _ -> Error(UnsupportedNode("call_indirect_table"))
-  })
+  let idx = table_idx(ctx, table)
   let r = list.length(ty.results)
   case sc {
     NoState -> {
-      let call =
-        seam_call(ctx.binding.table_module, "call_indirect", [
-          emit_value(index),
-          func_type_term(ty),
-          core_list(list.map(args, emit_value)),
-        ])
+      // Index 0 → the byte-identical un-indexed head; ≥1 → the indexed head with a leading tableidx.
+      let call = case idx {
+        0 ->
+          seam_call(ctx.binding.table_module, "call_indirect", [
+            emit_value(index),
+            func_type_term(ty),
+            core_list(list.map(args, emit_value)),
+          ])
+        _ ->
+          seam_call(ctx.binding.table_module, "call_indirect_at", [
+            CInt(idx),
+            emit_value(index),
+            func_type_term(ty),
+            core_list(list.map(args, emit_value)),
+          ])
+      }
       // Bind one var to the unwrapped result LIST (or raise on `{error,R}`), then unpack it.
       let #(xvar, state2) = fresh_var(state)
       let #(evar, state3) = fresh_var(state2)
@@ -1825,14 +1832,25 @@ fn emit_call_indirect(
     Threading(cur) -> {
       // `{Rs, St2} = case '<table>':'t_call_indirect'(St, Idx, TypeTag, Args) of
       //   {ok,P} -> P; {error,R} -> raise end` — unpack `Rs` to `len(ty.results)` values,
-      // REBIND `cur := St2`. `t_call_indirect` returns `#(List(Int), InstanceState)`.
-      let call =
-        seam_call(ctx.binding.table_module, "t_call_indirect", [
-          CVar(cur),
-          emit_value(index),
-          func_type_term(ty),
-          core_list(list.map(args, emit_value)),
-        ])
+      // REBIND `cur := St2`. `t_call_indirect` returns `#(List(Int), InstanceState)`. Index 0 →
+      // the byte-identical un-indexed head; ≥1 → the indexed `t_call_indirect_at` (leading tableidx).
+      let call = case idx {
+        0 ->
+          seam_call(ctx.binding.table_module, "t_call_indirect", [
+            CVar(cur),
+            emit_value(index),
+            func_type_term(ty),
+            core_list(list.map(args, emit_value)),
+          ])
+        _ ->
+          seam_call(ctx.binding.table_module, "t_call_indirect_at", [
+            CVar(cur),
+            CInt(idx),
+            emit_value(index),
+            func_type_term(ty),
+            core_list(list.map(args, emit_value)),
+          ])
+      }
       let #(pvar, state2) = fresh_var(state)
       let #(evar, state3) = fresh_var(state2)
       let #(pbound, state4) = fresh_var(state3)
@@ -2148,9 +2166,16 @@ fn emit_table_init(
     nth(ctx.elements, seg)
     |> result.replace_error(UnsupportedNode("table_init_seg")),
   )
+  // A `global.get` init item resolves against the live state at THIS `table.init` site: the
+  // threaded record `cur` under `Threading`, the pdict cell (None) under `Cell`.
+  let items_state_ref = case sc {
+    NoState -> None
+    Threading(cur) -> Some(cur)
+  }
   use #(entries, state2) <- result.try(render_ref_items(
     segment.init,
     ctx,
+    items_state_ref,
     state,
   ))
   let #(gated, state3) =
@@ -2496,30 +2521,58 @@ fn drop_gate(
 /// Render an element segment's `init` items (each a ref-producing const-expr `Expr`) to a list
 /// of Core reference VALUES — the payload `table.init` / active reference-segment seeding pass to
 /// `rt_table`. `RefFunc($f)` → the `{TypeTag, Closure}` funcref entry (build-strategy ABI, §B);
-/// `Values([ConstNull(_)])` → the null sentinel `{ref_null}`. `Error(UnsupportedNode)` for a
-/// `global.get`-initialised item (its provided-state resolution is 09's) or any other shape.
+/// `Values([ConstNull(_)])` → the null sentinel `{ref_null}`; `GlobalGet($g)` → a RUNTIME read of
+/// the reference global `$g` (an imported/defined immutable reference global, spec §3.3.1 const
+/// exprs), resolved at instantiate/`table.init` time from the seeded `ref_globals` (R8). The
+/// `state_ref` is the state channel at the render site: `None` under `Cell` (`ref_global_get` reads
+/// the pdict cell directly), `Some(st)` under `Threaded` (`t_ref_global_get(St, …)` over the live
+/// record `st`). `Error(UnsupportedNode)` for any other shape.
 fn render_ref_items(
   items: List(Expr),
   ctx: Ctx,
+  state_ref: Option(String),
   state: EmitState,
 ) -> Result(#(List(CExpr), EmitState), EmitError) {
   list.try_fold(items, #([], state), fn(acc, item) {
     let #(rendered, st) = acc
-    use #(c, st2) <- result.try(render_ref_item(item, ctx, st))
+    use #(c, st2) <- result.try(render_ref_item(item, ctx, state_ref, st))
     Ok(#(list.append(rendered, [c]), st2))
   })
 }
 
-/// Render ONE element-init item to a Core reference value (see `render_ref_items`).
+/// Render ONE element-init item to a Core reference value (see `render_ref_items`). A `GlobalGet`
+/// item reads the reference global at run time via the `ref_globals` seam so a
+/// global-initialised element segment (`(elem … (global.get $g))`, spec §4.5.4) places the global's
+/// current reference value into the table.
 fn render_ref_item(
   item: Expr,
   ctx: Ctx,
+  state_ref: Option(String),
   state: EmitState,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case item {
     ir.RefFunc(name) -> reference_func_entry(name, ctx, state)
     Values([ir.ConstNull(_)]) -> Ok(#(null_ref_term(), state))
+    GlobalGet(name) -> Ok(#(ref_global_read(name, state_ref, ctx), state))
     _ -> Error(UnsupportedNode("elem_item"))
+  }
+}
+
+/// A runtime read of reference global `name` (R8) at the current state site: `Cell`
+/// (`state_ref == None`) reads the pdict cell via `rt_state:ref_global_get(<<name>>)`; `Threaded`
+/// (`state_ref == Some(st)`) reads the live record via `rt_state:t_ref_global_get(St, <<name>>)`.
+/// Used to resolve a `global.get`-initialised element item at instantiate/`table.init` time.
+fn ref_global_read(name: String, state_ref: Option(String), ctx: Ctx) -> CExpr {
+  case state_ref {
+    None ->
+      seam_call(ctx.binding.state_module, "ref_global_get", [
+        core_binary_string(name),
+      ])
+    Some(st) ->
+      seam_call(ctx.binding.state_module, "t_ref_global_get", [
+        CVar(st),
+        core_binary_string(name),
+      ])
   }
 }
 
@@ -3416,7 +3469,7 @@ fn threaded_elem_wrappers(
     let #(wraps, cur, st) = acc
     case seg.mode {
       ir.ElemActive(table, offset_expr) -> {
-        use offset <- result.try(const_fold(offset_expr))
+        use offset <- result.try(render_offset(offset_expr, Some(cur), ctx))
         let tidx = table_idx(ctx, table)
         use #(call, st2) <- result.try(case byte_ident_funcref(seg, tidx) {
           True -> {
@@ -3429,19 +3482,25 @@ fn threaded_elem_wrappers(
             Ok(#(
               seam_call(ctx.binding.table_module, "t_init_elem", [
                 CVar(cur),
-                CInt(offset),
+                offset,
                 core_list(entries),
               ]),
               st2,
             ))
           }
           False -> {
-            use #(refs, st2) <- result.try(render_ref_items(seg.init, ctx, st))
+            // Threaded active seeding: a `global.get` item reads the live record `cur`.
+            use #(refs, st2) <- result.try(render_ref_items(
+              seg.init,
+              ctx,
+              Some(cur),
+              st,
+            ))
             Ok(#(
               seam_call(ctx.binding.table_module, "t_init_elem_ref", [
                 CVar(cur),
                 CInt(tidx),
-                CInt(offset),
+                offset,
                 core_list(refs),
               ]),
               st2,
@@ -3471,19 +3530,19 @@ fn threaded_data_wrappers(
     let #(wraps, cur, st) = acc
     case seg.mode {
       ir.DataActive(mem, offset_expr) -> {
-        use offset <- result.try(const_fold(offset_expr))
+        use offset <- result.try(render_offset(offset_expr, Some(cur), ctx))
         let call = case mem {
           0 ->
             seam_call(ctx.binding.mem_module, "t_init_data", [
               CVar(cur),
-              CInt(offset),
+              offset,
               core_binary_bytes(seg.bytes),
             ])
           _ ->
             seam_call(ctx.binding.mem_module, "t_init_data_at", [
               CVar(cur),
               CInt(mem),
-              CInt(offset),
+              offset,
               core_binary_bytes(seg.bytes),
             ])
         }
@@ -3778,7 +3837,7 @@ fn element_segment_effects(
     let #(effects, st) = acc
     case seg.mode {
       ir.ElemActive(table, offset_expr) -> {
-        use offset <- result.try(const_fold(offset_expr))
+        use offset <- result.try(render_offset(offset_expr, None, ctx))
         let tidx = table_idx(ctx, table)
         use #(call, st2) <- result.try(case byte_ident_funcref(seg, tidx) {
           True -> {
@@ -3786,18 +3845,24 @@ fn element_segment_effects(
             use #(entries, st2) <- result.try(build_entries(funcs, ctx, st))
             Ok(#(
               seam_call(ctx.binding.table_module, "init_elem", [
-                CInt(offset),
+                offset,
                 core_list(entries),
               ]),
               st2,
             ))
           }
           False -> {
-            use #(refs, st2) <- result.try(render_ref_items(seg.init, ctx, st))
+            // Cell active seeding: a `global.get` item reads the already-seeded pdict cell (None).
+            use #(refs, st2) <- result.try(render_ref_items(
+              seg.init,
+              ctx,
+              None,
+              st,
+            ))
             Ok(#(
               seam_call(ctx.binding.table_module, "init_elem_ref", [
                 CInt(tidx),
-                CInt(offset),
+                offset,
                 core_list(refs),
               ]),
               st2,
@@ -3941,17 +4006,17 @@ fn data_segment_effects(
     let #(effects, st) = acc
     case seg.mode {
       ir.DataActive(mem, offset_expr) -> {
-        use offset <- result.try(const_fold(offset_expr))
+        use offset <- result.try(render_offset(offset_expr, None, ctx))
         let call = case mem {
           0 ->
             seam_call(ctx.binding.mem_module, "init_data", [
-              CInt(offset),
+              offset,
               core_binary_bytes(seg.bytes),
             ])
           _ ->
             seam_call(ctx.binding.mem_module, "init_data_at", [
               CInt(mem),
-              CInt(offset),
+              offset,
               core_binary_bytes(seg.bytes),
             ])
         }
@@ -3973,6 +4038,38 @@ fn start_effects(module: Module, ctx: Ctx) -> Result(List(CExpr), EmitError) {
         Error(_) -> Error(UnknownFunction(name))
         Ok(arity) -> Ok([CApply(FName(name, arity), [])])
       }
+  }
+}
+
+/// Render an active segment's OFFSET const-expr to the Core i32 offset the `init_*` seam takes.
+///
+/// A constant literal (`Values([Const])`) const-folds to its raw-bit `CInt` — BYTE-IDENTICAL to
+/// Phase-4 (a numeric offset never changed). A `global.get $g` (an imported / defined IMMUTABLE i32
+/// global, a valid constant expression, spec §3.3.1 / §4.5.4) is resolved at instantiate time by a
+/// RUNTIME read of the seeded numeric global: `Cell` (`state_ref == None`) reads the pdict cell via
+/// `rt_state:global_get(<<name>>)`, `Threaded` (`Some(st)`) reads the live record via
+/// `rt_state:t_global_get(St, <<name>>)`. Because the seed installs the (imported) global BEFORE any
+/// active segment runs, the read yields the exact provided value (e.g. an OOB active-data offset
+/// then traps at instantiation, spec §4.5.4). `Error(NonConstInit)` for any other shape.
+fn render_offset(
+  offset_expr: Expr,
+  state_ref: Option(String),
+  ctx: Ctx,
+) -> Result(CExpr, EmitError) {
+  case offset_expr {
+    GlobalGet(name) ->
+      Ok(case state_ref {
+        None ->
+          seam_call(ctx.binding.state_module, "global_get", [
+            core_binary_string(name),
+          ])
+        Some(st) ->
+          seam_call(ctx.binding.state_module, "t_global_get", [
+            CVar(st),
+            core_binary_string(name),
+          ])
+      })
+    _ -> result.map(const_fold(offset_expr), CInt)
   }
 }
 

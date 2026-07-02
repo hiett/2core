@@ -31,11 +31,14 @@ import gleam/result
 import gleam/set
 import gleeunit/should
 import twocore/ir.{
-  type FuncType, FuncType, TI32, TableOutOfBounds, UninitializedElement,
+  type FuncType, FuncType, IndirectCallTypeMismatch, TI32, TableOutOfBounds,
+  UndefinedElement, UninitializedElement,
 }
 import twocore/runtime/rt_meter
 import twocore/runtime/rt_ref
-import twocore/runtime/rt_state.{type InstanceState, InstanceState, StateDecl}
+import twocore/runtime/rt_state.{
+  type InstanceState, FullDecl, InstanceState, StateDecl,
+}
 import twocore/runtime/rt_table
 import twocore/runtime/rt_trap
 
@@ -407,4 +410,81 @@ pub fn spec_trap_messages_test() {
   |> should.equal("out of bounds table access")
   rt_trap.spec_trap_message(UninitializedElement)
   |> should.equal("uninitialized element")
+}
+
+// ── 11. Multi-table call_indirect (Phase-5 follow-up, reference-types multi-table dispatch) ──
+//
+// Reference-types lifts the single-table restriction: `call_indirect` carries an explicit table
+// index (<https://webassembly.github.io/spec/core/exec/instructions.html#control-instructions>).
+// `call_indirect_at(k, …)` / `t_call_indirect_at(st, k, …)` dispatch through table `k` (0 = the
+// default, behaviourally identical to `call_indirect`) with the SAME 3-fault fail-closed order:
+// bounds → `UndefinedElement`, null slot → `UninitializedElement`, type → `IndirectCallTypeMismatch`.
+
+/// CELL: dispatch through the NON-default table 1 — a filled slot runs; the three faults fire in
+/// spec order on the non-default table; and `call_indirect_at(0, …)` reads the default table.
+pub fn call_indirect_at_multi_table_cell_test() {
+  rt_state.seed_full(
+    FullDecl(
+      mems: [],
+      globals: [],
+      tables: [rt_table.new(1, None), rt_table.new(4, None)],
+      ref_globals: [],
+    ),
+  )
+  let assert Ok(Nil) =
+    rt_table.set(
+      1,
+      1,
+      rt_table.funcref(ii_i(), fn(a) {
+        case a {
+          [x, y] -> [x + y]
+          _ -> []
+        }
+      }),
+    )
+  rt_table.call_indirect_at(1, 1, ii_i(), [3, 4]) |> should.equal(Ok([7]))
+  // bounds → null → type, all on table 1.
+  rt_table.call_indirect_at(1, 4, ii_i(), [3, 4])
+  |> should.equal(Error(UndefinedElement))
+  rt_table.call_indirect_at(1, 0, ii_i(), [3, 4])
+  |> should.equal(Error(UninitializedElement))
+  rt_table.call_indirect_at(1, 1, FuncType([TI32], [TI32]), [3])
+  |> should.equal(Error(IndirectCallTypeMismatch))
+  // table 0 (the default) is independent and untouched — its slot 0 reads null.
+  rt_table.call_indirect_at(0, 0, ii_i(), [3, 4])
+  |> should.equal(Error(UninitializedElement))
+}
+
+/// THREADED: the same multi-table dispatch over the record-threading `t_call_indirect_at`.
+pub fn t_call_indirect_at_multi_table_test() {
+  let st =
+    rt_state.fresh_full(
+      FullDecl(
+        mems: [],
+        globals: [],
+        tables: [rt_table.new(1, None), rt_table.new(4, None)],
+        ref_globals: [],
+      ),
+    )
+  let assert Ok(st) =
+    rt_table.t_set(
+      st,
+      1,
+      1,
+      rt_table.funcref_t(ii_i(), fn(s, a) {
+        case a {
+          [x, y] -> #([x + y], s)
+          _ -> #([], s)
+        }
+      }),
+    )
+  let assert Ok(#(res, _)) =
+    rt_table.t_call_indirect_at(st, 1, 1, ii_i(), [3, 4])
+  res |> should.equal([7])
+  rt_table.t_call_indirect_at(st, 1, 4, ii_i(), [3, 4])
+  |> should.equal(Error(UndefinedElement))
+  rt_table.t_call_indirect_at(st, 1, 0, ii_i(), [3, 4])
+  |> should.equal(Error(UninitializedElement))
+  rt_table.t_call_indirect_at(st, 1, 1, FuncType([TI32], [TI32]), [3])
+  |> should.equal(Error(IndirectCallTypeMismatch))
 }

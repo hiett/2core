@@ -1561,3 +1561,172 @@ pub fn import_spectest_threaded_e2e_test() {
 // record or a trap text.
 @external(erlang, "twocore_threaded_test_ffi", "instantiate_with")
 fn t_instantiate_with(module: Atom, imports: Dynamic) -> Result(Dynamic, String)
+
+// ════════════════════ Phase-5 follow-up: multi-table call_indirect (Gap 1) ════════════════════
+//
+// Reference-types lifts the single-table restriction: `call_indirect` (and every table op) carries
+// an explicit table index, so a module may declare MANY tables and dispatch through any of them
+// (<https://webassembly.github.io/spec/core/exec/instructions.html#control-instructions>, the
+// reference-types proposal). `emit_core` resolves the table NAME→index; index 0 keeps the
+// byte-identical `call_indirect` head, a NON-zero table emits `call_indirect_at(Idx, …)` /
+// `t_call_indirect_at(St, Idx, …)`, both running the SAME 3-fault fail-closed dispatch
+// (bounds → null → exact FuncType). Proven end-to-end on the BEAM under BOTH Cell and Threaded.
+
+/// A 2-table module whose targets live in the NON-default table `t1` (index 1). `call1` dispatches
+/// `call_indirect $t1`; `call1_wrong` dispatches with a mismatched type; `t0` (index 0) is declared
+/// but left empty to prove the dispatch reads the SELECTED table, not the default.
+fn multi_table_ci_module(name: String) -> ir.Module {
+  let add1 =
+    ir.Function(
+      "add1",
+      [ir.Local("x", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Let(
+        ["r"],
+        ir.Num(ir.IAdd(ir.W32), [ir.Var("x"), ir.ConstI32(1)]),
+        ir.Return([ir.Var("r")]),
+      ),
+    )
+  let call1 =
+    ir.Function(
+      "call1",
+      [ir.Local("idx", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.CallIndirect("t1", ir.Var("idx"), ir.FuncType([ir.TI32], [ir.TI32]), [
+        ir.ConstI32(41),
+      ]),
+    )
+  let call1_wrong =
+    ir.Function(
+      "call1_wrong",
+      [ir.Local("idx", ir.TI32)],
+      [ir.TI64],
+      [],
+      ir.CallIndirect("t1", ir.Var("idx"), ir.FuncType([ir.TI64], [ir.TI64]), [
+        ir.ConstI64(0),
+      ]),
+    )
+  full(
+    name,
+    option.None,
+    [],
+    [add1, call1, call1_wrong],
+    [
+      ir.TableDecl("t0", ir.FuncRef, 4, option.None),
+      ir.TableDecl("t1", ir.FuncRef, 4, option.None),
+    ],
+    // Seed slot 0 of the NON-default table t1 with `add1` (an active reference segment on t1).
+    [
+      ir.ElementSegment(
+        ir.ElemActive("t1", ir.Values([ir.ConstI32(0)])),
+        ir.FuncRef,
+        [ir.RefFunc("add1")],
+      ),
+    ],
+    [],
+    option.None,
+  )
+}
+
+/// CELL: dispatch through table 1 — a filled slot runs (`add1(41) == 42`), an in-bounds null slot
+/// traps `uninitialized element`, and a wrong expected type traps `indirect call type mismatch`
+/// (the three distinct spec messages, on a NON-default table).
+pub fn multi_table_call_indirect_cell_e2e_test() {
+  let mod = load(multi_table_ci_module("mt_ci_cell"))
+  instantiate(mod)
+  assert catch_apply(mod, atom.create("call1"), [0]) == Ok(42)
+  // In-bounds (size 4) but never-written slot 2 → uninitialized element.
+  let assert Error(uninit) = catch_apply(mod, atom.create("call1"), [2])
+  assert string.contains(uninit, "uninitialized_element")
+  // Index past the bound → undefined element (bounds guard fires first).
+  let assert Error(undef) = catch_apply(mod, atom.create("call1"), [9])
+  assert string.contains(undef, "undefined_element")
+  // Right slot, wrong expected type → indirect call type mismatch.
+  let assert Error(mismatch) = catch_apply(mod, atom.create("call1_wrong"), [0])
+  assert string.contains(mismatch, "indirect_call_type_mismatch")
+}
+
+/// THREADED: the SAME multi-table dispatch over the record-threading build — byte-identical
+/// observable results to the Cell oracle (`t_call_indirect_at` reads `st`'s `tables` vector at
+/// index 1).
+pub fn multi_table_call_indirect_threaded_e2e_test() {
+  let mod = load_threaded(multi_table_ci_module("mt_ci_threaded"))
+  let assert Ok(st0) = t_instantiate(mod)
+  let assert Ok(#(v, st1)) = t_invoke_int(mod, atom.create("call1"), st0, [0])
+  assert v == 42
+  let assert Error(uninit) = t_invoke_int(mod, atom.create("call1"), st1, [2])
+  assert string.contains(uninit, "uninitialized_element")
+  let assert Error(mismatch) =
+    t_invoke_int(mod, atom.create("call1_wrong"), st1, [0])
+  assert string.contains(mismatch, "indirect_call_type_mismatch")
+}
+
+// ════════════════════ Phase-5 follow-up: ref.func-of-declarative + global-init elem (Gap 2) ════════════════════
+//
+// The reference-types proposal makes a function reference-able by `ref.func` only if it is
+// "declared" — e.g. by a DECLARATIVE element segment, which materialises NO table slots and only
+// forward-declares its funcs (<https://webassembly.github.io/spec/core/valid/modules.html>, elem
+// segments; the reference-types proposal). An element segment's init items may also be a
+// `global.get` of an immutable reference global (a constant expression, spec §3.3.1 / §4.5.4),
+// resolved at instantiate time from the seeded `ref_globals`. `emit_core` now emits both: a
+// declarative segment is a no-op init, and a `global.get` element item reads the reference global.
+
+/// A module exercising BOTH Gap-2 emit paths WITHOUT any (unsupported) cross-module import:
+/// a declarative segment declares `$f`; a defined immutable funcref global `$g` is initialised
+/// `ref.func $f`; an ACTIVE element segment seeds table slot 0 from `(global.get $g)`; and
+/// `call0` dispatches `call_indirect $t0` into that global-initialised slot.
+pub fn ref_func_declarative_and_global_init_elem_e2e_test() {
+  let target =
+    ir.Function(
+      "f",
+      [ir.Local("x", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Let(
+        ["r"],
+        ir.Num(ir.IMul(ir.W32), [ir.Var("x"), ir.ConstI32(2)]),
+        ir.Return([ir.Var("r")]),
+      ),
+    )
+  let call0 =
+    ir.Function(
+      "call0",
+      [ir.Local("idx", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.CallIndirect("t0", ir.Var("idx"), ir.FuncType([ir.TI32], [ir.TI32]), [
+        ir.ConstI32(21),
+      ]),
+    )
+  let m =
+    ir.Module(
+      name: "twocore@e2e@reffunc_decl_globalinit",
+      uses_numerics: True,
+      memories: [],
+      // `$g : funcref = ref.func $f` (an immutable reference global, R8).
+      globals: [ir.GlobalDecl("g", ir.TFuncRef, False, ir.RefFunc("f"))],
+      imports: [],
+      functions: [target, call0],
+      exports: [ir.ExportFn("call0", "call0")],
+      data_segments: [],
+      tables: [ir.TableDecl("t0", ir.FuncRef, 4, option.None)],
+      elements: [
+        // Declarative segment: NO table slots, only declares `$f` for `ref.func` — a no-op init.
+        ir.ElementSegment(ir.ElemDeclarative, ir.FuncRef, [ir.RefFunc("f")]),
+        // Active segment whose init item is `(global.get $g)` — placed into t0 slot 0.
+        ir.ElementSegment(
+          ir.ElemActive("t0", ir.Values([ir.ConstI32(0)])),
+          ir.FuncRef,
+          [ir.GlobalGet("g")],
+        ),
+      ],
+      start: option.None,
+    )
+  // The module EMITS (no `UnsupportedNode`) and instantiates, and the global-initialised slot is
+  // the funcref of `$f`: `call0(21) == 42` (`f(x) = x*2`).
+  let mod = load(m)
+  instantiate(mod)
+  assert catch_apply(mod, atom.create("call0"), [0]) == Ok(42)
+}
