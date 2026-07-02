@@ -295,7 +295,7 @@ Phase 7; memory64's runtime → Phase 6 (R12 — the IR axis stays, decode/valid
 | **P5-10a** WAT parser (lexer + parse_module) | [`10`](phase-5/10-wat-parser.md) | **done** | `«WASM-AST3»` | **GREEN: +34 tests (1154 total), 0 warnings, format clean, conformance unchanged 15749/409/0 + 1894/227/0.** `frontend/wasm/wat.gleam` (NEW): publishes `«WAT-API-CORE»` — `lex`, `parse_module`, `WatError`/`Token`/`Pos`/`LexErrorKind`/`Category`. Full Phase-5 module surface (folded+flat instrs, abbreviations, `$id` resolution across all index spaces, `(type)` dedup in depth-first source order matching wabt, inline import/export, inline table+elem / memory+data, reftype/bulk/table/multi-mem/memory64 text, datacount rule R13). Number→bits (D5/R15): hex-float + `nan:0x` bit-exact; decimal floats exact via big-int round-ties-even (float-torture diffed vs wabt). Totality (D4): typed errors + truncation fuzz, no panic. **Differential proven** `parse_module ≡ decode∘wat2wasm` (wabt 1.0.41, flags `--enable-multi-memory --enable-memory64`; NOT `--enable-all` → that enables non-standard compact-imports) over a curated Phase-5 corpus + the acceptance corpus; ~300 malformed spec fixtures exercise totality. **Leaves for 10b:** `parse_script`/`Script`/`WastValue` (builds on `lex`+`parse_module`). **Leaves for 11:** the `Script`→fixture adapter. |
 | **P5-10b** WAT script layer (`parse_script`) | [`10`](phase-5/10-wat-parser.md) | **done** | P5-10a (`«WAT-API-CORE»`) | **GREEN: +16 tests (1170 total), conformance unchanged.** `parse_script → Script` in `wat.gleam`: `Command` (WatModule/Register/AssertReturn/Trap/Exhaustion/Invalid/Malformed/Unlinkable/Uninstantiable/ActionCmd/CmdSkipped), `ModuleDef` (Text/Binary/Quote), `Action` (Invoke/Get), `WastValue` (i32/i64/f32/f64 raw bits + `RefNullVal`/`RefFuncVal`/`RefExternVal` R18), `Expected` (Value/NanCanonical/NanArithmetic). `$id` recorded as name only (11's `registry.resolve` resolves). Differential vs `wast2json` (command count+kind parity); `(module binary)` round-trips + decodes, `(module quote)` re-parses; total. **11 writes the `Script`→`fixture` adapter + `SpecValue` ref variants + deletes the "no WAT parser" skip.** |
 | **P5-11** conformance expansion | [`11`](phase-5/11-conformance-expansion.md) | **done** | 03–10 | **GREEN: 1180 tests (was 1170), 0 warnings, format clean; conformance `fail=0` under BOTH profiles (Safe/Unsafe each 21512 pass / 1270 skip / 0 fail) + the full tier matrix (cell/threaded × paged 7565/1180/0; × atomics 7532/1179/0; cell×nif 7565/1180/0).** MEASURED headline (R16): **pass rose +5763 (15749→21512)** as reftype+bulk categories lit up; new files added via wast2json DEFAULT flags at the pin (empirically re-verified): `ref_func table_get table_set table_size table_grow table_fill table_copy bulk memory_fill memory_copy memory_init data`. Reference values wired through `fixture.SpecValue` (`NullRef`/`ExternRefVal`/`FuncRefVal` R18) + oracle (null-by-type / externref-by-identity / funcref-any-nonnull) + a term invoke-ABI (`ffi.call_instance_terms`/`result_list`/`extern_payload`, `rt_ref`) that also delivers the **multi-value run-ABI (R17)** — the numeric single-result path stays byte-identical. Imports/spectest/link driven via `link.link_imports` (spectest built-in → import-free `instantiate/0` vs `instantiate/1(Imports)` dispatched by import-presence); `Get`→exported-global accessor; `assert_unlinkable`→fail-closed `link:` phrase. WAT-only path: text `assert_malformed`/`assert_invalid` fragments now route through `wat.parse_module` (deleted the "no WAT parser" skip; float_literals +16 passes); new `wat_fixture.gleam` adapter (`Script`→drive, sole consumer of `parse_script`, R15) proven on an authored in-scope `.wast` (6/6). New-surface tier differential `refexpansion_differential_test` (reftab/bulkmem/multimem `.wat` — reference/table, bulk memmove+eager-bounds, **multi-memory execution+cross-mem copy** — spec-correct AND byte-identical across all 5 shipped combos) + a guarded `wasmtime` differential (§F.2). `skipcount_test` guards fail=0, pass↑, residual closed+categorised. **Residual honesty (D9): skip 1270 = the two KNOWN EMIT GAPS (multi-table `call_indirect` 1092 asserts — `table_copy` verifies via non-zero-table calls; imported-global/ref.func element-init 9) + 169 categorised out-of-scope (GC-proposal reftypes, extended-const, cross-module state import, exhaustion, out-of-scope text). Residual EXCLUDING the two emit gaps = 169 < the Phase-4 baseline 409 — the material drop once the engine gaps are set aside (a follow-up for 12/emit-owner).** **Categorized/deferred (never false-green, R16):** GC-proposal reftype files (`ref_null`/`ref_is_null`/`elem`/`select`/`table_init` — `anyref`/typed-refs/array un-`wast2json`-able AND out of our funcref/externref scope), EH (`imports.wast` `tag`), module-linking (`memory`/`table` `(module definition)`), multi-memory `memory_grow` (spectest-interp 0/50 at pin). **Cross-unit finding (P5-09):** `link.spectest_export` builds provided memory/table with the PAGED tier unconditionally → importing spectest memory under an `atomics` binding hands a paged handle to atomics code (`badarg`); handled honestly by excluding the one spectest-state importer (`data.wast`) from the non-paged matrix combos (green under paged + both full profiles; its bulk semantics tier-covered by own-memory `memory_*`). No src touched. |
-| **P5-12** capstone | [`12`](phase-5/12-capstone.md) | **unclaimed** | all above | PHASE 5 PROVEN: full surface green under the matrix; conformance-neutral; honest close. |
+| **P5-12** capstone | [`12`](phase-5/12-capstone.md) | **done** | all above | **PHASE 5 PROVEN. 1195 tests (was 1189), 0 warnings, format clean.** Full surface green end-to-end under both modes × every shipped `state_strategy × mem_tier`; conformance `fail == 0` (Safe/Unsafe 21525/1257/0; matrix cell/threaded×paged + cell×nif 7578/1167/0, ×atomics 7544/1167/0). Pass rose **+5776** (15749→21525) with the residual **fully categorized + closed** (skipcount guard). New `new_surface_test.gleam` (reftab/bulkmem/multimem spec-correct + byte-identical across safe/unsafe/portable; Phase-1..4 corpus mode-neutral) + extended `runs_anywhere_test.gleam` (new-surface portable: 0 native + 0 instance-cell seam, threaded families non-vacuous, executed byte-identical to the cell/paged oracle) + `conformance_test.gleam` (the two full-profile runs now carry the surface headline `pass > baseline`). `docs/wasm-conformance.svg` regenerated (21525/1257/0, Phase-5 footnote) + `docs/phase-5-surface.md` (before/after + categorized residual). Confirmed green (not re-derived): P5-11 skipcount/refexpansion/wasmtime, P5-10 WAT differential, unit 06 emitter byte-identity. |
 
 ### High-level spec coverage this phase takes
 
@@ -320,6 +320,66 @@ NIF; the extended-const proposal.
 
 ## Change log
 
+- **P5-12 landed (capstone) — PHASE 5 PROVEN.** The engine now executes the **complete standardized
+  WebAssembly surface except SIMD**, proven under both modes and every shipped tier. Capstone
+  deliverables: `test/twocore/conformance/new_surface_test.gleam` (new — proof 1/3), an extended
+  `test/twocore/conformance/runs_anywhere_test.gleam` (proof 4, new surface) and
+  `conformance_test.gleam` (the surface headline `pass > baseline` on the two full-profile runs),
+  the refreshed `docs/wasm-conformance.svg` (21525/1257/0, Phase-5 footnote) + generator, and the
+  new `docs/phase-5-surface.md` (the measured before/after + categorized residual).
+  - **Proof 1 — complete surface, green end-to-end.** `reftab` (reference & table: `ref.*`, the full
+    `table.*` surface, a null-slot `call_indirect` → trap *uninitialized element*, an OOB
+    `table.get` → *out of bounds table access*), `bulkmem` (bulk memory: fill/copy/init + `data.drop`,
+    memmove overlap, eager-bounds trap with **no partial write**, dropped-segment = length-0), and
+    `multimem` (two independent memories + a cross-memory `memory.copy`) are spec-correct against
+    their spec-sourced `.expected` under `safe`/`unsafe`/`portable` and **byte-identical** across
+    them — plus the P5-11 tier-sweep already proves byte-identity across every `state_strategy ×
+    mem_tier`.
+  - **Proof 2 — the surface-phase headline (MEASURED, R16).** Over the enlarged allowlist, `fail == 0`
+    and `pass` **strictly rose to 21525 (+5776 over the 15749 baseline)** under both full profiles;
+    the filtered tier-matrix run is `fail == 0` per combo (7578/1167/0 paged+nif, 7544/1167/0
+    atomics). Framed **honestly**: the raw skip count *rose* (409→1257) only because P5-11 added ~30
+    previously-EXCLUDED files to the allowlist — the headline is the pass-RISE + `fail == 0` with a
+    **fully-categorized, closed residual** (`skipcount_test`: every skip matches an enumerated
+    category or the test goes red). Residual = ~1088 **cross-module wasm→wasm function imports**
+    (a distinct cross-module function-linking feature Phase 5 never scoped) + 169 genuinely
+    out-of-scope; the residual *excluding* that gap is 169 < the Phase-4 baseline of 409.
+  - **Proof 3 — conformance-neutral by default (H7).** The entire Phase-1..4 acceptance corpus
+    produces the SAME `Outcome` under Safe and Unsafe Phase-5 code (new-surface test), the
+    `portable`-vs-oracle corpus neutrality (Phase-4 runs-anywhere) stays green, and unit 06's
+    emitter-level byte-identity (`MemLoad(0,…)` ⇒ the un-indexed Phase-4 `rt_mem:load` head) is
+    confirmed green — the IR grew but the defaults route the new surface away.
+  - **Proof 4 — runs-anywhere RE-CONFIRMED for the new surface (grep + executed).** The
+    `profiles.portable()` `.core` of `reftab`/`bulkmem`/`multimem` links **zero**
+    `atomics`/`ets`/`persistent_term`/NIF and emits **zero** `rt_state` pdict instance-cell seam,
+    while non-vacuously naming the threaded families the new nodes route through (`'t_get'`/
+    `'t_call_indirect'`/`'t_init_elem'`/`rt_ref` for reftab; `'t_copy'`/`'t_init'` for bulkmem;
+    `'t_load_at'`/`'t_store_at'`/`rt_state` for multimem); all three execute byte-identical to the
+    `cell`/`paged` oracle on a bare BEAM.
+  - **Proof 5 — confirmed, not re-derived.** P5-11's `wasmtime` differential (skips gracefully when
+    absent) + P5-10's `parse_module ≡ decode∘wat2wasm` / `parse_script ≡ wast2json` suites are green
+    and committed; the previously-un-`wast2json`-able files run from our own `parse_script`.
+  - **The honest close of Phase 5.** *PROVED* — the **complete standardized WebAssembly engine minus
+    SIMD**: reference types (funcref/externref, ref ops, `table.get/set/size/grow/fill`, typed
+    `select`, multiple tables incl. **multi-table `call_indirect`**, passive/declarative elements),
+    bulk memory & table ops (spec-exact eager-bounds + memmove + O(N) fuel + droppable segments),
+    multiple memories, non-function imports + the full `spectest` module + `(register …)`, and a
+    first-class WAT text parser — all **spec-differentially correct** (held to the baked `.wast` +
+    `wasmtime`) under **both modes** and **every shipped `state_strategy × mem_tier`**,
+    **byte-identical by default** (H7), **constant-space loops + preemption preserved**, and
+    **runs-anywhere** for the new surface. *DEFERRED (stated, each):* **SIMD → Phase 6** (the single
+    largest proposal); **memory64 runtime → Phase 6** (the `IdxType` IR axis + decode/validate ship;
+    lower/link reject a 64-bit memory with a categorized skip — no guessed page cap, R12);
+    **cross-module wasm→wasm function linking → Phase 6** (the ~1088-assert residual, stated not
+    claimed); the **Porffor JS→WASM bridge → Phase 7** ("JS on the BEAM"); **GC-proposal reftypes**
+    (typed function refs + `struct`/`array`/`i31`) + the **extended-const** proposal → later; a
+    **production C NIF** for tier-N memory stays documented-deferred; and the documented
+    **`spectest`-memory-under-atomics** edge (the fixed `spectest` provider is paged; the imported
+    `spectest` memory is proven under the paged/both profiles and tier-covered for bulk by the
+    own-memory `memory_*` tests). No performance claim beyond Phase 4's — Phase 5 is a surface phase;
+    its only performance obligation is negative (no regression), which proofs 3–4 carry.
+  - **1195 tests (was 1189), 0 warnings, `gleam format --check src test` clean, conformance
+    `fail == 0` across both profiles + the full tier matrix.**
 - **Phase-5 plan authored + adversarially critiqued + reconciled.** Scope decision (EM): **Phase 5 =
   "the complete WASM engine"** — reference types + bulk memory + multi-memory + non-function imports/
   `spectest` + the WAT text parser (+ memory64 decode/validate only). **SIMD promoted to a dedicated

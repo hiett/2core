@@ -228,3 +228,133 @@ pub fn headline_profiles_compose_fail_closed_test() {
   assert profiles.validate_binding(Binding(..profiles.safe(), mem_tier: Nif))
     == Error(profiles.SafeForbidsNif)
 }
+
+// ─────────────────────────── P5-12 PROOF 4: runs-anywhere RE-CONFIRMED for the new surface (H3/H6) ───────────────────────────
+
+/// The Phase-5 new-surface programs the runs-anywhere property must be RE-CONFIRMED over (capstone
+/// §E): `reftab` (a reference-typed table + `ref.*` + `call_indirect`), `bulkmem` (bulk memory
+/// fill/copy/init + a passive segment), `multimem` (two memories + a cross-memory copy). Phase 4
+/// proved the tier-P `portable` build runs the Phase-4 corpus on a bare BEAM; Phase 5 GREW the
+/// surface, so these new nodes must ALSO route through the purely-functional record with no native
+/// code and no crashable instance cell — else the runs-anywhere headline no longer covers the whole
+/// engine. Authored `.wat` → `.wasm` under `corpus/` (capstone-owned, §H).
+const new_surface_programs: List(String) = ["reftab", "bulkmem", "multimem"]
+
+/// PROOF 4a (new surface, G6 — no native code). The `portable` `.core` of every new-surface program
+/// links ZERO native / OTP-native state: it names no module containing `atomics`, `ets`,
+/// `persistent_term`, or a NIF loader. The reference value model, the bulk ops, the passive-segment
+/// drop state, and the memories vector are all pure-BEAM `twocore@runtime@*` code — nothing native
+/// is even reachable, so a bounds/type bug's worst case is a wrong/missing trap or a node-safe
+/// process crash, never a host escape (spec §7 embedding; H6).
+pub fn portable_new_surface_links_zero_native_state_test() {
+  let failures =
+    list.flat_map(new_surface_programs, fn(name) {
+      let core = portable_core(name)
+      let check = fn(tok) {
+        case combos.count_occurrences(core, tok) {
+          0 -> []
+          n -> [
+            name
+            <> " links native primitive '"
+            <> tok
+            <> "' × "
+            <> int.to_string(n),
+          ]
+        }
+      }
+      list.flatten([
+        check("atomics"),
+        check("ets"),
+        check("persistent_term"),
+        check("nif"),
+        check("load_nif"),
+        check("erlang_nif"),
+      ])
+    })
+  assert failures == []
+}
+
+/// PROOF 4a (new surface, G1 — no crashable instance cell). No process-dictionary INSTANCE-STATE
+/// seam in any new-surface `portable` `.core`: the `Threaded` build threads the memories/tables
+/// vector + the passive drop-state through the record, never the `rt_state` pdict cell
+/// (`'seed'`/`'mem_get'`/`'mem_put'`/`'global_get'`/`'global_set'`). So the whole new surface carries
+/// the SAME "no crashable state" property Phase 4 proved for the base corpus.
+pub fn portable_new_surface_has_no_instance_cell_seam_test() {
+  let cell_seam = [
+    "'seed'", "'mem_get'", "'mem_put'", "'global_get'", "'global_set'",
+  ]
+  let failures =
+    list.flat_map(new_surface_programs, fn(name) {
+      let core = portable_core(name)
+      list.flat_map(cell_seam, fn(tok) {
+        case combos.count_occurrences(core, tok) {
+          0 -> []
+          n -> [
+            name
+            <> " emits pdict instance-cell seam '"
+            <> tok
+            <> "' × "
+            <> int.to_string(n),
+          ]
+        }
+      })
+    })
+  assert failures == []
+}
+
+/// PROOF 4a (new surface, non-vacuity). The greps above are a REAL audit, not vacuously-green: the
+/// `portable` build DOES route the new nodes through the THREADED runtime families (a replacement,
+/// not an absence). `reftab` names the threaded reference-table accessors (`'t_get'`,
+/// `'t_call_indirect'`, `'t_init_elem'`); `bulkmem` names the threaded bulk-memory family
+/// (`'t_copy'`, `'t_init'`); `multimem` routes the second memory through the memory-index `_at`
+/// accessors (`'t_load_at'`, `'t_store_at'`) and holds the memories vector in the record (`rt_state`
+/// present). If units 07/08 renamed these, this test's tokens must follow — the seam is named, not
+/// guessed.
+pub fn portable_new_surface_uses_threaded_families_test() {
+  let reftab = portable_core("reftab")
+  assert combos.count_occurrences(reftab, "'t_get'") > 0
+  assert combos.count_occurrences(reftab, "'t_call_indirect'") > 0
+  assert combos.count_occurrences(reftab, "'t_init_elem'") > 0
+  assert combos.count_occurrences(reftab, "rt_ref") > 0
+
+  let bulkmem = portable_core("bulkmem")
+  assert combos.count_occurrences(bulkmem, "'t_copy'") > 0
+  assert combos.count_occurrences(bulkmem, "'t_init'") > 0
+
+  let multimem = portable_core("multimem")
+  assert combos.count_occurrences(multimem, "'t_load_at'") > 0
+  assert combos.count_occurrences(multimem, "'t_store_at'") > 0
+  assert combos.count_occurrences(multimem, "rt_state") > 0
+}
+
+/// PROOF 4b (new surface, EXECUTED — the dynamic half). Every new-surface program, compiled under
+/// the REAL `profiles.portable()` profile and run through `load → instantiate → invoke` on a bare
+/// BEAM, is (1) spec-correct against its `.expected` and (2) BYTE-IDENTICAL (raw bit pattern) to the
+/// `cell`/`paged` oracle (`profiles.safe()`), values AND traps alike. This re-confirms that the
+/// reference value model, the bulk ops, the passive-segment drop state, and the memories vector all
+/// thread through the purely-functional record without a native backend and without a crashable
+/// pdict cell — the runs-anywhere property now covers the WHOLE engine (spec §7 embedding).
+pub fn portable_new_surface_runs_byte_identical_to_oracle_test() {
+  let portable_d = driver.pipeline_with(profiles.portable())
+  let oracle_d = driver.pipeline_with(profiles.safe())
+
+  let failures =
+    list.flat_map(new_surface_programs, fn(name) {
+      let #(p_outs, p_fails) = combos.evaluate(portable_d, name)
+      let #(o_outs, _) = combos.evaluate(oracle_d, name)
+      list.flatten([
+        list.map(p_fails, fn(f) { "portable spec-incorrect: " <> f }),
+        case p_outs == o_outs {
+          True -> []
+          False -> [
+            name
+            <> " [portable ≢ cell/paged oracle]: "
+            <> string.inspect(o_outs)
+            <> " vs "
+            <> string.inspect(p_outs),
+          ]
+        },
+      ])
+    })
+  assert failures == []
+}

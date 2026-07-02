@@ -33,6 +33,25 @@
 //// profile/linker surface, bounded `cap_pages` so an atomics combo links), then driven through the
 //// SAME `run_suite` gate. The two Phase-3 profiles stay as two more matrix points.
 ////
+//// ## Phase 5 — the surface-phase headline: `fail == 0 && pass > baseline` (capstone P5-12 proof 2)
+////
+//// Unlike Phases 3–4 (which added NO IR nodes and NO spec files, so the counts did not move),
+//// Phase 5 is a SURFACE phase: whole `.wast` categories light up (reference types, bulk memory,
+//// multi-memory, the `spectest` imports, the WAT-only text-format asserts), so on the enlarged
+//// allowlist (P5-11) the pinned suite's `pass` STRICTLY RISES while `fail` stays `0`. The two
+//// FULL-profile runs (`spec_suite_safe`/`unsafe`, the unfiltered 21525-pass runs) therefore carry
+//// the surface-phase headline directly: `fail == 0 && pass > phase4_baseline_pass` (`run_suite`).
+//// The residual-skip accounting — every remaining skip is one of the ENUMERATED honest categories,
+//// the CLOSED-residual invariant — is owned by `skipcount_test.gleam` (P5-11) and CONFIRMED green by
+//// the capstone (D1: the capstone references it, it does not re-derive the phrase list). The honest
+//// reading: the headline is a pass-RISE (+5776), NOT a naive skip-drop — the raw skip count rose
+//// because P5-11 added ~30 previously-EXCLUDED files to the allowlist, so most of the 1257 residual
+//// is asserts in files that were never counted before Phase 5; ~1088 of it is cross-module
+//// wasm→wasm FUNCTION imports (a distinct cross-module function-linking feature Phase 5 never
+//// scoped → Phase 6), and 169 is genuinely out-of-scope (GC-proposal reftypes, extended-const,
+//// `assert_exhaustion`, cross-module state import, SIMD/GC text). `fail == 0` under every shipped
+//// binding is the whole-phase net; the FILTERED matrix combos keep the non-vacuity `pass > 0` gate.
+////
 //// Tier-A needs NO engine at run time: the expected values are baked into the vendored `.wast`
 //// (now JSON). The committed curated fixture subset makes this run in a fresh checkout;
 //// `vendor/vendor.sh` regenerates the FULL allowlist (gitignored) for a wider local run — the
@@ -57,6 +76,13 @@ import twocore/runtime/profiles
 import twocore/tier/combos.{type Combo}
 
 const fixtures_dir = "test/twocore/conformance/fixtures"
+
+/// The Phase-4 baseline pass count (15749 / 409 / 0 — task / state.md P4-11). The two FULL,
+/// unfiltered profile runs must clear it STRICTLY (`pass > phase4_baseline_pass`): Phase 5 is a
+/// surface phase, so `pass` RISES as whole categories light up (measured post-Phase-5: 21525, a
+/// +5776 pass-rise), while `fail` stays `0`. A regression that flipped a formerly-passing assert to
+/// skip/fail, or a category silently going dark, drops `pass` below the floor and goes red.
+const phase4_baseline_pass: Int = 15_749
 
 /// The Safe max-pages cap the full-matrix run bakes into EVERY combination. It must be (1) LARGE
 /// ENOUGH that no in-scope spec assertion is changed by the cap — the widest is `call`/
@@ -190,16 +216,33 @@ fn run_combo(c: Combo) -> Nil {
   )
 }
 
-/// Run every `*.json` fixture present through `d`, print a per-file + total report tagged with
-/// `label`, and assert zero genuine failures with at least one pass. Total — every command
-/// passes/fails/skips; the runner never panics.
+/// Run every `*.json` fixture present through `d` (a FULL, unfiltered profile run) and assert the
+/// Phase-5 surface-phase headline (capstone P5-12 proof 2): `fail == 0` AND `pass > phase4_baseline_
+/// pass` (STRICTLY — whole categories lit up, a pass-RISE). `run_suite` is used only by the two
+/// full-profile runs (`spec_suite_safe`/`unsafe`); the filtered matrix combos use `run_suite_keep`
+/// (non-vacuity `pass > 0` only). Total — the runner never panics.
 fn run_suite(d: Driver, label: String) -> Nil {
-  run_suite_keep(d, label, fn(_) { True })
+  run_suite_keep_min(d, label, fn(_) { True }, phase4_baseline_pass + 1)
 }
 
 /// Like `run_suite`, but runs only the fixtures for which `keep(name)` is `True` (the matrix
-/// combos skip the tier-invariant bulk-numeric files). Same zero-fail / non-vacuous gate.
+/// combos skip the tier-invariant bulk-numeric files) and gates on non-vacuity only (`pass > 0`) —
+/// the filtered subset does not run the whole 21525-pass suite, so it cannot clear the surface
+/// headline floor; the two full-profile runs (`run_suite`) carry that. Same zero-fail gate.
 fn run_suite_keep(d: Driver, label: String, keep: fn(String) -> Bool) -> Nil {
+  run_suite_keep_min(d, label, keep, 1)
+}
+
+/// The shared driver behind `run_suite`/`run_suite_keep`: run the kept fixtures, print the per-file
+/// + total report, and assert `total.fail == 0 && total.pass >= min_pass`. `min_pass` is the
+/// surface headline floor for a full run (`phase4_baseline_pass + 1` ⇒ `pass > baseline`) or `1` for
+/// a filtered matrix combo (non-vacuity). Total.
+fn run_suite_keep_min(
+  d: Driver,
+  label: String,
+  keep: fn(String) -> Bool,
+  min_pass: Int,
+) -> Nil {
   let jsons = case ffi.list_dir(fixtures_dir) {
     Ok(entries) ->
       entries
@@ -232,9 +275,10 @@ fn run_suite_keep(d: Driver, label: String, keep: fn(String) -> Bool) -> Nil {
       print_skip_reasons(total)
       print_fail_reasons(total)
 
-      // Honest gate: zero genuine spec mismatches; coverage is non-vacuous.
+      // Honest gate: zero genuine spec mismatches; coverage clears the floor (the surface-phase
+      // headline `pass > baseline` for a full run, or non-vacuity `pass > 0` for a filtered combo).
       assert total.fail == 0
-      assert total.pass > 0
+      assert total.pass >= min_pass
     }
   }
 }

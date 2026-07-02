@@ -38,9 +38,12 @@ fi
 echo "gen-conformance-svg: running conformance test ($conf_test) ..." >&2
 report="$(gleam test -- "$conf_test" 2>&1 || true)"
 
-# Keep only the report lines: "<file>.json pass=N skip=M fail=K" and the TOTAL line.
+# Keep the run-block HEADERS ("=== … — <label> ===") and the report lines ("<file>.json pass=…"
+# and the TOTAL line). The headers let awk isolate the ONE full, unfiltered profile run (Phase 5
+# runs the suite SEVEN times — the two full profiles + the five filtered tier-matrix combos — and
+# only the full Safe run carries the complete per-file breakdown + the enlarged-allowlist TOTAL).
 lines="$(printf '%s\n' "$report" \
-  | grep -E '(\.json| TOTAL) +pass=[0-9]+ +skip=[0-9]+ +fail=[0-9]+' || true)"
+  | grep -E '(=== Phase-3 spec-suite|(\.json| TOTAL) +pass=[0-9]+ +skip=[0-9]+ +fail=[0-9]+)' || true)"
 
 if ! printf '%s\n' "$lines" | grep -q 'TOTAL'; then
   echo "gen-conformance-svg: ERROR — no TOTAL report line in conformance output." >&2
@@ -67,7 +70,15 @@ function commas(x,   s, out) {
   while (length(s) > 3) { out = "," substr(s, length(s) - 2) out; s = substr(s, 1, length(s) - 3) }
   return s out
 }
-# Parse each report line into the per-file arrays (or the TOTAL accumulators).
+# Parse each report line into the per-file arrays (or the TOTAL accumulators). Only the FULL Safe
+# run (unfiltered — the enlarged Phase-5 allowlist, 21525 pass) feeds the chart; the filtered
+# tier-matrix combos print a tier-touching SUBSET (fewer passes) and the Unsafe run duplicates the
+# Safe totals, so gate on the Safe full-profile header ("Baseline optimizer + enforcing fuel").
+/=== Phase-3 spec-suite/ {
+  active = ($0 ~ /Baseline optimizer \+ enforcing fuel/) ? 1 : 0
+  next
+}
+!active { next }
 {
   name = $1; p = 0; s = 0; f = 0
   for (i = 1; i <= NF; i++) {
@@ -77,10 +88,8 @@ function commas(x,   s, out) {
   }
   if (name == "TOTAL") { tP = p; tS = s; tF = f; next }
   sub(/\.json$/, "", name)
-  # The suite now runs under every shipped Phase-4 tier combination (cell/threaded × paged/atomics,
-  # + the nif skeleton) AND both Phase-3 profiles, so each file report line appears once per run
-  # with identical counts (conformance is tier-/profile-neutral, G7/F7). Keep the first occurrence
-  # per file so the chart shows each file once.
+  # Only the full Safe block is active here, so each file appears once; the `seen` guard is a
+  # belt-and-braces dedup (a file line is idempotent — the counts are tier-/profile-neutral, H7).
   if (name in seen) next
   seen[name] = 1
   n++; fn[n] = name; fp[n] = p; fs[n] = s; ff[n] = f
@@ -168,7 +177,7 @@ END {
   }
 
   # ---- footnotes ----
-  print "  <text x='24' y='" fn1Y "' font-size='9.5' fill='" muted "'>Phase 4: green under every shipped tier (cell/threaded &#215; paged/atomics, plus the ets/atomics table tiers) — conformance-neutral. Skipped = constructs beyond the slice (reference types, bulk memory, multi-memory, non-function imports, multi-value, extended-const, memory64, text-format asserts). " commas(tF) " failing.</text>"
+  print "  <text x='24' y='" fn1Y "' font-size='9.5' fill='" muted "'>Phase 5: complete WebAssembly surface minus SIMD — reference types, bulk memory, multi-memory, multi-table call_indirect, non-function imports + the spectest module, and a first-class WAT text parser. Pass rose +5,776; " commas(tF) " failing under every shipped tier. Residual out of scope: cross-module wasm&#8594;wasm function linking (&#8594; Phase 6), SIMD (&#8594; Phase 6), GC-proposal reftypes + extended-const.</text>"
   print "  <text x='24' y='" fn2Y "' font-size='9' fill='" faint "'>Source: WebAssembly/testsuite @ " sha "  ·  wabt " wabt "  ·  " n " of " allow " allowlisted .wast files convertible at pin  ·  regenerate with scripts/gen-conformance-svg.sh</text>"
 
   print "</svg>"
